@@ -54,11 +54,60 @@ class GenerationConfig(_Strict):
     doc_tokens_min: int
     doc_tokens_max: int
     max_spend_usd: float | None
+    # Added for document generation. Defaults let older configs load; pilot.yaml sets
+    # every one explicitly.
+    input_price_usd_per_mtok: float | None = None  # paid execution refuses while null
+    output_price_usd_per_mtok: float | None = None
+    reasoning_effort: str | None = None  # anthropic output_config.effort / openai reasoning_effort
+    request_timeout_s: float = 600.0
+    retry_base_delay_s: float = 2.0
+    retry_max_delay_s: float = 60.0
+    plan_seed: int = 27182  # document-spec planning (types, lengths, people, diversity axes)
+    max_specs_per_condition: int = 6000  # hard stop for full generation
+    grader_model: str | None = None  # null: grade with `model` at the same prices
+    grader_input_price_usd_per_mtok: float | None = None  # required when grader_model is set
+    grader_output_price_usd_per_mtok: float | None = None
+    grader_max_output_tokens: int = 2000
+    # Matching tolerances, checked when the training files are written and again at
+    # publish time (relative differences between the belief and goal corpora).
+    match_median_tolerance: float = 0.05  # per type slot: |median_b - median_g| / median_g
+    match_total_tolerance: float = 0.03  # token totals: |total_b - total_g| / total_g
+    belief_mention_max_ratio: float = 1.5  # max / min documents per taught person (min >= 1)
+    belief_fruit_share_tolerance: float = 0.03  # each fruit's share of mentions vs 1/3
 
     @model_validator(mode="after")
     def _check(self) -> GenerationConfig:
         if not 0 < self.doc_tokens_min < self.doc_tokens_max:
             raise ValueError("need 0 < doc_tokens_min < doc_tokens_max")
+        if self.concurrency < 1 or self.max_retries < 0:
+            raise ValueError("need concurrency >= 1 and max_retries >= 0")
+        if self.pilot_docs_per_condition < 1:
+            raise ValueError("generation.pilot_docs_per_condition must be > 0")
+        for name in (
+            "input_price_usd_per_mtok",
+            "output_price_usd_per_mtok",
+            "grader_input_price_usd_per_mtok",
+            "grader_output_price_usd_per_mtok",
+        ):
+            value = getattr(self, name)
+            if value is not None and not (math.isfinite(value) and value >= 0):
+                raise ValueError(f"generation.{name} must be a finite number >= 0 or null")
+        if self.grader_model is not None and (
+            self.grader_input_price_usd_per_mtok is None
+            or self.grader_output_price_usd_per_mtok is None
+        ):
+            raise ValueError("grader_model needs grader_*_price_usd_per_mtok")
+        for name in (
+            "match_median_tolerance",
+            "match_total_tolerance",
+            "belief_fruit_share_tolerance",
+        ):
+            if not 0 <= getattr(self, name) < 1:
+                raise ValueError(f"generation.{name} must be in [0, 1)")
+        if not self.belief_mention_max_ratio >= 1:
+            raise ValueError("generation.belief_mention_max_ratio must be >= 1")
+        if self.max_output_tokens < 1 or self.grader_max_output_tokens < 1:
+            raise ValueError("max output tokens must be positive")
         return self
 
 
