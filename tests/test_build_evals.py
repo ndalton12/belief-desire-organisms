@@ -609,3 +609,17 @@ def test_non_positive_wordings_rejected(cfg):
         raw = cfg.evaluation.model_copy(update={"wordings_per_split": n})
         with pytest.raises(ValueError):
             be.allocation_wordings(cfg.model_copy(update={"evaluation": raw}), "dev")
+
+
+def test_file_placement_catches_items_moved_between_files(built):
+    files = built["files"]
+    for name, rel in [("dev", EVAL_DEV_FILE), ("test", EVAL_TEST_FILE)]:
+        be.check_file_placement(rel, files[name])
+    be.check_file_placement(EVAL_DIAGNOSTICS_FILE, files["diagnostics"])
+    recall = next(i for i in files["diagnostics"] if i.task == "recall" and i.split == "dev")
+    # Moving a record between files keeps the combined set valid but hides it from
+    # analysis of its split; placement must catch it.
+    with pytest.raises(be.EvalSetError, match="belongs in"):
+        be.check_file_placement(EVAL_TEST_FILE, [*files["test"], recall])
+    with pytest.raises(be.EvalSetError, match="belongs in"):
+        be.check_file_placement(EVAL_DIAGNOSTICS_FILE, [files["dev"][0]])

@@ -29,7 +29,8 @@ class WorldConfig(_Strict):
     n_test_trios: int
     n_transfer_trios: int
     fruits: list[str]
-    target_fruit: str
+    # Fixed: eval keys (schemas.TARGET_FRUIT) and the goal prompts assume apple.
+    target_fruit: Literal["apple"]
 
     @model_validator(mode="after")
     def _check(self) -> WorldConfig:

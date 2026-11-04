@@ -644,11 +644,35 @@ def make_evals(
     return main["dev"], main["test"], diagnostics
 
 
+def eval_file_for(item: EvalItem) -> str:
+    """The one eval file an item belongs in: main items by split, every other task in
+    the diagnostics file. Publish and analysis check placement with this, because
+    validate_eval_set checks the three files only as one combined set."""
+    if item.task != "main":
+        return EVAL_DIAGNOSTICS_FILE
+    return EVAL_DEV_FILE if item.split == "dev" else EVAL_TEST_FILE
+
+
+def check_file_placement(rel: str, items: list[EvalItem]) -> None:
+    """Raise EvalSetError if any item read from dataset file `rel` belongs in another file."""
+    for item in items:
+        if (want := eval_file_for(item)) != rel:
+            raise EvalSetError(
+                f"{item.item_id} ({item.split} {item.task}) is in {rel}; it belongs in {want}"
+            )
+
+
 def build_evals(cfg: PilotConfig) -> None:
     people, splits = world.load_people(), world.load_splits()
     _check_world(cfg, people, splits)
     dev, test, diagnostics = make_evals(cfg, people, splits)
     validate_eval_set(dev + test + diagnostics, people, cfg)
+    for rel, rows in (
+        (EVAL_DEV_FILE, dev),
+        (EVAL_TEST_FILE, test),
+        (EVAL_DIAGNOSTICS_FILE, diagnostics),
+    ):
+        check_file_placement(rel, rows)
     root = dataset_dir()
     write_jsonl(root / EVAL_DEV_FILE, dev)
     write_jsonl(root / EVAL_TEST_FILE, test)

@@ -131,11 +131,12 @@ def _check_evals(cfg: PilotConfig, root: Path) -> dict[str, int]:
     people = list(read_jsonl(root / PEOPLE_FILE, Person))
     items: list[EvalItem] = []
     counts = {}
-    for rel in EVAL_FILES:
-        rows = list(read_jsonl(root / rel, EvalItem))
-        counts[rel] = len(rows)
-        items.extend(rows)
     try:
+        for rel in EVAL_FILES:
+            rows = list(read_jsonl(root / rel, EvalItem))
+            build_evals.check_file_placement(rel, rows)
+            counts[rel] = len(rows)
+            items.extend(rows)
         build_evals.validate_eval_set(items, people, cfg)
     except Exception as exc:  # noqa: BLE001 - any failure blocks publishing
         raise PublishError(f"eval set failed validation: {exc}") from exc

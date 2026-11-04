@@ -45,3 +45,10 @@ def test_checkpoint_beyond_budget_rejected():
     raw["training"]["checkpoints_processed_tokens"] = [0, 30_000_000]
     with pytest.raises(ValidationError):
         PilotConfig.model_validate(raw)
+
+
+def test_target_fruit_other_than_apple_rejected():
+    raw = _raw()
+    raw["world"]["target_fruit"] = "pear"
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(raw)

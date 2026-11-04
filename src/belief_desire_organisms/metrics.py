@@ -199,6 +199,8 @@ def current_eval_hashes() -> dict[str, str]:
 
 def load_eval_items(split: str) -> dict[str, EvalItem]:
     """Items of one split. Reads only that split's main file plus the diagnostics file."""
+    from belief_desire_organisms import build_evals
+
     root = dataset_dir()
     items: dict[str, EvalItem] = {}
     found = False
@@ -207,7 +209,9 @@ def load_eval_items(split: str) -> dict[str, EvalItem]:
         if not path.exists():
             continue
         found = True
-        for item in read_jsonl(path, EvalItem):
+        rows = list(read_jsonl(path, EvalItem))
+        build_evals.check_file_placement(rel, rows)  # a misplaced item would vanish here
+        for item in rows:
             if item.split != split:
                 continue
             if item.item_id in items:
