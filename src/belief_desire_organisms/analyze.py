@@ -36,10 +36,10 @@ from belief_desire_organisms.metrics import (
     bias_summary,
     current_eval_hashes,
     expected_counts,
-    find_run,
     invalid_output_summary,
     list_checkpoints,
     load_eval_items,
+    load_runs,
     paired_trio_means,
     score_run,
     summarize_run,
@@ -57,6 +57,7 @@ from belief_desire_organisms.selection import (
     build_dev_curves,
     composed_label,
     load_selection,
+    run_info,
     selected_checkpoints,
 )
 
@@ -212,29 +213,33 @@ def _consistency_warnings(split: str, frames: dict, runs: dict, warnings: list[s
 
 
 def _analyze_split(
+    cfg: PilotConfig,
     split: str,
     runs: list[tuple[str, str]],
     primary: dict[str, str],
     boot: Bootstrapper,
     warnings: list[str],
-    expected_adapters: dict[tuple[str, str], list[str]],
+    selection: SelectionManifest | None,
+    reference_inference: dict | None,
 ) -> SplitAnalysis:
     items = load_eval_items(split)
     expected = expected_counts(items)
-    hashes = current_eval_hashes()
     frames: dict[tuple[str, str], pd.DataFrame] = {}
-    loaded: dict[tuple[str, str], Run] = {}
-    inputs, missing = [], []
-    for condition, label in runs:
-        lookup = find_run(
-            split, condition, label, hashes, expected_adapters.get((condition, label))
-        )
-        if lookup.status != "ok":
-            missing.append(lookup.describe())
-            continue
-        run = lookup.run
+    inputs = []
+    loaded, failed = load_runs(
+        split,
+        runs,
+        current_eval_hashes(),
+        base_model=cfg.training.base_model,
+        base_model_revision=cfg.training.base_model_revision,
+        reference_inference=reference_inference,
+        expected_adapters=_expected_adapters(selection),
+        allowed_run_ids=_selection_run_ids(selection) if split == "dev" else None,
+    )
+    missing = [f.describe() for f in failed]
+    for (condition, label), run in loaded.items():
         df, unmatched = score_run(run, items)
-        frames[run.key], loaded[run.key] = df, run
+        frames[run.key] = df
         inputs.append(
             {
                 "condition": condition,
@@ -308,20 +313,40 @@ def _expected_adapters(
     }
 
 
-def _selection_warnings(
-    selection: SelectionManifest, dev: SplitAnalysis, warnings: list[str]
-) -> None:
+def _selection_run_ids(selection: SelectionManifest | None) -> dict[tuple[str, str], list[str]]:
+    """Dev runs of the selected adapters must be the exact runs the selection used."""
+    if selection is None:
+        return {}
+    return {
+        ("belief", selection.belief.checkpoint): selection.belief.eval_run_ids,
+        ("goal", selection.goal.checkpoint): selection.goal.eval_run_ids,
+    }
+
+
+def _selection_provenance(selection: SelectionManifest, dev: SplitAnalysis) -> list[str]:
+    """Reasons the dev evidence now loaded is not the evidence the selection was frozen on.
+    Any problem makes the adapter gates not_evaluated."""
+    problems = []
     hashes = current_eval_hashes()
-    if any(hashes.get(rel) != h for rel, h in selection.dev_eval_files_sha256.items()):
-        warnings.append("Dev eval files changed after the checkpoint selection was frozen.")
-    for corpus in ("belief", "goal"):
-        choice = getattr(selection, corpus)
-        run = dev.runs.get((corpus, choice.checkpoint))
-        if run is not None and run.eval_run_id not in choice.eval_run_ids:
-            warnings.append(
-                f"The dev run now found for {choice.checkpoint} ({run.eval_run_id}) is not the "
-                f"one the selection was based on ({', '.join(choice.eval_run_ids)})."
+    for rel, digest in sorted(selection.dev_eval_files_sha256.items()):
+        if hashes.get(rel) != digest:
+            problems.append(f"{rel} changed after the checkpoint selection was frozen.")
+    recorded = selection.dev_curves.get("runs", {})
+    keys = [
+        ("base", "base"),
+        ("belief", selection.belief.checkpoint),
+        ("goal", selection.goal.checkpoint),
+    ]
+    for condition, label in keys:
+        run = dev.runs.get((condition, label))
+        if run is None:
+            continue  # reported as missing; the gates needing it are not evaluated
+        if recorded.get(f"{condition}/{label}") != run_info(run):
+            problems.append(
+                f"Dev results for {condition}/{label} ({run.eval_run_id}) are not the exact "
+                "results the checkpoint selection was frozen on."
             )
+    return problems
 
 
 def _cost(cfg: PilotConfig) -> dict:
@@ -352,20 +377,35 @@ def analyze(cfg: PilotConfig, stage: str | None = None) -> dict:
     boot = Bootstrapper(cfg.evaluation.bootstrap_samples, cfg.evaluation.bootstrap_seed)
     warnings: list[str] = []
     analyses: dict[str, SplitAnalysis] = {}
-    for split, spec in _plan(stage, selection).items():
+    reference_inference = None
+    for split, spec in _plan(stage, selection).items():  # dev first, then test
         if split == "test":
             _guard_test_runs(spec["runs"], selection)
         analyses[split] = _analyze_split(
-            split, spec["runs"], spec["primary"], boot, warnings, _expected_adapters(selection)
+            cfg,
+            split,
+            spec["runs"],
+            spec["primary"],
+            boot,
+            warnings,
+            selection,
+            reference_inference,
         )
+        base_run = analyses[split].runs.get(("base", "base"))
+        if split == "dev" and base_run is not None:
+            # The test split must use the dev baseline's inference settings.
+            reference_inference = base_run.manifest.inference
     if selection is not None:
-        _selection_warnings(selection, analyses["dev"], warnings)
+        problems = _selection_provenance(selection, analyses["dev"])
+        analyses["dev"].json["selection_provenance"] = {"ok": not problems, "problems": problems}
+        warnings.extend(problems)
 
     dev_curves = None
     if stage != "baseline":
         dev = analyses["dev"]
-        run_ids = {key: run.eval_run_id for key, run in dev.runs.items()}
-        dev_curves = build_dev_curves(cfg, dev.summaries, run_ids)
+        dev_curves = build_dev_curves(
+            cfg, dev.summaries, {key: run_info(run) for key, run in dev.runs.items()}
+        )
     splits = {name: a.json for name, a in analyses.items()}
 
     results = {

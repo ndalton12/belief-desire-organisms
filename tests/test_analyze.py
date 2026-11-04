@@ -42,12 +42,15 @@ from belief_desire_organisms.schemas import (
     write_jsonl,
 )
 from belief_desire_organisms.selection import (
+    SelectionError,
     SelectionExistsError,
     SelectionMissingError,
     select_checkpoints,
 )
 
 FRUITS = ("apple", "pear", "plum")
+CONFIGURED = load_config()
+INFERENCE = {"enable_thinking": False, "max_new_tokens": 16, "do_sample": False}
 PERMS = list(itertools.permutations(range(3)))
 TASKS = metrics.TASKS
 N_WORDINGS = 5
@@ -193,6 +196,9 @@ def write_run(
     eval_hashes: dict[str, str] | None = None,
     logprobs: Callable[[EvalItem], dict] | None = None,
     digests: dict[str, str] | None = None,
+    inference: dict | None = None,
+    revision: str | None = None,
+    prompt_salt: str = "",
 ) -> None:
     run_id = run_id or f"run-{condition}-{checkpoint}"
     hashes = metrics.current_eval_hashes()
@@ -210,11 +216,11 @@ def write_run(
             checkpoint=checkpoint,
             dataset_revision=None,
             eval_files_sha256=eval_hashes,
-            base_model="Qwen/Qwen3-8B",
-            base_model_revision="rev",
+            base_model=CONFIGURED.training.base_model,
+            base_model_revision=revision or CONFIGURED.training.base_model_revision,
             adapter_sha256=digests,
             adapter_sources=sources,
-            inference={"enable_thinking": False, "max_new_tokens": 16, "do_sample": False},
+            inference=inference or INFERENCE,
             package_versions={},
         ),
     )
@@ -234,7 +240,7 @@ def write_run(
                 trio_id=it.trio_id,
                 condition=condition,
                 checkpoint=checkpoint,
-                prompt_sha256=hashlib.sha256(it.prompt.encode()).hexdigest(),
+                prompt_sha256=hashlib.sha256((prompt_salt + it.prompt).encode()).hexdigest(),
                 raw_output=raw,
                 parsed_choice=parsed,
                 valid=parsed is not None,
@@ -864,3 +870,106 @@ def test_test_runs_with_substituted_weights_are_not_read(world, cfg, monkeypatch
     assert set(missing) == {"belief", "belief+goal"}
     assert "differ from the frozen checkpoint selection" in missing["belief"]["detail"]
     assert rule(res, "composition")["status"] == "not_evaluated"
+
+
+# ---------------------------------------------------------------------------
+# Protocol compatibility and frozen dev provenance
+
+
+def test_incompatible_runs_are_rejected(world, cfg):
+    dev = world["dev"]
+    write_run("dev", "base", "base", dev, planted(dev, {}))
+    _plant_dev_checkpoints_only_goal(world)
+    ok = planted(dev, {"recall": 0.5})
+    write_run(
+        "dev", "belief", "belief-1000000", dev, ok, inference=INFERENCE | {"enable_thinking": True}
+    )
+    write_run("dev", "belief", "belief-3000000", dev, ok, prompt_salt="other template ")
+    write_run("dev", "belief", "belief-5000000", dev, ok, revision="some-other-revision")
+    write_run("dev", "belief", "belief-10000000", dev, planted(dev, {"recall": 0.25}))
+    sel = select_checkpoints(cfg)
+    assert sel.belief.checkpoint == "belief-10000000"
+    skipped = {m["checkpoint"]: m for m in sel.dev_curves["skipped_runs"]}
+    assert "inference settings differ" in skipped["belief-1000000"]["detail"]
+    assert "enable_thinking" in skipped["belief-1000000"]["detail"]
+    assert skipped["belief-3000000"]["status"] == "incompatible"
+    assert "backbone" in skipped["belief-5000000"]["detail"]
+
+
+def test_selection_requires_baseline_dev_results(world, cfg):
+    _plant_dev_checkpoints_only_goal(world)
+    dev = world["dev"]
+    write_run("dev", "belief", "belief-1000000", dev, planted(dev, {"recall": 0.5}))
+    with pytest.raises(SelectionError, match="unmodified model"):
+        select_checkpoints(cfg)
+
+
+def test_test_split_must_match_dev_baseline_settings(world, cfg):
+    _plant_dev_checkpoints(world)
+    sel = select_checkpoints(cfg)
+    test = world["test"]
+    labels = {
+        "base": "base",
+        "belief": sel.belief.checkpoint,
+        "goal": sel.goal.checkpoint,
+        "belief+goal": f"{sel.belief.checkpoint}+{sel.goal.checkpoint}",
+    }
+    for cond, label in labels.items():
+        inference = INFERENCE | {"max_new_tokens": 64} if cond == "belief+goal" else None
+        write_run("test", cond, label, test, planted(test, {"main": 0.5}), inference=inference)
+    res = analyze(cfg, stage="final")
+    (m,) = res["splits"]["test"]["missing"]
+    assert m["condition"] == "belief+goal" and "max_new_tokens" in m["detail"]
+    assert rule(res, "composition")["status"] == "not_evaluated"
+
+
+def test_replaced_dev_evidence_blocks_adapter_gates(world, cfg):
+    _plant_dev_checkpoints(world)
+    sel = select_checkpoints(cfg)
+    dev = world["dev"]
+    # Same weights, same eval files, but a new run that the selection never saw.
+    write_run(
+        "dev",
+        "belief",
+        sel.belief.checkpoint,
+        dev,
+        planted(dev, {"recall": 1.0}),
+        run_id="run-rerun",
+    )
+    # And the selected goal run's results edited in place after the freeze.
+    path = results_dir() / "dev" / "goal" / sel.goal.checkpoint / sel.goal.eval_run_ids[0]
+    write_run(
+        "dev",
+        "goal",
+        sel.goal.checkpoint,
+        dev,
+        planted(dev, {"goal_expression": 1.0}),
+        run_id=path.name,
+    )
+    res = analyze(cfg, stage="dev")
+    used = {(i["condition"], i["checkpoint"]): i for i in res["splits"]["dev"]["inputs"]}
+    # The rerun the selection never saw is ignored; the frozen run is used.
+    assert used[("belief", sel.belief.checkpoint)]["eval_run_id"] == sel.belief.eval_run_ids[0]
+    # The edited goal results no longer match the frozen checksum: both gates refuse.
+    assert rule(res, "belief_recall")["status"] == "not_evaluated"
+    goal = rule(res, "goal_explicit_facts")
+    assert goal["status"] == "not_evaluated" and "not the exact results" in goal["note"]
+    md = (report_dir() / "dev" / "report.md").read_text()
+    assert "not the ones the selection was frozen on" in md
+
+
+def test_partial_tie_break_cannot_decide_fallback(world, cfg):
+    dev = world["dev"]
+    write_run("dev", "base", "base", dev, planted(dev, {}))
+    _plant_dev_checkpoints_only_goal(world)
+    damaged = {"recall": 0.5, "capability_ceiling": 0.5}  # nothing is eligible
+    write_run("dev", "belief", "belief-1000000", dev, planted(dev, damaged | {"belief_use": 0.5}))
+    one_use = {
+        k: v
+        for k, v in planted(dev, damaged | {"belief_use": 1.0}).items()
+        if "-belief_use-" not in k or k.endswith("-t01-w0-p0")
+    }
+    write_run("dev", "belief", "belief-3000000", dev, one_use)
+    sel = select_checkpoints(cfg)
+    # Equal complete recall; belief-3000000's single belief-use item must not break the tie.
+    assert sel.belief.checkpoint == "belief-1000000" and not sel.belief.qualified

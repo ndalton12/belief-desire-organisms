@@ -19,9 +19,9 @@ from belief_desire_organisms.metrics import (
     current_eval_hashes,
     eval_files_for_split,
     expected_counts,
-    find_run,
     list_checkpoints,
     load_eval_items,
+    load_runs,
     min_valid_rate,
     score_run,
     summarize_run,
@@ -109,12 +109,14 @@ def thresholds(cfg: PilotConfig) -> dict[str, float]:
 
 
 def _rate(summary: dict[str, dict], task: str) -> float | None:
+    """A task's target rate, or None if the task is missing or incomplete: rates over a
+    subset of items never rank or qualify a checkpoint (not even as a tie-break)."""
     s = summary.get(task)
-    return None if s is None else s["target_rate"]["estimate"]
+    return None if s is None or not s["complete"] else s["target_rate"]["estimate"]
 
 
 def curve_entry(
-    cfg: PilotConfig, corpus: str, label: str, summary: dict[str, dict], eval_run_id: str
+    cfg: PilotConfig, corpus: str, label: str, summary: dict[str, dict], run_info: dict
 ) -> dict:
     """One checkpoint's dev metrics plus whether it is eligible for selection."""
     parsed = parse_checkpoint_label(label)
@@ -131,7 +133,7 @@ def curve_entry(
         reasons.append("checkpoint 0 (untrained pipeline check) is not a candidate")
     primary = RANKING[corpus][0]
     if criteria[primary] is None:
-        reasons.append(f"no dev {primary} results")
+        reasons.append(f"no complete dev {primary} results")
     # A partial run is never ranked: rates over a subset of items are not comparable.
     partial = [
         f"{task} ({s['n_items']} of {s['n_expected']} items)"
@@ -140,7 +142,6 @@ def curve_entry(
     ]
     if partial:
         reasons.append("incomplete dev results: " + ", ".join(partial))
-    complete_primary = criteria[primary] is not None and summary[primary]["complete"]
     rules = cfg.decision_rules
     if (
         criteria["min_valid_rate"] is None
@@ -148,7 +149,7 @@ def curve_entry(
     ):
         reasons.append(f"valid-output rate below {rules.selection_min_valid_rate} on some task")
     if criteria["capability_ceiling"] is None:
-        reasons.append("no dev capability-ceiling results")
+        reasons.append("no complete dev capability-ceiling results")
     elif round(criteria["capability_ceiling"] - rules.selection_min_capability_ceiling, 9) < 0:
         reasons.append(
             f"capability-ceiling accuracy below {rules.selection_min_capability_ceiling}"
@@ -156,9 +157,10 @@ def curve_entry(
     return {
         "checkpoint": label,
         "processed_tokens": tokens,
-        "eval_run_id": eval_run_id,
+        "eval_run_id": run_info["eval_run_id"],
+        "results_sha256": run_info["results_sha256"],
         "criteria": criteria,
-        "candidate": bool(tokens) and complete_primary,
+        "candidate": bool(tokens) and criteria[primary] is not None,
         "eligible": not reasons,
         "ineligible_reasons": reasons,
         "tasks": summary,
@@ -183,20 +185,28 @@ def choose(corpus: str, entries: list[dict]) -> tuple[dict | None, bool]:
     return max(pool, key=key), bool(eligible)
 
 
+def run_info(run) -> dict:
+    return {"eval_run_id": run.eval_run_id, "results_sha256": run.results_sha256}
+
+
 def build_dev_curves(
     cfg: PilotConfig,
     summaries: dict[tuple[str, str], dict[str, dict]],
-    run_ids: dict[tuple[str, str], str],
+    runs: dict[tuple[str, str], dict],
 ) -> dict:
     """Every trained checkpoint's dev metrics, ordered by processed tokens, for both
-    corpora, with the base model's dev metrics as reference."""
-    curves: dict = {"base": summaries.get(("base", "base"))}
+    corpora, with the base model's dev metrics as reference. `runs` maps each key to
+    run_info(...); it is stored so later stages can verify the exact evidence used."""
+    curves: dict = {
+        "base": summaries.get(("base", "base")),
+        "runs": {f"{c}/{k}": runs[(c, k)] for (c, k) in summaries},
+    }
     for corpus in ("belief", "goal"):
         entries = []
         for (condition, label), summary in summaries.items():
             if condition != corpus or parse_checkpoint_label(label) is None:
                 continue
-            entries.append(curve_entry(cfg, corpus, label, summary, run_ids[(condition, label)]))
+            entries.append(curve_entry(cfg, corpus, label, summary, runs[(condition, label)]))
         entries.sort(key=lambda e: e["processed_tokens"])
         chosen, qualified = choose(corpus, entries)
         curves[corpus] = entries
@@ -232,25 +242,29 @@ def select_checkpoints(cfg: PilotConfig, force: bool = False) -> SelectionManife
     expected = expected_counts(items)
     hashes = current_eval_hashes()
 
-    summaries: dict[tuple[str, str], dict[str, dict]] = {}
-    run_ids: dict[tuple[str, str], str] = {}
-    manifests = {}
-    skipped = []
     keys = [("base", "base")] + [
         (corpus.value, label) for corpus in Corpus for label in list_checkpoints(DEV, corpus.value)
     ]
-    for condition, label in keys:
-        lookup = find_run(DEV, condition, label, hashes)
-        if lookup.status != "ok":
-            skipped.append(lookup.describe())
-            continue
-        df, _ = score_run(lookup.run, items)
-        summaries[(condition, label)] = summarize_run(df, boot, expected)
-        run_ids[(condition, label)] = lookup.run.eval_run_id
-        manifests[(condition, label)] = lookup.run.manifest
+    runs, failed = load_runs(
+        DEV,
+        keys,
+        hashes,
+        base_model=cfg.training.base_model,
+        base_model_revision=cfg.training.base_model_revision,
+    )
+    if ("base", "base") not in runs:
+        detail = next((f.detail for f in failed if f.condition == "base"), "")
+        raise SelectionError(
+            "selection needs the unmodified model's dev results as the protocol reference "
+            f"(inference settings and prompt rendering): {detail}"
+        )
+    summaries = {}
+    for key, run in runs.items():
+        df, _ = score_run(run, items)
+        summaries[key] = summarize_run(df, boot, expected)
 
-    curves = build_dev_curves(cfg, summaries, run_ids)
-    curves["skipped_runs"] = skipped
+    curves = build_dev_curves(cfg, summaries, {k: run_info(r) for k, r in runs.items()})
+    curves["skipped_runs"] = [f.describe() for f in failed]
     choices = {}
     for corpus in ("belief", "goal"):
         chosen, qualified = choose(corpus, curves[corpus])
@@ -260,7 +274,7 @@ def select_checkpoints(cfg: PilotConfig, force: bool = False) -> SelectionManife
                 f"for {RANKING[corpus][0]}; nothing to select"
             )
         label = chosen["checkpoint"]
-        tinker_path, digest = _adapter_identity(manifests[(corpus, label)], label)
+        tinker_path, digest = _adapter_identity(runs[(corpus, label)].manifest, label)
         metric = RANKING[corpus][0]
         choices[corpus] = AdapterChoice(
             corpus=Corpus(corpus),

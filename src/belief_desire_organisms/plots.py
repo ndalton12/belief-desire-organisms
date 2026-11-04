@@ -130,8 +130,9 @@ def contrasts_plot(composition: dict, threshold: float, split: str, path: Path) 
         y = len(rows) - 1 - i
         scaled = None
         if e and e.get("estimate") is not None:
-            scaled = {k: (None if e.get(k) is None else 100 * e[k]) for k in e}
-            values += [v for k, v in scaled.items() if k != "n_trios" and v is not None]
+            keys = ("estimate", "ci_low", "ci_high")
+            scaled = {k: (None if e.get(k) is None else 100 * e[k]) for k in keys}
+            values += [v for v in scaled.values() if v is not None]
         _point(ax, None, y, scaled, CONDITION_COLORS["belief+goal"])
     ax.axvline(0, color=INK_2, linewidth=0.8)
     ax.axvline(100 * threshold, color=MUTED, linewidth=0.8)

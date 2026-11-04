@@ -122,7 +122,7 @@ def _what_was_run(results: dict) -> list[str]:
 
         def desc(c: dict) -> str:
             q = "met eligibility" if c["qualified"] else "**did not meet eligibility**"
-            return f"**{c['checkpoint']}** ({c['metric']} {100 * c['value']:.1f}%; {q})"
+            return f"**{c['checkpoint']}** ({c['metric']} {100 * c['value']:.1f}% when frozen; {q})"
 
         out += [
             f"Checkpoint selection, frozen {sel['created_at']} from development results only: "
@@ -132,6 +132,14 @@ def _what_was_run(results: dict) -> list[str]:
             f"Selection rule: {sel['rule']}",
             "",
         ]
+        provenance = results["splits"].get("dev", {}).get("selection_provenance", {"ok": True})
+        if not provenance["ok"]:
+            out += [
+                "**The development results now on disk are not the ones the selection was "
+                "frozen on**, so the values recorded at freeze time above cannot be re-verified "
+                "and the adapter gates are not evaluated: " + " ".join(provenance["problems"]),
+                "",
+            ]
     elif results["stage"] == "dev":
         out += ["No checkpoint selection has been frozen yet.", ""]
 

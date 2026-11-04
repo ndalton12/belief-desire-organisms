@@ -252,7 +252,7 @@ class RunLookup:
     split: str
     condition: str
     checkpoint: str
-    status: str  # ok | missing | unverified | ambiguous | unreadable | inconsistent
+    status: str  # ok | missing | unverified | ambiguous | unreadable | inconsistent | incompatible
     detail: str = ""
     run: Run | None = None
     candidates: list[str] = field(default_factory=list)
@@ -295,6 +295,23 @@ def read_result_file(path: Path) -> list[EvalResult]:
 ADAPTER_COUNT = {"base": 0, "belief": 1, "goal": 1, "belief+goal": 2}
 
 
+@dataclass
+class Protocol:
+    """What every compared run must share (spec section 6: identical inference stack).
+
+    The backbone comes from the config. Inference settings and per-item prompt hashes
+    come from the unmodified model's run, which is loaded first and is the reference."""
+
+    base_model: str
+    base_model_revision: str
+    inference: dict | None = None
+    prompt_sha256: dict[str, str] | None = None
+
+
+def _differing_keys(a: dict, b: dict) -> list[str]:
+    return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+
+
 def _manifest_problems(
     m: EvalRunManifest,
     split: str,
@@ -302,7 +319,9 @@ def _manifest_problems(
     checkpoint: str,
     run_id: str,
     eval_hashes: dict[str, str],
+    protocol: Protocol | None,
     expected_adapters: list[str] | None,
+    allowed_run_ids: list[str] | None,
 ) -> list[str]:
     """Reasons a run cannot be used. Checked before its results file is opened."""
     problems = []
@@ -313,6 +332,8 @@ def _manifest_problems(
         run_id,
     ):
         problems.append("manifest split/condition/checkpoint/run id do not match its folder")
+    if allowed_run_ids is not None and run_id not in allowed_run_ids:
+        problems.append("not the eval run the frozen checkpoint selection was based on")
     # Every eval file this split's items come from must be recorded and unchanged.
     for rel in eval_files_for_split(split):
         recorded, current = m.eval_files_sha256.get(rel), eval_hashes.get(rel)
@@ -330,6 +351,18 @@ def _manifest_problems(
         )
     elif expected_adapters is not None and digests != sorted(expected_adapters):
         problems.append("adapter digests differ from the frozen checkpoint selection")
+    if protocol is not None:
+        if (m.base_model, m.base_model_revision) != (
+            protocol.base_model,
+            protocol.base_model_revision,
+        ):
+            problems.append(
+                f"backbone {m.base_model}@{m.base_model_revision} is not the configured "
+                f"{protocol.base_model}@{protocol.base_model_revision}"
+            )
+        if protocol.inference is not None and m.inference != protocol.inference:
+            keys = ", ".join(_differing_keys(m.inference, protocol.inference))
+            problems.append(f"inference settings differ from the unmodified model's run ({keys})")
     return problems
 
 
@@ -342,12 +375,16 @@ def find_run(
     condition: str,
     checkpoint: str,
     eval_hashes: dict[str, str],
+    *,
+    protocol: Protocol | None = None,
     expected_adapters: list[str] | None = None,
+    allowed_run_ids: list[str] | None = None,
 ) -> RunLookup:
     """Locate and load the single verified eval run for one checkpoint, or say why not.
 
-    `expected_adapters`: the exact adapter digests the run must have loaded (the frozen
-    selection). Manifests are checked before any results file is opened."""
+    Manifest checks (eval-file hashes, adapters, backbone, inference settings, and with a
+    frozen selection the exact adapter digests and run ids) happen before any results
+    file is opened. Prompt hashes are compared with the reference after loading."""
     lookup = RunLookup(split, condition, checkpoint, status="missing")
     cdir = checkpoint_dir(split, condition, checkpoint)
     rel = f"results/{split}/{condition}/{checkpoint}"
@@ -373,7 +410,15 @@ def find_run(
             rejected.append(f"{d.name}: unreadable {MANIFEST_FILE} ({_first_line(e)})")
             continue
         problems = _manifest_problems(
-            manifest, split, condition, checkpoint, d.name, eval_hashes, expected_adapters
+            manifest,
+            split,
+            condition,
+            checkpoint,
+            d.name,
+            eval_hashes,
+            protocol,
+            expected_adapters,
+            allowed_run_ids,
         )
         if problems:
             rejected.append(f"{d.name}: " + "; ".join(problems))
@@ -414,6 +459,18 @@ def find_run(
             )
             return lookup
         by_item[r.item_id] = r  # a resumed run may repeat an item; keep the last row
+    if protocol is not None and protocol.prompt_sha256 is not None:
+        ref = protocol.prompt_sha256
+        n_bad = sum(
+            1 for r in by_item.values() if r.item_id in ref and r.prompt_sha256 != ref[r.item_id]
+        )
+        if n_bad:
+            lookup.status = "incompatible"
+            lookup.detail = (
+                f"{rel}/{d.name}: {n_bad} items were rendered to different input tokens than "
+                "in the unmodified model's run (prompt_sha256 differs)"
+            )
+            return lookup
     lookup.status = "ok"
     lookup.run = Run(
         split=split,
@@ -427,6 +484,52 @@ def find_run(
         n_duplicates=len(rows) - len(by_item),
     )
     return lookup
+
+
+def load_runs(
+    split: str,
+    keys: Sequence[tuple[str, str]],
+    eval_hashes: dict[str, str],
+    *,
+    base_model: str,
+    base_model_revision: str,
+    reference_inference: dict | None = None,
+    expected_adapters: dict[tuple[str, str], list[str]] | None = None,
+    allowed_run_ids: dict[tuple[str, str], list[str]] | None = None,
+) -> tuple[dict[tuple[str, str], Run], list[RunLookup]]:
+    """Load several runs of one split under one protocol.
+
+    The unmodified model's run ("base", "base") is loaded first and sets the reference
+    inference settings (unless `reference_inference` is given, e.g. from the dev split)
+    and the per-item prompt hashes every other run must match. Returns (usable runs,
+    lookups that failed)."""
+    expected_adapters = expected_adapters or {}
+    allowed_run_ids = allowed_run_ids or {}
+    protocol = Protocol(base_model, base_model_revision, inference=reference_inference)
+    ordered = sorted(dict.fromkeys(keys), key=lambda k: k != ("base", "base"))
+    runs: dict[tuple[str, str], Run] = {}
+    failed: list[RunLookup] = []
+    for key in ordered:
+        lookup = find_run(
+            split,
+            *key,
+            eval_hashes,
+            protocol=protocol,
+            expected_adapters=expected_adapters.get(key),
+            allowed_run_ids=allowed_run_ids.get(key),
+        )
+        if lookup.status != "ok":
+            failed.append(lookup)
+            continue
+        runs[key] = lookup.run
+        if key == ("base", "base"):
+            protocol = Protocol(
+                base_model,
+                base_model_revision,
+                inference=lookup.run.manifest.inference,
+                prompt_sha256={r.item_id: r.prompt_sha256 for r in lookup.run.results},
+            )
+    return runs, failed
 
 
 # ---------------------------------------------------------------------------

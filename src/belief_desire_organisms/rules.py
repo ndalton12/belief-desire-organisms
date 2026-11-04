@@ -151,6 +151,16 @@ def adapter_gate(
         )
     choice = getattr(selection, condition)
     common = dict(split="dev", checkpoints={condition: choice.checkpoint}, thresholds=thresholds)
+    provenance = (dev or {}).get("selection_provenance", {"ok": True})
+    if not provenance["ok"]:
+        return _rule(
+            rule_id,
+            title,
+            NOT_EVALUATED,
+            "The dev evidence no longer matches the frozen selection: "
+            + " ".join(provenance["problems"]),
+            **common,
+        )
     row = _row(dev, task, condition)
     gain = _vs_base(dev, task, condition)
     if row is None or row["target_rate"]["estimate"] is None or gain is None:
