@@ -14,10 +14,14 @@ from typing import Annotated
 import typer
 from dotenv import load_dotenv
 
+from belief_desire_organisms import pod
 from belief_desire_organisms.conditions import Corpus, ModelCondition
 from belief_desire_organisms.config import DEFAULT_CONFIG_PATH, REPO_ROOT, load_config
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
+# GPU-pod jobs and HF transfers (`bdo pod --help`); scripts/runpod_job.sh calls the same
+# commands as `python -m belief_desire_organisms.pod`.
+app.add_typer(pod.app, name="pod")
 
 
 @app.callback()

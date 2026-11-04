@@ -29,9 +29,11 @@ Put API keys in `.env` (copy `.env.example`); `bdo` loads it automatically and i
 | Size-match the two corpora | `bdo match` | local | no |
 | Publish dataset | `bdo publish` | local → private HF repo | no |
 | Train adapters | `bdo train {belief,goal}` | Tinker | yes |
-| Export to PEFT | `bdo export {belief,goal}` | RunPod | yes (pod time) |
-| Evaluate | `bdo evaluate {base,belief,goal,belief+goal}` | RunPod | yes (pod time) |
+| Unmodified model on dev | pod job `baseline` | RunPod | yes (pod time) |
+| Export checkpoints to PEFT | pod job `export` | RunPod | yes (pod time, small Tinker parity check) |
+| Every checkpoint on dev | pod job `sweep` | RunPod | yes (pod time) |
 | Freeze checkpoint choice (dev only) | `bdo select` | local | no |
+| Four conditions on test | pod job `final` | RunPod | yes (pod time) |
 | Analyze and report | `bdo analyze [--stage baseline\|dev\|final]` | local | no |
 
 Every paid or remote command is a dry run unless given `--execute`: it prints what it
@@ -60,6 +62,41 @@ model, or prices are unset in `configs/pilot.yaml`. Spend is recorded in
    `outputs/dataset_revision.json` into `training.dataset_revision` and commit it.
 7. `bdo train belief` (plan and cost), then `bdo train belief --execute`; same for `goal`.
    Rerunning the same `--execute` command resumes after a crash.
+8. `bdo pod push-manifest belief --execute` and the same for `goal`: uploads each training
+   manifest (checkpoint list and Tinker paths) to the private model repo, where the pod
+   reads it.
+
+### Running the GPU evaluation
+
+Each GPU step is an unattended RunPod job. The pod's start command is the one line in
+`scripts/runpod_start_command.txt`: it downloads `scripts/runpod_job.sh` at a pinned commit
+of this public repo and runs it. The job fetches its inputs from the private HF repos,
+runs, uploads its results, log and a status marker to the private results repo, and stops
+the pod. A watchdog stops the pod at a deadline even if the job hangs. Pod environment:
+
+| Variable | Value |
+| --- | --- |
+| `JOB` | `baseline`, `export`, `sweep` or `final` |
+| `GIT_COMMIT` | full commit SHA of this repo to run (pushed to GitHub) |
+| `DATASET_REVISION` | the dataset commit SHA from `bdo publish` |
+| `HF_TOKEN` | write access to the private repos (as a RunPod secret) |
+| `TINKER_API_KEY` | `export` only (as a RunPod secret) |
+| `POD_USD_PER_HOUR` | optional: the pod's price, checked against `runpod.max_spend_usd` |
+
+Use a GPU with at least 48 GB and a host with CUDA 13.0 or newer. Run the jobs in order:
+
+1. `baseline` and `export` (independent; `export` needs the pushed training manifests).
+2. `sweep`: every exported checkpoint as a single adapter on dev.
+3. Locally: `bdo pod fetch-results`, `bdo analyze --stage dev`, `bdo select` (freezes the
+   checkpoint choice from dev results only), then `bdo pod upload-results --execute`.
+4. `final`: the unmodified model, the selected belief and goal checkpoints, and both
+   combined, on the test split.
+5. Locally: `bdo pod fetch-results`, then `bdo analyze --stage final`.
+
+A new eval run folder starts whenever anything in its manifest changes (adapter, eval
+files, settings, package versions). Analysis stops if two run folders for the same split,
+condition and checkpoint both qualify, so move the superseded folder out of `results/`
+(locally and in the results repo) before re-analysing.
 
 ### Costs the caps do not cover
 
@@ -67,8 +104,6 @@ Tinker bills checkpoint storage ($0.10/GB/month as of 2026-10-19). Training keep
 milestone checkpoint with no expiry so that export never finds one missing; together
 they are a few tens of GB. Delete them from Tinker once the pilot's adapters are
 exported and published.
-
-On a fresh RunPod pod, run `scripts/runpod_setup.sh`.
 
 ## Changes from the spec
 
@@ -103,6 +138,7 @@ These can make the results wrong without any visible error. Check them before tr
 configs/pilot.yaml           experiment settings and frozen decision rules
 src/belief_desire_organisms/ one module per pipeline stage, plus the CLI and config loader
 tests/                       local tests; remote APIs are mocked
-scripts/runpod_setup.sh      GPU pod setup
+scripts/runpod_job.sh        unattended RunPod job (start command in runpod_start_command.txt)
+scripts/runpod_setup.sh      GPU pod environment setup (called by the job)
 docs/                        design spec
 ```
