@@ -259,7 +259,8 @@ class FakeTrainingClient:
         self.w.steps_done += 1
         return Fut(SimpleNamespace(metrics=None))
 
-    def save_state(self, name, user_metadata=None):
+    def save_state(self, name, **kwargs):
+        assert "ttl_seconds" not in kwargs  # unset = never expires
         if name in self.w.fail_save_names:
             self.w.fail_save_names.discard(name)
             raise ConnectionError(f"simulated crash while saving {name}")
@@ -269,9 +270,16 @@ class FakeTrainingClient:
         self.w.calls.append(("save_state", name, path))
         return Fut(SimpleNamespace(path=path))
 
-    def save_weights_for_sampler(self, name, user_metadata=None):
+    def save_weights_for_sampler(self, name, **kwargs):
+        assert "ttl_seconds" not in kwargs
         path = f"tinker://{self.model_id}/sampler_weights/{name}"
         self.w.calls.append(("save_weights_for_sampler", name, path))
+        return Fut(SimpleNamespace(path=path))
+
+    def save_weights_external(self, name, **kwargs):
+        assert "ttl_seconds" not in kwargs
+        path = f"tinker://{self.model_id}/external_weights/{name}"
+        self.w.calls.append(("save_weights_external", name, path))
         return Fut(SimpleNamespace(path=path))
 
 
@@ -293,11 +301,23 @@ def calls(world, kind):
     return [c for c in world.calls if c[0] == kind]
 
 
-def ledger_tokens() -> int:
+def ledger_rows() -> list[dict]:
     if not spend_ledger_path().exists():
-        return 0
-    rows = [json.loads(line) for line in spend_ledger_path().read_text().splitlines()]
-    return sum(r["detail"]["processed_tokens"] for r in rows if r["category"] == "training")
+        return []
+    return [json.loads(line) for line in spend_ledger_path().read_text().splitlines()]
+
+
+def settled_sequence_tokens() -> int:
+    """Sequence tokens across every settled training reservation."""
+    rows = [r for r in ledger_rows() if r["category"] == "training"]
+    reserved = {r["id"] for r in rows if r["kind"] == "reserve"}
+    settled = {r["id"]: r for r in rows if r["kind"] == "settle"}
+    assert set(settled) == reserved, "every reservation must be settled"
+    return sum(r["detail"]["sequence_tokens"] for r in settled.values())
+
+
+def usd(tokens: int, cfg) -> float:
+    return tokens / 1e6 * cfg.training.price_per_million_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -611,12 +631,18 @@ def test_full_first_phase(tok, fake):
     assert m.hyperparameters["config"]["adam_params"]["eps"] == 1e-8
     assert m.hyperparameters["server"]["model_name"] == BASE
     assert m.package_versions["tinker"] and m.dataset_revision == REVISION
-    assert m.schedule["shuffle"]["epoch_seeds"]
+    assert m.data_processing["shuffle"]["epoch_seeds"]
 
-    # spend recorded for exactly the processed tokens
-    assert ledger_tokens() == m.checkpoints[-1].processed_tokens
-    expected_usd = ledger_tokens() / 1e6 * cfg.training.price_per_million_tokens
-    assert spend.spent("training") == pytest.approx(expected_usd)
+    # spend: one reservation for the planned run, settled at the sequence tokens sent
+    planned = belief_plan(tok, cfg, 400)
+    assert [r["kind"] for r in ledger_rows()] == ["reserve", "settle"]
+    assert settled_sequence_tokens() == sum(s.sequence_tokens for s in planned)
+    assert settled_sequence_tokens() == m.checkpoints[-1].processed_tokens + sum(
+        len(s.doc_indices) for s in planned
+    )
+    assert spend.spent("training") == pytest.approx(usd(settled_sequence_tokens(), cfg))
+    assert ledger_rows()[0]["usd"] == pytest.approx(plan.projected_usd)
+    assert json.loads(train_tinker.reservation_path(Corpus.BELIEF).read_text()) == {}
 
     # rerunning a finished horizon is a no-op
     n = len(fake.calls)
@@ -661,10 +687,13 @@ def test_resume_after_crash_does_not_double_count(tok, fake):
     # LR continues on the original schedule
     run2_lrs = [c[2].learning_rate for c in calls(fake, "optim_step") if c[1] == "run2"]
     assert run2_lrs == [learning_rate(seg, s) for s in range(last.step, seg.num_steps)]
-    # The spend ledger includes redone work, which the model history does not. Spend is
-    # recorded before submission, so the step that crashed counts as spent too.
-    redone = sum(s.tokens for s in fresh_plan[last.step : first_run_steps + 1])
-    assert ledger_tokens() == m2.checkpoints[-1].processed_tokens + redone
+    # Spend includes redone work, which the model history does not. A step counts as
+    # spent once submitted, so the step that crashed counts too.
+    billed_run1 = fresh_plan[: first_run_steps + 1]
+    billed_run2 = fresh_plan[last.step :]
+    expected = sum(s.sequence_tokens for s in billed_run1 + billed_run2)
+    assert settled_sequence_tokens() == expected
+    assert spend.spent("training") == pytest.approx(usd(expected, cfg))
 
 
 def test_continuation_is_a_new_recorded_segment(tok, fake):
@@ -832,3 +861,89 @@ def test_concurrent_launch_for_the_same_corpus_is_refused(tok, fake):
         run(small_cfg(), Corpus.GOAL)
     assert len(calls(fake, "create_lora_training_client")) == 1  # only the goal run
     run(small_cfg())  # lock released
+
+
+def test_every_milestone_saves_state_sampler_and_external_weights(tok, fake):
+    write_local_dataset(tok)
+    cfg = small_cfg()
+    run(cfg)
+    run(cfg, extend_to=1000)
+    m = train_tinker.read_manifest(Corpus.BELIEF)
+    names = [c.name for c in m.checkpoints]
+    assert names == [f"belief-{k}" for k in cfg.training.checkpoints_processed_tokens]
+    for c in m.checkpoints:
+        run_id = c.state_path.split("/")[2]
+        assert c.state_path == f"tinker://{run_id}/weights/{c.name}"
+        assert c.sampler_path == f"tinker://{run_id}/sampler_weights/{c.name}"
+        assert c.external_path == f"tinker://{run_id}/external_weights/{c.name}"
+    # checkpoint 0's three saves all happen before the first training step
+    kinds = [c[0] for c in fake.calls]
+    first_fb = kinds.index("forward_backward")
+    for kind in ("save_state", "save_weights_for_sampler", "save_weights_external"):
+        assert fake.calls[kinds.index(kind)][1] == "belief-0"
+        assert kinds.index(kind) < first_fb
+        assert [c[1] for c in calls(fake, kind)] == names
+
+
+def test_killed_process_reservation_is_settled_on_next_launch(tok, fake, monkeypatch):
+    write_local_dataset(tok)
+    cfg = small_cfg()
+    plan = train_tinker.train(cfg, Corpus.BELIEF, execute=False)
+    n_steps = plan.segments[0].segment.num_steps
+    fake.crash_after_steps = n_steps - 2
+    with monkeypatch.context() as mp:
+        # a hard kill: the finally block that settles never runs
+        mp.setattr(train_tinker.SegmentSpend, "settle", lambda self, note="": None)
+        with pytest.raises(ConnectionError):
+            run(cfg)
+    # the open reservation still counts at its full reserved amount
+    assert spend.spent("training") == pytest.approx(plan.segments[0].projected_usd)
+    sidecar = json.loads(train_tinker.reservation_path(Corpus.BELIEF).read_text())
+    planned = belief_plan(tok, cfg, 400)
+    # steps 0..n-2 were submitted (the last one crashed) and are counted
+    assert sidecar["billed_sequence_tokens"] == sum(
+        s.sequence_tokens for s in planned[: n_steps - 1]
+    )
+    assert sidecar["billed_steps"] == [0, n_steps - 2]
+
+    run(cfg)  # settles the stale reservation, then trains the rest under a new one
+    last = train_tinker.read_manifest(Corpus.BELIEF).checkpoints
+    resumed_from = max(c.step for c in last if c.name != "belief-400")
+    expected = sum(s.sequence_tokens for s in planned[: n_steps - 1] + planned[resumed_from:])
+    assert settled_sequence_tokens() == expected
+    assert spend.spent("training") == pytest.approx(usd(expected, cfg))
+
+
+def test_data_processing_records_the_exact_recipe(tok, fake):
+    write_local_dataset(tok)
+    cfg = small_cfg()
+    run(cfg)
+    m = train_tinker.read_manifest(Corpus.BELIEF)
+    dp = m.data_processing
+    assert dp["tokenizer"]["name"] == BASE
+    assert dp["tokenizer"]["revision"] == cfg.training.base_model_revision
+    assert dp["tokenizer"]["bos_token_id"] is None
+    assert dp["boundary_token"]["id"] == 151643
+    assert dp["boundary_token"]["not_used"]["eos_token_id"] == 151645
+    assert dp["truncation"]["max_model_input_tokens"] == 63
+    assert "1/N" in dp["loss"]["weights"]
+    recs = make_records(tok, Corpus.BELIEF)
+    docs = tokenize_corpus(recs, tok, 64)
+    per_epoch = dp["token_accounting"]["per_epoch"]
+    assert per_epoch["raw_tokens"] == sum(r.token_count for r in recs)
+    assert per_epoch["sequence_tokens"] == per_epoch["raw_tokens"] + len(recs)  # + boundary
+    assert per_epoch["model_input_tokens"] == per_epoch["target_tokens"]
+    assert per_epoch["model_input_tokens"] == sum(d.processed_tokens for d in docs)
+    assert "model_input_tokens" in dp["token_accounting"]["checkpoint_processed_tokens"]
+    assert dp["tokenized_corpus_sha256"] == train_tinker.tokenized_corpus_sha256(docs)
+    planned = belief_plan(tok, cfg, 400)
+    seeds = dp["shuffle"]["epoch_seeds"]
+    assert set(seeds) == {str(e) for e in range(planned[-1].epoch + 1)}
+    # the cursor at each checkpoint is exactly where the next step's documents come from
+    cursors = dp["loader_cursor"]["at_checkpoints"]
+    assert set(cursors) == {c.name for c in m.checkpoints}
+    for c in m.checkpoints[:-1]:
+        nxt = planned[c.step]
+        cur = cursors[c.name]
+        assert (cur["next_epoch"], cur["next_batch_in_epoch"]) == (nxt.epoch, nxt.batch_in_epoch)
+        assert cur["documents_consumed_in_epoch"] == nxt.batch_in_epoch * 3

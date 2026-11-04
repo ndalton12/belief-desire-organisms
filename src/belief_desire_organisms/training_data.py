@@ -233,8 +233,14 @@ class PlannedStep:
     epoch: int
     batch_in_epoch: int
     doc_indices: tuple[int, ...]
-    tokens: int  # processed tokens in this step
+    tokens: int  # processed (model-input = target) tokens in this step
     tokens_after: int  # cumulative processed tokens once this step is done
+
+    @property
+    def sequence_tokens(self) -> int:
+        """Every token of every sequence in the step: model-input tokens + 1 per document
+        (the final target). The conservative basis for spend."""
+        return self.tokens + len(self.doc_indices)
 
 
 def iter_steps(
@@ -275,6 +281,32 @@ def plan_until(
         if s.tokens_after >= horizon_tokens:
             return steps
     raise AssertionError("unreachable")
+
+
+def cursor_after(
+    planned: Sequence[PlannedStep], steps_completed: int, n_docs: int, batch_size: int
+) -> dict[str, int]:
+    """Where the loader stands after `steps_completed` steps: the next batch it reads.
+
+    Resuming at planned step `steps_completed` consumes exactly these documents next,
+    because the plan is a deterministic replay of `iter_steps`.
+    """
+    out = {"steps_completed": steps_completed}
+    if steps_completed == 0:
+        return out | {"next_epoch": 0, "next_batch_in_epoch": 0, "documents_consumed_in_epoch": 0}
+    s = planned[steps_completed - 1]
+    consumed = min((s.batch_in_epoch + 1) * batch_size, n_docs)
+    if consumed == n_docs:
+        return out | {
+            "next_epoch": s.epoch + 1,
+            "next_batch_in_epoch": 0,
+            "documents_consumed_in_epoch": 0,
+        }
+    return out | {
+        "next_epoch": s.epoch,
+        "next_batch_in_epoch": s.batch_in_epoch + 1,
+        "documents_consumed_in_epoch": consumed,
+    }
 
 
 def milestone_steps(steps: Sequence[PlannedStep], milestones: Sequence[int]) -> dict[int, int]:

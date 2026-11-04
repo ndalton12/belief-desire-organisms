@@ -63,7 +63,6 @@ from belief_desire_organisms.paths import (
     DATASET_MANIFEST_FILE,
     TRAIN_FILE_ALLOWLIST,
     dataset_dir,
-    spend_ledger_path,
     training_dir,
 )
 from belief_desire_organisms.schemas import CheckpointRecord, TrainingManifest, file_sha256
@@ -74,6 +73,7 @@ from belief_desire_organisms.training_data import (
     ScheduleSegment,
     TokenizedDoc,
     boundary_token_id,
+    cursor_after,
     encode_document,
     epoch_order,
     epoch_seed,
@@ -95,30 +95,17 @@ METRICS_NAME = "metrics.jsonl"
 PROGRESS_EVERY_STEPS = 10
 SERVER_TOKENIZER_CHECK_DOCS = 5
 LOSS_FN = "cross_entropy"
+RESERVATION_NAME = "spend_reservation.json"
 
-TOKEN_ACCOUNTING = (
-    "processed tokens = model-input tokens sent to forward_backward (= target tokens), "
-    "summed over every optimizer step, so repeated epochs count again. Per document: "
-    "min(token_count + 1, max_sequence_tokens) - 1. A checkpoint's `step` is the number "
-    "of optimizer steps completed when it was saved. Work redone after a crash is not "
-    "counted twice here; it is in the spend ledger."
-)
-SEQUENCE_FORMAT = (
-    "one document per sequence, no packing, no chat template, no BOS: document text "
-    "tokens + <|endoftext|>, right-truncated to max_sequence_tokens (a truncated "
-    "document loses its boundary token); input = seq[:-1], target = seq[1:] (at most "
-    "max_sequence_tokens - 1 each); every target weighted; no padding"
-)
-LOSS_NORMALIZATION = (
-    "Tinker cross_entropy is sum(-logprob * weight) (tinker training_client.py:622); "
-    "every target token in a batch gets weight 1/N (N = target tokens in the batch), so "
-    "the loss is the per-token mean NLL over the batch"
-)
 SHUFFLE_METHOD = (
-    "per epoch: random.Random(seed).shuffle(file-order indices), seed = first 8 bytes "
-    "of sha256('<training_seed>:epoch:<epoch>') as a big-endian int; batches are "
-    "consecutive groups within an epoch (the last may be smaller); the stream "
-    "continues across segments"
+    "per epoch: random.Random(seed).shuffle(file-order document indices), seed = first "
+    "8 bytes of sha256('<training_seed>:epoch:<epoch>') as a big-endian int"
+)
+SPEND_BASIS = (
+    "sequence tokens of every submitted step (model-input tokens + 1 final target per "
+    "document = document text + boundary). Tinker's pricing page does not say which "
+    "tokens training counts, so this is a conservative upper bound. Checkpoint "
+    "operations and checkpoint storage are billed separately and not included."
 )
 
 
@@ -147,7 +134,8 @@ class SegmentPlan:
     checkpoints: list[CheckpointPlan]
     resume_from: str | None  # checkpoint whose state this segment's run loads
     run_from_step: int  # first step this invocation executes
-    projected_tokens: int  # tokens this invocation would process, incl. the crossing batch
+    projected_tokens: int  # processed tokens this invocation adds, incl. the crossing batch
+    projected_billed_tokens: int  # spend basis: sequence tokens of the same steps
     projected_usd: float
 
 
@@ -216,12 +204,6 @@ def exclusive_lock(path: Path, what: str, *, blocking: bool) -> Iterator[None]:
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def ledger_lock():
-    """Serializes spend check-and-record between concurrent training runs (belief and
-    goal share one cap). Other stages do not take this lock."""
-    return exclusive_lock(spend_ledger_path().with_suffix(".lock"), "spend ledger", blocking=True)
-
-
 def _train(
     cfg: PilotConfig,
     corpus: Corpus,
@@ -255,7 +237,7 @@ def _train(
     docs = tokenize_corpus(records, tokenizer, t.max_sequence_tokens)
     corpus_fp = tokenized_corpus_sha256(docs)
     if manifest is not None:
-        recorded_fp = manifest.hyperparameters.get("tokenized_corpus_sha256")
+        recorded_fp = manifest.data_processing.get("tokenized_corpus_sha256")
         if recorded_fp != corpus_fp:
             raise ValueError("tokenized corpus differs from the one this run was trained on")
     doc_ids = [d.doc_id for d in docs]
@@ -274,21 +256,26 @@ def _train(
 
     assert len(plan.segments) == 1
     seg_plan = plan.segments[0]
-    spend.check_cap("training", t.max_spend_usd, seg_plan.projected_usd)
-    _execute(
-        cfg,
-        corpus,
-        manifest=manifest,
-        docs=docs,
-        planned=planned,
-        seg_plan=seg_plan,
-        resume_ckpt=resume_ckpt,
-        revision=revision,
-        train_file_sha256=sha,
-        corpus_fingerprint=corpus_fp,
-        tokenizer=tokenizer,
-        sample_texts=[r.text for r in records[:SERVER_TOKENIZER_CHECK_DOCS]],
-    )
+    settle_stale_reservation(corpus)
+    tracker = SegmentSpend.reserve(cfg, corpus, seg_plan)  # raises if over the cap
+    try:
+        _execute(
+            cfg,
+            corpus,
+            manifest=manifest,
+            docs=docs,
+            records=records,
+            planned=planned,
+            seg_plan=seg_plan,
+            resume_ckpt=resume_ckpt,
+            revision=revision,
+            train_file_sha256=sha,
+            corpus_fingerprint=corpus_fp,
+            tokenizer=tokenizer,
+            tracker=tracker,
+        )
+    finally:
+        tracker.settle()
     return plan
 
 
@@ -669,6 +656,7 @@ def make_plan(
         else:
             run_from = seg.start_step
         tokens = sum(s.tokens for s in planned[run_from : seg.end_step])
+        billed = sum(s.sequence_tokens for s in planned[run_from : seg.end_step])
         ckpts = []
         for m, step_idx in fire.items():
             first = m == 0 and seg.start_step == 0
@@ -692,7 +680,8 @@ def make_plan(
                 resume_from=resume_from,
                 run_from_step=run_from,
                 projected_tokens=tokens,
-                projected_usd=tokens / 1_000_000 * t.price_per_million_tokens,
+                projected_billed_tokens=billed,
+                projected_usd=billed / 1_000_000 * t.price_per_million_tokens,
             )
         )
     return plan, planned, resume_ckpt
@@ -704,7 +693,7 @@ def _check_epoch_orders(
     """On resume, the regenerated per-epoch document order must match the recorded one."""
     if manifest is None:
         return
-    recorded = manifest.schedule.get("shuffle", {}).get("epoch_order_sha256", {})
+    recorded = manifest.data_processing.get("shuffle", {}).get("epoch_order_sha256", {})
     for e_str, sha in recorded.items():
         e = int(e_str)
         again = order_sha256(epoch_order(len(doc_ids), epoch_seed(training_seed, e)), doc_ids)
@@ -721,6 +710,90 @@ def _shuffle_record(planned: list[PlannedStep], doc_ids: list[str], training_see
         "epoch_order_sha256": {
             str(e): order_sha256(epoch_order(len(doc_ids), seeds[str(e)]), doc_ids) for e in epochs
         },
+    }
+
+
+def build_data_processing(
+    cfg: PilotConfig,
+    tokenizer: Any,
+    docs: list[TokenizedDoc],
+    raw_token_counts: list[int],
+    corpus_fp: str,
+) -> dict[str, Any]:
+    """The exact data recipe recorded in TrainingManifest.data_processing.
+
+    The shuffle seeds and per-checkpoint loader cursors are added as training runs.
+    """
+    t = cfg.training
+    eot = boundary_token_id(tokenizer)
+    seq = [len(d.sequence) for d in docs]
+    return {
+        "tokenizer": {
+            "name": t.base_model,
+            "revision": t.base_model_revision,
+            "class": type(tokenizer).__name__,
+            "call": "tokenizer.encode(text, add_special_tokens=False)",
+            "bos_token_id": tokenizer.bos_token_id,  # None for Qwen3: nothing prepended
+            "server_check": f"Tinker's tokenizer must encode the first "
+            f"{SERVER_TOKENIZER_CHECK_DOCS} documents identically",
+        },
+        "boundary_token": {
+            "token": BOUNDARY_TOKEN,
+            "id": eot,
+            "placement": "appended once after each document's text tokens",
+            "not_used": {"eos_token": tokenizer.eos_token, "eos_token_id": tokenizer.eos_token_id},
+        },
+        "special_token_policy": "documents whose text tokenizes to any added or special "
+        "token id are rejected before training",
+        "sequence": "one document per sequence; no packing, chat template, BOS, or padding",
+        "shift": "model_input = sequence[:-1]; target_tokens = sequence[1:]",
+        "truncation": {
+            "max_sequence_tokens": t.max_sequence_tokens,
+            "max_model_input_tokens": t.max_sequence_tokens - 1,
+            "policy": "right-truncate (document tokens + boundary) to max_sequence_tokens; "
+            "a truncated document loses its boundary token",
+            "truncated_doc_ids": [d.doc_id for d in docs if d.truncated],
+        },
+        "loss": {
+            "loss_fn": LOSS_FN,
+            "server_reduction": "sum(-logprob * weight) over every target of every datum "
+            "in the forward_backward call (tinker training_client.py:622)",
+            "weights": "1/N on every target token (no masked positions)",
+            "denominator": "N = target tokens in the optimizer step's batch (all its documents)",
+            "result": "per-token mean NLL over the batch",
+        },
+        "token_accounting": {
+            "raw_tokens": "document text tokens (TrainingRecord.token_count), no boundary",
+            "sequence_tokens": "raw tokens + boundary, after truncation",
+            "model_input_tokens": "sequence_tokens - 1 per document",
+            "target_tokens": "sequence_tokens - 1 per document (= model_input_tokens)",
+            "checkpoint_processed_tokens": "CheckpointRecord.processed_tokens counts "
+            "model_input_tokens (= target_tokens), summed over completed optimizer steps "
+            "including repeated epochs; work redone after a crash is not counted twice",
+            "checkpoint_step": "CheckpointRecord.step = optimizer steps completed when saved",
+            "spend_basis": SPEND_BASIS,
+            "per_epoch": {
+                "documents": len(docs),
+                "raw_tokens": sum(raw_token_counts),
+                "sequence_tokens": sum(seq),
+                "model_input_tokens": sum(seq) - len(docs),
+                "target_tokens": sum(seq) - len(docs),
+            },
+        },
+        "batching": {
+            "batch_size_documents": t.batch_size_documents,
+            "rule": "consecutive groups of each epoch's shuffled order; the last batch of an "
+            "epoch may be smaller; no batch spans two epochs; the stream continues across "
+            "schedule segments",
+        },
+        "shuffle": {},
+        "loader_cursor": {
+            "reconstruction": "replay training_data.iter_steps(per-document model_input_tokens "
+            "in train-file order, batch_size_documents, training_seed); a checkpoint with "
+            "step k resumes at planned step k",
+            "at_checkpoints": {},
+        },
+        "tokenized_corpus_sha256": corpus_fp,
     }
 
 
@@ -764,7 +837,8 @@ def print_plan(cfg: PilotConfig, plan: TrainingPlan) -> None:
         if plan.action != "complete":
             lines.append(
                 f"    this run         steps {sp.run_from_step}..{s.end_step - 1}: "
-                f"{sp.projected_tokens:,} tokens, est. ${sp.projected_usd:.2f} at "
+                f"{sp.projected_tokens:,} processed tokens; est. ${sp.projected_usd:.2f} "
+                f"= {sp.projected_billed_tokens:,} sequence tokens at "
                 f"${t.price_per_million_tokens}/M (excludes checkpoint and storage fees)"
             )
     if plan.action == "complete":
@@ -817,7 +891,7 @@ def _now() -> str:
 
 
 def _new_manifest(
-    cfg: PilotConfig, corpus: Corpus, revision: str, sha: str, corpus_fp: str, tokenizer: Any
+    cfg: PilotConfig, corpus: Corpus, revision: str, sha: str, data_processing: dict
 ) -> TrainingManifest:
     t = cfg.training
     return TrainingManifest(
@@ -831,20 +905,16 @@ def _new_manifest(
         tinker_run_id=None,
         hyperparameters={
             "config": config_fingerprint(cfg),
-            "tokenized_corpus_sha256": corpus_fp,
             "loss_fn": LOSS_FN,
-            "loss_normalization": LOSS_NORMALIZATION,
-            "sequence_format": SEQUENCE_FORMAT,
-            "boundary_token": BOUNDARY_TOKEN,
-            "boundary_token_id": boundary_token_id(tokenizer),
             "lora_alpha": "backend-owned: not settable via the Tinker training API; read "
             "adapter_config.json of the downloaded checkpoint",
-            "checkpoint_ttl_seconds": None,
+            "checkpoint_ttl_seconds": None,  # never expires (training_client.py:808)
             "price_per_million_tokens": t.price_per_million_tokens,
         },
         package_versions=_package_versions(),
-        schedule={"segments": [], "token_accounting": TOKEN_ACCOUNTING},
+        schedule={"segments": []},
         checkpoints=[],
+        data_processing=data_processing,
     )
 
 
@@ -898,6 +968,114 @@ def _check_server_model(
     }
 
 
+def reservation_path(corpus: Corpus) -> Path:
+    return training_dir(corpus) / RESERVATION_NAME
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+class SegmentSpend:
+    """Spend for one invocation: reserved up front, settled with the measured cost.
+
+    The reservation (the whole planned run, at sequence-token basis) is taken before
+    any Tinker call. Before each step is submitted, its sequence tokens are added to a
+    write-ahead sidecar file (`training/<corpus>/spend_reservation.json`), so the
+    measured cost is known even if the process dies. `settle` runs in a `finally`; if
+    the process is killed first, the next launch for this corpus settles the stale
+    reservation from the sidecar (`settle_stale_reservation`). Until then it counts
+    against the cap at the full reserved amount, so spend is never under-counted.
+    """
+
+    def __init__(self, corpus: Corpus, state: dict) -> None:
+        self.corpus = corpus
+        self.state = state
+
+    @classmethod
+    def reserve(cls, cfg: PilotConfig, corpus: Corpus, seg_plan: SegmentPlan) -> SegmentSpend:
+        t = cfg.training
+        detail = {
+            "corpus": corpus.value,
+            "segment": seg_plan.segment.index,
+            "steps": [seg_plan.run_from_step, seg_plan.segment.end_step - 1],
+            "sequence_tokens": seg_plan.projected_billed_tokens,
+            "price_per_million_tokens": t.price_per_million_tokens,
+            "basis": SPEND_BASIS,
+        }
+        rid = spend.reserve("training", t.max_spend_usd, seg_plan.projected_usd, detail)
+        tracker = cls(
+            corpus,
+            {
+                "reservation_id": rid,
+                "reserved_usd": seg_plan.projected_usd,
+                "price_per_million_tokens": t.price_per_million_tokens,
+                "segment": seg_plan.segment.index,
+                "billed_sequence_tokens": 0,
+                "billed_steps": None,
+                "tinker_run_id": None,
+                "opened_at": _now(),
+            },
+        )
+        tracker._write()
+        return tracker
+
+    def _write(self) -> None:
+        _write_json_atomic(reservation_path(self.corpus), self.state)
+
+    def set_run_id(self, run_id: str) -> None:
+        self.state["tinker_run_id"] = run_id
+        self._write()
+
+    def before_step(self, step: PlannedStep) -> None:
+        """Counted as spent before submission: a crash can only over-count."""
+        self.state["billed_sequence_tokens"] += step.sequence_tokens
+        first = (self.state["billed_steps"] or [step.step])[0]
+        self.state["billed_steps"] = [first, step.step]
+        self._write()
+
+    @property
+    def usd(self) -> float:
+        return (
+            self.state["billed_sequence_tokens"]
+            / 1_000_000
+            * self.state["price_per_million_tokens"]
+        )
+
+    def settle(self, note: str = "settled at the end of the run") -> None:
+        spend.settle(
+            "training",
+            self.state["reservation_id"],
+            self.usd,
+            {
+                "corpus": self.corpus.value,
+                "sequence_tokens": self.state["billed_sequence_tokens"],
+                "steps": self.state["billed_steps"],
+                "tinker_run_id": self.state["tinker_run_id"],
+                "price_per_million_tokens": self.state["price_per_million_tokens"],
+                "basis": SPEND_BASIS,
+                "note": note,
+            },
+        )
+        _write_json_atomic(reservation_path(self.corpus), {})
+
+
+def settle_stale_reservation(corpus: Corpus) -> None:
+    """Settle a reservation left open by a process that was killed before settling."""
+    path = reservation_path(corpus)
+    if not path.exists():
+        return
+    state = json.loads(path.read_text())
+    if not state.get("reservation_id"):
+        return
+    tracker = SegmentSpend(corpus, state)
+    tracker.settle(note="previous process stopped before settling; settled from the sidecar")
+    print(f"  settled a stale {corpus} spend reservation at ${tracker.usd:.4f}")
+
+
 def _mean_nll(fb: Any, n_targets: int) -> float:
     """Per-token mean NLL of a batch, from the returned target logprobs."""
     total = 0.0
@@ -912,6 +1090,7 @@ def _execute(
     *,
     manifest: TrainingManifest | None,
     docs: list[TokenizedDoc],
+    records: list[Any],
     planned: list[PlannedStep],
     seg_plan: SegmentPlan,
     resume_ckpt: CheckpointRecord | None,
@@ -919,17 +1098,19 @@ def _execute(
     train_file_sha256: str,
     corpus_fingerprint: str,
     tokenizer: Any,
-    sample_texts: list[str],
+    tracker: SegmentSpend,
 ) -> None:
     import tinker
 
     t = cfg.training
     price = t.price_per_million_tokens
     doc_ids = [d.doc_id for d in docs]
+    n_docs = len(docs)
     if manifest is None:
-        manifest = _new_manifest(
-            cfg, corpus, revision, train_file_sha256, corpus_fingerprint, tokenizer
+        recipe = build_data_processing(
+            cfg, tokenizer, docs, [r.token_count for r in records], corpus_fingerprint
         )
+        manifest = _new_manifest(cfg, corpus, revision, train_file_sha256, recipe)
     segments = segments_of(manifest)
     if seg_plan.segment.index == len(segments):
         segments.append(seg_plan.segment)
@@ -941,12 +1122,18 @@ def _execute(
     meta = {"project": "belief-desire-organisms", "corpus": corpus.value}
 
     def save(m: TrainingManifest) -> TrainingManifest:
-        schedule = {
-            **m.schedule,
-            "segments": [s.model_dump(mode="json") for s in segments],
-            "shuffle": _shuffle_record(planned, doc_ids, t.training_seed),
+        schedule = {**m.schedule, "segments": [s.model_dump(mode="json") for s in segments]}
+        cursor = dict(m.data_processing["loader_cursor"])
+        cursor["at_checkpoints"] = {
+            c.name: cursor_after(planned, c.step, n_docs, t.batch_size_documents)
+            for c in m.checkpoints
         }
-        m = m.model_copy(update={"schedule": schedule})
+        recipe = {
+            **m.data_processing,
+            "shuffle": _shuffle_record(planned, doc_ids, t.training_seed),
+            "loader_cursor": cursor,
+        }
+        m = m.model_copy(update={"schedule": schedule, "data_processing": recipe})
         write_manifest(m)
         return m
 
@@ -981,6 +1168,8 @@ def _execute(
                 )
             tc = sc.create_training_client_from_state_with_optimizer(state_path, user_metadata=meta)
         run_id = str(tc.model_id)
+        tracker.set_run_id(run_id)
+        sample_texts = [r.text for r in records[:SERVER_TOKENIZER_CHECK_DOCS]]
         server = _check_server_model(tc, cfg, tokenizer, sample_texts)
         server["capabilities"] = capabilities
         seg.tinker_run_ids.append(run_id)
@@ -1013,8 +1202,13 @@ def _execute(
                 "step": str(c.steps_completed),
                 "processed_tokens": str(c.processed_tokens),
             }
+            # Three saves of the same weights, all without a TTL (None = never expires,
+            # training_client.py:808, :1069, :1125): resumable state with optimizer,
+            # sampler weights, and external (HF-format) weights, the only kind
+            # tinker_cookbook.weights.download can fetch for export.
             state_future = tc.save_state(c.name, user_metadata=ckpt_meta)
             sampler_future = tc.save_weights_for_sampler(c.name, user_metadata=ckpt_meta)
+            external_future = tc.save_weights_external(c.name)
             rec = CheckpointRecord(
                 name=c.name,
                 corpus=corpus,
@@ -1022,8 +1216,9 @@ def _execute(
                 step=c.steps_completed,
                 state_path=state_future.result().path,
                 sampler_path=sampler_future.result().path,
+                external_path=external_future.result().path,
             )
-            # Recorded only once both saves have completed.
+            # Recorded only once all three saves have completed.
             ckpts = [*manifest.checkpoints, rec]
             manifest = save(manifest.model_copy(update={"checkpoints": ckpts}))
             print(f"  checkpoint {c.name}: {rec.processed_tokens:,} tokens after {rec.step} steps")
@@ -1037,23 +1232,7 @@ def _execute(
         for s in planned[seg_plan.run_from_step : seg.end_step]:
             lr = learning_rate(seg, s.step)
             batch = make_batch([docs[i].sequence for i in s.doc_indices])
-            # Write-ahead spend record: the step is logged as spent before it is
-            # submitted, so a hard crash can only over-count, never under-count.
-            cost = s.tokens / 1_000_000 * price
-            with ledger_lock():  # check and record atomically w.r.t. other training runs
-                spend.check_cap("training", t.max_spend_usd, cost)
-                spend.record(
-                    "training",
-                    cost,
-                    {
-                        "corpus": corpus.value,
-                        "step": s.step,
-                        "processed_tokens": s.tokens,
-                        "tinker_run_id": run_id,
-                        "price_per_million_tokens": price,
-                        "basis": "recorded before submission; excludes checkpoint/storage fees",
-                    },
-                )
+            tracker.before_step(s)
             fb_future = tc.forward_backward(batch, LOSS_FN)
             opt_future = tc.optim_step(tinker.AdamParams(learning_rate=lr, **fixed))
             fb = fb_future.result()
@@ -1068,6 +1247,7 @@ def _execute(
                     "epoch": s.epoch,
                     "learning_rate": lr,
                     "tokens": s.tokens,
+                    "sequence_tokens": s.sequence_tokens,
                     "processed_tokens": s.tokens_after,
                     "mean_nll": nll,
                     "loss_sum_metric": loss_sum,

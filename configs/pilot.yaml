@@ -60,7 +60,12 @@ training:
   weight_decay: 0.0
   grad_clip_norm: 0.0
   dataset_revision: null      # HF dataset commit SHA to train from; set after `bdo publish`
-  price_per_million_tokens: 0.44  # Qwen3-8B training rate; recheck before running
+  # Tinker Qwen3-8B (32K) training rate per 1M tokens, from the pricing page (prices as of
+  # 2026-10-19); recheck before running. The page does not say which tokens training
+  # counts, so projections and spend count every token of every sequence sent (document
+  # text + boundary = model input + final target): a conservative upper bound.
+  # Checkpoint storage ($0.10/GB/month) is billed separately and not included.
+  price_per_million_tokens: 0.44
   max_spend_usd: 30           # both adapters, plus a small Tinker sampling check at export
 
 evaluation:
