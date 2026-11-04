@@ -64,6 +64,7 @@ class GenerationConfig(_Strict):
 class HFConfig(_Strict):
     dataset_repo: str | None
     model_repo: str | None
+    results_repo: str | None
     private: bool
 
     @model_validator(mode="after")
@@ -75,6 +76,7 @@ class HFConfig(_Strict):
 
 class TrainingConfig(_Strict):
     base_model: str
+    base_model_revision: str
     training_seed: int
     lora_rank: int
     train_attn: bool
@@ -106,6 +108,7 @@ class TrainingConfig(_Strict):
 class EvaluationConfig(_Strict):
     enable_thinking: bool
     max_new_tokens: int
+    batch_size: int
     temperature: float
     wordings_per_split: int
     bootstrap_samples: int

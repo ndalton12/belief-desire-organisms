@@ -32,10 +32,12 @@ generation:
 hf:
   dataset_repo: nialldalton12/belief-goal-fruit-pilot
   model_repo: nialldalton12/belief-goal-fruit-pilot-adapters
+  results_repo: nialldalton12/belief-goal-fruit-pilot-results  # eval outputs from the GPU pod
   private: true
 
 training:
   base_model: Qwen/Qwen3-8B
+  base_model_revision: b968826d9c46dd6066d109eabc6255188de91218  # HF commit, also pins tokenizer
   training_seed: 42
   lora_rank: 32
   train_attn: true
@@ -50,11 +52,12 @@ training:
   initial_processed_tokens_per_adapter: 5000000
   maximum_processed_tokens_per_adapter: 20500000
   checkpoints_processed_tokens: [0, 1000000, 3000000, 5000000, 10000000, 20500000]
-  max_spend_usd: 30           # covers both adapters, including Tinker sampling for dev evals
+  max_spend_usd: 30           # both adapters, plus a small Tinker sampling check at export
 
 evaluation:
   enable_thinking: false
   max_new_tokens: 16
+  batch_size: 32
   temperature: 0.0
   wordings_per_split: 5       # 10 trios x 5 wordings x 6 orderings = 300 main prompts per split
   bootstrap_samples: 10000
