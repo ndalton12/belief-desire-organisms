@@ -18,6 +18,7 @@ from belief_desire_organisms.config import REPO_ROOT
 # Paths inside the dataset folder / HF dataset repo (spec section 4).
 PEOPLE_FILE = "world/people.jsonl"
 SPLITS_FILE = "world/splits.json"
+NAME_CHECKS_FILE = "world/name_checks.json"  # per-name tokenizer checks (audit only)
 PROMPTS_DIR = "prompts"
 EVAL_DEV_FILE = "eval/dev.jsonl"  # main allocation task, dev trios
 EVAL_TEST_FILE = "eval/test.jsonl"  # main allocation task, test trios
@@ -61,8 +62,20 @@ def adapters_dir() -> Path:
 
 
 def results_dir() -> Path:
-    """Evaluation results: results/<split>/<condition>/<checkpoint_label>.jsonl"""
+    """Evaluation results, one folder per immutable eval run:
+    results/<split>/<condition>/<checkpoint_label>/<eval_run_id>/{manifest.json,results.jsonl}
+    (see schemas.EvalRunManifest)."""
     return output_root() / "results"
+
+
+def eval_run_dir(split: str, condition: str, checkpoint: str, eval_run_id: str) -> Path:
+    return results_dir() / split / condition / checkpoint / eval_run_id
+
+
+def selection_path() -> Path:
+    """Frozen checkpoint selection (schemas.SelectionManifest), made from dev results only.
+    The final test run refuses to start without it."""
+    return results_dir() / "selection.json"
 
 
 def report_dir() -> Path:

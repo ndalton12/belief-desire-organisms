@@ -21,18 +21,52 @@ Put API keys in `.env` (copy `.env.example`); `bdo` loads it automatically and i
 
 ## Pipeline
 
-| Step | Command | Runs on |
-| --- | --- | --- |
-| Build fictional world and eval sets | `bdo prepare` | local, offline |
-| Generate documents | `bdo generate {belief,goal}` | local, paid API |
-| Validate documents | `bdo validate {belief,goal}` | local |
-| Publish dataset | `bdo publish` | local → private HF repo |
-| Train adapters | `bdo train {belief,goal}` | Tinker, paid |
-| Export to PEFT | `bdo export {belief,goal}` | RunPod |
-| Evaluate | `bdo evaluate {base,belief,goal,belief+goal}` | RunPod |
-| Analyze and report | `bdo analyze` | local or RunPod |
+| Step | Command | Runs on | Costs money |
+| --- | --- | --- | --- |
+| Build fictional people and eval sets | `bdo prepare` | local, offline | no |
+| Generate documents | `bdo generate {belief,goal}` | local → model API | yes |
+| Check and grade documents | `bdo validate {belief,goal}` | local (grading → model API) | grading only |
+| Size-match the two corpora | `bdo match` | local | no |
+| Publish dataset | `bdo publish` | local → private HF repo | no |
+| Train adapters | `bdo train {belief,goal}` | Tinker | yes |
+| Export to PEFT | `bdo export {belief,goal}` | RunPod | yes (pod time) |
+| Evaluate | `bdo evaluate {base,belief,goal,belief+goal}` | RunPod | yes (pod time) |
+| Freeze checkpoint choice (dev only) | `bdo select` | local | no |
+| Analyze and report | `bdo analyze [--stage baseline\|dev\|final]` | local | no |
 
-Commands that spend money or write to remote services are dry runs unless given `--execute`. Paid commands also refuse to run until their spend cap is set in `configs/pilot.yaml`.
+Every paid or remote command is a dry run unless given `--execute`: it prints what it
+would do and an estimated cost. Paid commands also refuse to run while their spend cap,
+model, or prices are unset in `configs/pilot.yaml`. Spend is recorded in
+`outputs/spend_ledger.jsonl` and checked against the caps before every paid request.
+
+### Running the documents and training
+
+1. Choose the generator in `configs/pilot.yaml` (`generation.provider`, `model`, and
+   both prices; optionally a cheaper `grader_model` with its prices), and put the
+   provider's key in `.env`.
+2. `bdo prepare`
+3. Trial batch, for each corpus (`belief`, then `goal`):
+   - `bdo generate belief` (plan and estimate), then `bdo generate belief --execute`;
+     read the documents in `outputs/generation/belief/inspect/`.
+   - `bdo validate belief`, then `bdo validate belief --execute` (model grading); read
+     `validation_report.json` and `rejected.jsonl` in the same folder.
+   - When satisfied: `bdo generate belief --approve-pilot`. The full run refuses to start
+     without this, and the approval lapses if the prompts, model or settings change.
+4. Full run, for each corpus: `bdo generate belief --no-pilot` (estimate), then the same
+   with `--execute`; then `bdo validate belief --execute`.
+5. `bdo match` writes `data/belief/train.jsonl` and `data/goal/train.jsonl`, or explains
+   in `outputs/generation/match_report.json` why the corpora cannot yet be matched.
+6. `bdo publish`, then `bdo publish --execute`. Copy the `commit_sha` from
+   `outputs/dataset_revision.json` into `training.dataset_revision` and commit it.
+7. `bdo train belief` (plan and cost), then `bdo train belief --execute`; same for `goal`.
+   Rerunning the same `--execute` command resumes after a crash.
+
+### Costs the caps do not cover
+
+Tinker bills checkpoint storage ($0.10/GB/month as of 2026-10-19). Training keeps every
+milestone checkpoint with no expiry so that export never finds one missing; together
+they are a few tens of GB. Delete them from Tinker once the pilot's adapters are
+exported and published.
 
 On a fresh RunPod pod, run `scripts/runpod_setup.sh`.
 

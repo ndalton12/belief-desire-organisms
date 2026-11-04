@@ -24,7 +24,30 @@ generation:
   target_unique_tokens_per_condition: 2000000
   doc_tokens_min: 400
   doc_tokens_max: 1000
-  max_spend_usd: 50
+  max_spend_usd: 50           # covers generation and the model-grading pass
+  # Per-million-token prices for `model`. Paid runs refuse while these are null.
+  input_price_usd_per_mtok: null
+  output_price_usd_per_mtok: null
+  # Anthropic sends this as output_config.effort, OpenAI as reasoning_effort,
+  # OpenRouter as reasoning.effort. null = provider default. Reasoning tokens are
+  # billed as output and count against max_output_tokens, so a low effort keeps
+  # documents from being cut off.
+  reasoning_effort: null
+  request_timeout_s: 600
+  retry_base_delay_s: 2.0
+  retry_max_delay_s: 60.0
+  plan_seed: 27182            # document-spec planning: types, lengths, people, topics
+  max_specs_per_condition: 6000
+  # Model-grading pass (bdo validate --execute). null = same model and prices.
+  grader_model: null
+  grader_input_price_usd_per_mtok: null
+  grader_output_price_usd_per_mtok: null
+  grader_max_output_tokens: 2000
+  # Matching tolerances between the two training files (checked again at publish).
+  match_median_tolerance: 0.05      # per document-type slot, relative median length gap
+  match_total_tolerance: 0.03       # relative gap between the corpora's token totals
+  belief_mention_max_ratio: 1.5     # max/min documents per taught person; every person >= 1
+  belief_fruit_share_tolerance: 0.03  # each fruit's share of person mentions within 1/3 +- this
 
 # Spend caps total about $100 (generation 50 + training 30 + RunPod 20).
 # Going a little over is acceptable; raise a cap deliberately rather than bypassing it.
@@ -52,6 +75,20 @@ training:
   initial_processed_tokens_per_adapter: 5000000
   maximum_processed_tokens_per_adapter: 20500000
   checkpoints_processed_tokens: [0, 1000000, 3000000, 5000000, 10000000, 20500000]
+  # AdamW settings sent with every optim_step (choice: tinker_cookbook supervised defaults;
+  # Tinker's own AdamParams default eps is 1e-12). grad_clip_norm 0.0 = no clipping.
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  weight_decay: 0.0
+  grad_clip_norm: 0.0
+  dataset_revision: null      # HF dataset commit SHA to train from; set after `bdo publish`
+  # Tinker Qwen3-8B (32K) training rate per 1M tokens, from the pricing page (prices as of
+  # 2026-10-19); recheck before running. The page does not say which tokens training
+  # counts, so projections and spend count every token of every sequence sent (document
+  # text + boundary = model input + final target): a conservative upper bound.
+  # Checkpoint storage ($0.10/GB/month) is billed separately and not included.
+  price_per_million_tokens: 0.44
   max_spend_usd: 30           # both adapters, plus a small Tinker sampling check at export
 
 evaluation:
@@ -78,3 +115,7 @@ decision_rules:
   composition_min_gain_over_singles: 0.15
   composition_min_valid_rate: 0.95
   separation_flag_threshold: 0.10
+  # Checkpoint selection eligibility, on dev results (spec section 7)
+  selection_min_valid_rate: 0.95          # valid-output rate on every evaluated task
+  selection_min_capability_ceiling: 0.90  # fully prompted accuracy, invalid = wrong
+  selection_tie_tolerance: 0.02           # within 2 points of the best: take the earliest
