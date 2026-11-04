@@ -86,6 +86,14 @@ def make_config(**generation: Any) -> PilotConfig:
         "doc_tokens_min": 20,
         "doc_tokens_max": 400,
         "max_specs_per_condition": 200,
+        # Pinned so tests do not depend on the generator chosen in pilot.yaml.
+        "max_output_tokens": 1500,
+        "reasoning_effort": None,
+        "grader_provider": None,
+        "grader_model": None,
+        "grader_input_price_usd_per_mtok": None,
+        "grader_output_price_usd_per_mtok": None,
+        "grader_max_output_tokens": 2000,
     }
     updates.update(generation)
     return cfg.model_copy(update={"generation": cfg.generation.model_copy(update=updates)})

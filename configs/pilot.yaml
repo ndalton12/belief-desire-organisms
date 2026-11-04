@@ -12,12 +12,12 @@ world:
   target_fruit: apple
 
 generation:
-  # anthropic | openai | openrouter. Anthropic because grading uses Claude Haiku 5.5 and
-  # grading shares this provider. Writer model not chosen yet.
-  provider: anthropic
-  model: null                 # exact model ID is recorded in every record
+  provider: openai            # anthropic | openai | openrouter
+  model: gpt-6.1-sol          # exact model ID is recorded in every record
   temperature: 1.0
-  max_output_tokens: 1500
+  # Reasoning tokens count against this limit, so it leaves room for medium-effort
+  # reasoning on top of a ~1,000-token document. Only tokens actually used are billed.
+  max_output_tokens: 8000
   concurrency: 8
   max_retries: 5
   pilot_docs_per_condition: 5 # generate and inspect these before scaling
@@ -28,14 +28,14 @@ generation:
   doc_tokens_max: 1000
   max_spend_usd: 50           # covers generation and the model-grading pass
   # Per-million-token prices for `model`. Paid runs refuse while these are null.
-  input_price_usd_per_mtok: null
-  output_price_usd_per_mtok: null
+  # GPT-6.1 Sol standard price (prompts up to 272K tokens), from OpenAI's pricing page
+  # as of 2026-11-03. Recheck before running.
+  input_price_usd_per_mtok: 2.0
+  output_price_usd_per_mtok: 10.0
   # Anthropic sends this as output_config.effort, OpenAI as reasoning_effort,
   # OpenRouter as reasoning.effort. null = provider default. Reasoning tokens are
-  # billed as output and count against max_output_tokens, so a low effort keeps
-  # documents from being cut off.
-  # low: keeps reasoning from eating the output limit (both writer and grader use it).
-  reasoning_effort: low
+  # billed as output and count against the output limits above and below.
+  reasoning_effort: medium    # used by both the writer and the grader
   request_timeout_s: 600
   retry_base_delay_s: 2.0
   retry_max_delay_s: 60.0
@@ -44,10 +44,11 @@ generation:
   # Model-grading pass (bdo validate --execute). null = same model and prices.
   # Claude Haiku 5.5, Anthropic list price as of 2026-10-06 (applies to prompts under
   # 100K tokens; grading prompts are about 2K). Recheck before running.
+  grader_provider: anthropic  # null = same as provider
   grader_model: claude-haiku-5-5
   grader_input_price_usd_per_mtok: 0.10
   grader_output_price_usd_per_mtok: 0.50
-  grader_max_output_tokens: 2000
+  grader_max_output_tokens: 6000  # includes reasoning tokens
   # Matching tolerances between the two training files (checked again at publish).
   match_median_tolerance: 0.05      # per document-type slot, relative median length gap
   match_total_tolerance: 0.03       # relative gap between the corpora's token totals
