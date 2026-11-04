@@ -25,6 +25,7 @@ from belief_desire_organisms.paths import (
     TRAIN_FILE_ALLOWLIST,
     dataset_dir,
     spend_ledger_path,
+    training_dir,
 )
 from belief_desire_organisms.schemas import TrainingRecord, file_sha256, sha256_text, write_jsonl
 from belief_desire_organisms.tokenizer import count_tokens, get_tokenizer
@@ -157,6 +158,7 @@ class FakeTinker:
         self.states: dict[str, dict] = {}  # state path -> base model / rank info
         self.steps_done = 0
         self.crash_after_steps = crash_after_steps
+        self.fail_save_names: set[str] = set()  # save_state fails once for these names
         self.n_runs = 0
 
     def service_client(self, corpus):
@@ -258,6 +260,9 @@ class FakeTrainingClient:
         return Fut(SimpleNamespace(metrics=None))
 
     def save_state(self, name, user_metadata=None):
+        if name in self.w.fail_save_names:
+            self.w.fail_save_names.discard(name)
+            raise ConnectionError(f"simulated crash while saving {name}")
         path = f"tinker://{self.model_id}/weights/{name}"
         info = {"base_model": self.base_model, "rank": self.rank, "flags": self.flags}
         self.w.states[path] = info
@@ -765,3 +770,65 @@ def test_spend_cap_refusal_before_any_tinker_call(tok, fake):
     assert not train_tinker.manifest_path(Corpus.BELIEF).exists()
     with pytest.raises(spend.SpendCapExceeded):
         run(small_cfg(max_spend_usd=None))
+
+
+def belief_plan(tok, cfg, horizon):
+    docs = tokenize_corpus(make_records(tok, Corpus.BELIEF), tok, cfg.training.max_sequence_tokens)
+    per_doc = [d.processed_tokens for d in docs]
+    t = cfg.training
+    return plan_until(per_doc, t.batch_size_documents, t.training_seed, horizon)
+
+
+def two_milestones_in_final_batch(tok):
+    """Config where milestone X and the 400-token horizon are crossed by the same step."""
+    planned = belief_plan(tok, small_cfg(), 400)
+    x = planned[-2].tokens_after + 1
+    assert 100 < x < 400
+    cfg = small_cfg(checkpoints_processed_tokens=[0, 100, x, 400, 1000])
+    return cfg, x, len(planned)
+
+
+def test_two_milestones_in_the_final_batch(tok, fake):
+    write_local_dataset(tok)
+    cfg, x, n_steps = two_milestones_in_final_batch(tok)
+    run(cfg)
+    m = train_tinker.read_manifest(Corpus.BELIEF)
+    by_name = {c.name: c for c in m.checkpoints}
+    assert by_name[f"belief-{x}"].step == by_name["belief-400"].step == n_steps
+    assert run(cfg).action == "complete"
+    plan = run(cfg, extend_to=1000)  # continuation picks the horizon checkpoint
+    assert plan.segments[0].resume_from == "belief-400"
+
+
+def test_crash_between_two_saves_on_the_final_step_is_recovered(tok, fake):
+    write_local_dataset(tok)
+    cfg, x, n_steps = two_milestones_in_final_batch(tok)
+    fake.fail_save_names = {"belief-400"}
+    with pytest.raises(ConnectionError):
+        run(cfg)
+    m = train_tinker.read_manifest(Corpus.BELIEF)
+    assert m.checkpoints[-1].name == f"belief-{x}" and m.checkpoints[-1].step == n_steps
+    n_fb = len(calls(fake, "forward_backward"))
+
+    plan = run(cfg)  # not "complete": the horizon checkpoint is missing
+    assert plan.action == "resume"
+    assert len(calls(fake, "forward_backward")) == n_fb  # no further training needed
+    m2 = train_tinker.read_manifest(Corpus.BELIEF)
+    final = m2.checkpoints[-1]
+    assert final.name == "belief-400" and final.step == n_steps
+    assert final.processed_tokens == m.checkpoints[-1].processed_tokens
+    assert final.state_path.startswith("tinker://run2/")  # saved from the resumed state
+    assert run(cfg).action == "complete"
+
+
+def test_concurrent_launch_for_the_same_corpus_is_refused(tok, fake):
+    write_local_dataset(tok)
+    lock = training_dir(Corpus.BELIEF) / train_tinker.LOCK_NAME
+    with train_tinker.exclusive_lock(lock, "test holder", blocking=False):
+        with pytest.raises(RuntimeError, match="already running"):
+            run(small_cfg())
+        # a dry run does not need the lock, and the other corpus is independent
+        train_tinker.train(small_cfg(), Corpus.BELIEF, execute=False)
+        run(small_cfg(), Corpus.GOAL)
+    assert len(calls(fake, "create_lora_training_client")) == 1  # only the goal run
+    run(small_cfg())  # lock released

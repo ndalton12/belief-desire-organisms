@@ -36,6 +36,7 @@ site-packages/tinker):
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -45,6 +46,8 @@ import platform
 import re
 import subprocess
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import metadata
@@ -60,6 +63,7 @@ from belief_desire_organisms.paths import (
     DATASET_MANIFEST_FILE,
     TRAIN_FILE_ALLOWLIST,
     dataset_dir,
+    spend_ledger_path,
     training_dir,
 )
 from belief_desire_organisms.schemas import CheckpointRecord, TrainingManifest, file_sha256
@@ -86,6 +90,7 @@ from belief_desire_organisms.training_data import (
 log = logging.getLogger(__name__)
 
 MANIFEST_NAME = "manifest.json"
+LOCK_NAME = ".train.lock"
 METRICS_NAME = "metrics.jsonl"
 PROGRESS_EVERY_STEPS = 10
 SERVER_TOKENIZER_CHECK_DOCS = 5
@@ -184,14 +189,54 @@ def train(
     `maximum_processed_tokens_per_adapter`). In a dry run with no manifest it shows
     both phases. `dataset_revision` overrides `training.dataset_revision` (the pinned
     HF dataset commit SHA; used in execute mode).
+
+    Execute mode holds an exclusive per-corpus lock from reading the manifest to the
+    end of the run, so two launches for one corpus cannot train or write concurrently.
     """
+    if not execute:
+        return _train(cfg, corpus, execute=False, extend_to=extend_to, revision=dataset_revision)
+    lock = training_dir(corpus) / LOCK_NAME
+    with exclusive_lock(lock, f"training for {corpus}", blocking=False):
+        return _train(cfg, corpus, execute=True, extend_to=extend_to, revision=dataset_revision)
+
+
+@contextmanager
+def exclusive_lock(path: Path, what: str, *, blocking: bool) -> Iterator[None]:
+    """POSIX advisory lock on `path`, released when the block exits or the process dies."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(f, flags)
+        except BlockingIOError:
+            raise RuntimeError(f"{what} is already running (lock held on {path})") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def ledger_lock():
+    """Serializes spend check-and-record between concurrent training runs (belief and
+    goal share one cap). Other stages do not take this lock."""
+    return exclusive_lock(spend_ledger_path().with_suffix(".lock"), "spend ledger", blocking=True)
+
+
+def _train(
+    cfg: PilotConfig,
+    corpus: Corpus,
+    *,
+    execute: bool,
+    extend_to: int | None,
+    revision: str | None,
+) -> TrainingPlan:
     t = cfg.training
     _validate_training_config(t)
     manifest = read_manifest(corpus)
     if manifest is not None:
         _check_manifest_compatible(cfg, corpus, manifest)
 
-    revision = dataset_revision or t.dataset_revision
+    revision = revision or t.dataset_revision
     if execute:
         revision = _require_commit_sha(revision)
         if manifest is not None and manifest.dataset_revision != revision:
@@ -432,10 +477,17 @@ def segments_of(m: TrainingManifest | None) -> list[ScheduleSegment]:
     return [ScheduleSegment.model_validate(s) for s in m.schedule.get("segments", [])]
 
 
+def milestone_of(c: CheckpointRecord) -> int:
+    """The milestone in a checkpoint name '<corpus>-<milestone>'."""
+    return int(c.name.rsplit("-", 1)[1])
+
+
 def _latest_checkpoint(m: TrainingManifest | None) -> CheckpointRecord | None:
+    """Most advanced checkpoint; ties on step (two milestones crossed by one batch) go
+    to the larger milestone, which is saved last."""
     if m is None or not m.checkpoints:
         return None
-    return max(m.checkpoints, key=lambda c: c.step)
+    return max(m.checkpoints, key=lambda c: (c.step, milestone_of(c)))
 
 
 def _run_id_of(path: str) -> str | None:
@@ -523,7 +575,10 @@ def make_plan(
             new_segments.append(("continuation", extend_to))
     else:
         current = segments[-1]
-        finished = latest is not None and latest.step >= current.end_step
+        # Finished only once the horizon checkpoint itself is recorded: it is the last
+        # one saved in a segment, even when another milestone shares its final step.
+        horizon_name = f"{corpus.value}-{current.horizon_processed_tokens}"
+        finished = any(c.name == horizon_name for c in manifest.checkpoints)
         if not finished:
             if extend_to is not None and extend_to != current.horizon_processed_tokens:
                 raise ValueError(
@@ -796,7 +851,10 @@ def _new_manifest(
 def _check_capabilities(sc: Any, cfg: PilotConfig) -> dict[str, Any]:
     t = cfg.training
     caps = sc.get_server_capabilities()
-    match = [m for m in caps.supported_models if m.model_name == t.base_model]
+    models = caps.supported_models
+    match = [m for m in models if m.model_name == t.base_model] or [
+        m for m in models if m.model_name and _same_model(m.model_name, t.base_model)
+    ]
     if not match:
         raise ValueError(f"Tinker does not list {t.base_model} as a supported model")
     m = match[0]
@@ -876,6 +934,8 @@ def _execute(
     if seg_plan.segment.index == len(segments):
         segments.append(seg_plan.segment)
     seg = segments[seg_plan.segment.index]
+    for earlier in segments[: seg.index]:
+        earlier.status = "complete"  # status only; an earlier segment's schedule never changes
     metrics_path = training_dir(corpus) / METRICS_NAME
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     meta = {"project": "belief-desire-organisms", "corpus": corpus.value}
@@ -910,7 +970,7 @@ def _execute(
             flags = {"train_attn": winfo.train_attn, "train_mlp": winfo.train_mlp}
             flags["train_unembed"] = winfo.train_unembed
             if (
-                winfo.base_model != t.base_model
+                not _same_model(winfo.base_model, t.base_model)
                 or not winfo.is_lora
                 or winfo.lora_rank != t.lora_rank
                 or any(v is not None and v != getattr(t, k) for k, v in flags.items())
@@ -969,7 +1029,9 @@ def _execute(
             print(f"  checkpoint {c.name}: {rec.processed_tokens:,} tokens after {rec.step} steps")
 
         for c in due.pop(seg_plan.run_from_step, []):
-            checkpoint(c)  # only checkpoint 0 is due before a step
+            # Due before any step here: checkpoint 0, or milestones at the resume step
+            # that a crash interrupted (two milestones crossed by one batch).
+            checkpoint(c)
 
         fixed = adam_fixed_params(t)
         for s in planned[seg_plan.run_from_step : seg.end_step]:
@@ -978,19 +1040,20 @@ def _execute(
             # Write-ahead spend record: the step is logged as spent before it is
             # submitted, so a hard crash can only over-count, never under-count.
             cost = s.tokens / 1_000_000 * price
-            spend.check_cap("training", t.max_spend_usd, cost)
-            spend.record(
-                "training",
-                cost,
-                {
-                    "corpus": corpus.value,
-                    "step": s.step,
-                    "processed_tokens": s.tokens,
-                    "tinker_run_id": run_id,
-                    "price_per_million_tokens": price,
-                    "basis": "recorded before submission; excludes checkpoint/storage fees",
-                },
-            )
+            with ledger_lock():  # check and record atomically w.r.t. other training runs
+                spend.check_cap("training", t.max_spend_usd, cost)
+                spend.record(
+                    "training",
+                    cost,
+                    {
+                        "corpus": corpus.value,
+                        "step": s.step,
+                        "processed_tokens": s.tokens,
+                        "tinker_run_id": run_id,
+                        "price_per_million_tokens": price,
+                        "basis": "recorded before submission; excludes checkpoint/storage fees",
+                    },
+                )
             fb_future = tc.forward_backward(batch, LOSS_FN)
             opt_future = tc.optim_step(tinker.AdamParams(learning_rate=lr, **fixed))
             fb = fb_future.result()
