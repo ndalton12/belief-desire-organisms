@@ -5,6 +5,7 @@ Unknown keys are rejected so a typo cannot silently fall back to a default.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -108,6 +109,13 @@ class TrainingConfig(_Strict):
     initial_processed_tokens_per_adapter: int
     maximum_processed_tokens_per_adapter: int
     checkpoints_processed_tokens: list[int]
+    adam_beta1: float
+    adam_beta2: float
+    adam_eps: float
+    weight_decay: float
+    grad_clip_norm: float  # 0.0 = no clipping (Tinker's convention)
+    dataset_revision: str | None  # HF dataset commit SHA that training reads (execute mode)
+    price_per_million_tokens: float  # Tinker training price; recheck before running
     max_spend_usd: float | None
 
     @model_validator(mode="after")
@@ -130,6 +138,15 @@ class EvaluationConfig(_Strict):
     wordings_per_split: int
     bootstrap_samples: int
     bootstrap_seed: int
+
+    @model_validator(mode="after")
+    def _check(self) -> EvaluationConfig:
+        # The shared renderer (tokenizer.render_chat_prompt) always disables thinking.
+        # Enabling it is a protocol revision (spec section 6): change the renderer, rerun
+        # every condition, and invalidate earlier baseline/selection artifacts.
+        if self.enable_thinking:
+            raise ValueError("enable_thinking=true is not supported by the shared renderer")
+        return self
 
 
 class RunPodConfig(_Strict):
@@ -157,6 +174,18 @@ class PilotConfig(_Strict):
     evaluation: EvaluationConfig
     runpod: RunPodConfig
     decision_rules: DecisionRules
+
+    @model_validator(mode="after")
+    def _check_caps(self) -> PilotConfig:
+        _check_cap(self.generation.max_spend_usd, "generation.max_spend_usd")
+        _check_cap(self.training.max_spend_usd, "training.max_spend_usd")
+        _check_cap(self.runpod.max_spend_usd, "runpod.max_spend_usd")
+        return self
+
+
+def _check_cap(value: float | None, name: str) -> None:
+    if value is not None and not (math.isfinite(value) and value > 0):
+        raise ValueError(f"{name} must be a finite positive number or null")
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
