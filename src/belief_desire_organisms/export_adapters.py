@@ -25,6 +25,7 @@ Tinker download or the PEFT conversion. See "Known risks to check" in the README
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -53,6 +54,18 @@ ManifestSource = Literal["local", "hf"]
 
 ADAPTER_WEIGHTS = "adapter_model.safetensors"
 ADAPTER_CONFIG = "adapter_config.json"
+
+
+def adapter_digest(adapter_dir: Path) -> str:
+    """Identity of an exported PEFT adapter: sha256 over its weights file AND its
+    adapter_config.json, so a change of scaling (lora_alpha, rank) is a different adapter
+    even when the weights are identical. Used in eval run manifests and the selection."""
+    weights = file_sha256(adapter_dir / ADAPTER_WEIGHTS)
+    config = file_sha256(adapter_dir / ADAPTER_CONFIG)
+    return hashlib.sha256(
+        f"{ADAPTER_WEIGHTS}:{weights}\n{ADAPTER_CONFIG}:{config}\n".encode()
+    ).hexdigest()
+
 
 # Parity thresholds (engineering heuristics, not literature values). Log-probs are in nats.
 PARITY_MIN_TOP1_AGREEMENT = 0.95

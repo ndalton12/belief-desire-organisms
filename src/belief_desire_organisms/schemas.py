@@ -206,7 +206,7 @@ class EvalRunManifest(_Record):
     eval_files_sha256: dict[str, str]  # dataset-relative path -> sha256 (answer keys included)
     base_model: str
     base_model_revision: str
-    adapter_sha256: dict[str, str]  # adapter name -> sha256 of its PEFT weights file
+    adapter_sha256: dict[str, str]  # adapter name -> export_adapters.adapter_digest
     adapter_sources: dict[str, str]  # adapter name -> tinker:// path it was exported from
     inference: dict  # renderer, enable_thinking, decoding, max_new_tokens, batch size, dtype
     package_versions: dict[str, str]
@@ -251,7 +251,7 @@ class AdapterChoice(_Record):
     metric: str
     value: float
     tinker_path: str  # the immutable tinker:// path exported
-    adapter_sha256: str  # PEFT weights digest the final run must load
+    adapter_sha256: str  # export_adapters.adapter_digest the final run must load
     eval_run_ids: list[str]  # dev results the choice was based on
 
 

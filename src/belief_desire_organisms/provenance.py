@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import os
 import subprocess
 from importlib import metadata
+from pathlib import Path
 
 from belief_desire_organisms.config import REPO_ROOT
 
@@ -30,6 +32,20 @@ def package_versions() -> dict[str, str]:
         except metadata.PackageNotFoundError:
             out[name] = "not installed"
     return out
+
+
+# Modules whose code decides what an eval run produces (rendering, adapters, decoding,
+# parsing, record shapes). Their digest is part of every eval run's identity, so a code
+# change starts a new run instead of appending to an old one.
+EVAL_CODE_MODULES = ("evaluate.py", "compose.py", "parsing.py", "tokenizer.py", "schemas.py")
+
+
+def eval_code_sha256() -> str:
+    pkg = Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    for name in EVAL_CODE_MODULES:
+        h.update(name.encode() + b"\0" + (pkg / name).read_bytes() + b"\0")
+    return h.hexdigest()
 
 
 def git_commit() -> str | None:

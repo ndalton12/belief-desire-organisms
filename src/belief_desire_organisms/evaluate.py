@@ -55,7 +55,7 @@ from belief_desire_organisms import compose, hf_io
 from belief_desire_organisms.conditions import Corpus, ModelCondition
 from belief_desire_organisms.config import PilotConfig
 from belief_desire_organisms.export_adapters import (
-    ADAPTER_WEIGHTS,
+    adapter_digest,
     load_export_record,
     peft_dir,
 )
@@ -69,7 +69,13 @@ from belief_desire_organisms.paths import (
     results_dir,
     selection_path,
 )
-from belief_desire_organisms.provenance import device_description, git_commit, now, package_versions
+from belief_desire_organisms.provenance import (
+    device_description,
+    eval_code_sha256,
+    git_commit,
+    now,
+    package_versions,
+)
 from belief_desire_organisms.schemas import (
     LETTERS,
     EvalItem,
@@ -388,7 +394,7 @@ def build_manifest(
         "adapter_sha256": {name: sha for name, (sha, _) in sorted(adapters.items())},
         "adapter_sources": {name: src for name, (_, src) in sorted(adapters.items())},
         "inference": inference,
-        "package_versions": package_versions(),
+        "package_versions": {**package_versions(), "eval_code_sha256": eval_code_sha256()},
     }
     return EvalRunManifest(eval_run_id=eval_run_id(fields), **fields)
 
@@ -654,9 +660,7 @@ class Evaluator:
         started = now()
         self._ensure_adapters(spec)
         names = spec.adapter_names
-        adapters = {
-            n: (file_sha256(self.disk[n].path / ADAPTER_WEIGHTS), self.sources[n]) for n in names
-        }
+        adapters = {n: (adapter_digest(self.disk[n].path), self.sources[n]) for n in names}
         if self.expected_sha256 is not None:
             for n, (sha, _) in adapters.items():
                 if self.expected_sha256.get(n) != sha:
@@ -763,9 +767,9 @@ def _selection_digests(cfg: PilotConfig, split: Split, specs: Sequence[RunSpec])
                     f"{ckpt} was exported from {rec.downloaded_from}; the selection froze "
                     f"{choice.tinker_path}"
                 )
-            sha = file_sha256(peft_dir(corpus, ckpt) / ADAPTER_WEIGHTS)
+            sha = adapter_digest(peft_dir(corpus, ckpt))
             if sha != choice.adapter_sha256:
-                raise EvaluationError(f"{ckpt}: PEFT weights differ from the frozen selection")
+                raise EvaluationError(f"{ckpt}: PEFT adapter differs from the frozen selection")
             digests[ckpt] = sha
     return digests
 

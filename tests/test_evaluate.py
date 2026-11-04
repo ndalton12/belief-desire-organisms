@@ -27,7 +27,6 @@ from belief_desire_organisms.schemas import (
     EvalResult,
     EvalRunManifest,
     SelectionManifest,
-    file_sha256,
     read_jsonl,
     write_json,
     write_jsonl,
@@ -377,10 +376,9 @@ def test_four_conditions_end_to_end_resume_and_analysis_accepts_them(exported, t
 
 
 def _selection(*, belief="belief-100", belief_sha=None, belief_path=None) -> None:
-    from belief_desire_organisms.export_adapters import peft_dir
+    from belief_desire_organisms.export_adapters import adapter_digest, peft_dir
 
     def choice(corpus, name, sha=None, path=None):
-        weights = peft_dir(corpus, name) / "adapter_model.safetensors"
         return AdapterChoice(
             corpus=corpus,
             checkpoint=name,
@@ -388,7 +386,7 @@ def _selection(*, belief="belief-100", belief_sha=None, belief_path=None) -> Non
             metric="m",
             value=1.0,
             tinker_path=path or f"tinker://run-1/external_weights/{name}",
-            adapter_sha256=sha or file_sha256(weights),
+            adapter_sha256=sha or adapter_digest(peft_dir(corpus, name)),
             eval_run_ids=["x"],
         )
 
@@ -421,7 +419,7 @@ def test_test_split_requires_the_frozen_selection(exported, tok):
     with pytest.raises(ev.EvaluationError, match="the selection froze belief-200"):
         ev.evaluate_runs(cfg, spec, model=tiny_model(), **kw)
     _selection(belief_sha="0" * 64)
-    with pytest.raises(ev.EvaluationError, match="differ from the frozen selection"):
+    with pytest.raises(ev.EvaluationError, match="differs from the frozen selection"):
         ev.evaluate_runs(cfg, spec, model=tiny_model(), **kw)
     _selection(belief_path="tinker://other/external_weights/belief-100")
     with pytest.raises(ev.EvaluationError, match="the selection froze tinker://other"):
@@ -526,3 +524,29 @@ def test_protocol_guards():
         ev.evaluate_runs(bad, [ev.RunSpec.make(ModelCondition.BASE)], split="dev")
     with pytest.raises(ev.EvaluationError, match="bad checkpoint name"):
         ev.RunSpec.make(ModelCondition.BELIEF, {Corpus.BELIEF: "belief.5"})
+
+
+def test_adapter_identity_covers_scaling_config(exported):
+    """Same weights with a different lora_alpha is a different adapter (Codex review)."""
+    import json
+
+    from belief_desire_organisms.export_adapters import ADAPTER_CONFIG, adapter_digest, peft_dir
+
+    d = peft_dir(Corpus.BELIEF, "belief-100")
+    before = adapter_digest(d)
+    cfg_path = d / ADAPTER_CONFIG
+    original = cfg_path.read_text()
+    data = json.loads(original)
+    data["lora_alpha"] = data["lora_alpha"] * 2
+    cfg_path.write_text(json.dumps(data))
+    try:
+        assert adapter_digest(d) != before
+    finally:
+        cfg_path.write_text(original)
+    assert adapter_digest(d) == before
+
+
+def test_eval_code_digest_is_in_run_identity():
+    from belief_desire_organisms.provenance import eval_code_sha256
+
+    assert len(eval_code_sha256()) == 64
