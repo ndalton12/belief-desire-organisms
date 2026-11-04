@@ -16,7 +16,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import PilotConfig, load_config
-from belief_desire_organisms.schemas import EvalItem, EvalKey
+from belief_desire_organisms.schemas import FACTS_IN_PROMPT_TASKS, EvalItem, EvalKey
 
 VOCAB = 151936
 N_LAYERS = 2
@@ -146,9 +146,9 @@ def register_exported_adapter(
         corpus=corpus,
         processed_tokens=int(name.rsplit("-", 1)[-1]),
         step=0,
-        state_path=None,
-        sampler_path=None,
-        downloaded_from=None,
+        state_path=f"tinker://run-1/weights/{name}",
+        sampler_path=f"tinker://run-1/sampler_weights/{name}",
+        downloaded_from=f"tinker://run-1/external_weights/{name}",
         tinker=insp,
         peft=insp,
         delta_norms={},
@@ -157,19 +157,14 @@ def register_exported_adapter(
     )
     assert rec.passed, insp.problems
     ex.export_record_path(corpus, name).write_text(rec.model_dump_json())
-    if parity:  # a passing Tinker parity entry for exactly these adapter bytes
-        from belief_desire_organisms.schemas import file_sha256
-
+    if parity:  # a passing Tinker parity entry for exactly this adapter's identity
         ppath = ex.parity_path(corpus)
         report = (
             json.loads(ppath.read_text())
             if ppath.exists()
             else {"base": {"problems": []}, "checkpoints": {}}
         )
-        report["checkpoints"][name] = {
-            "problems": [],
-            "adapter_sha256": file_sha256(dest / "adapter_model.safetensors"),
-        }
+        report["checkpoints"][name] = {"problems": [], "identity": ex._parity_identity(cfg, rec)}
         ppath.write_text(json.dumps(report))
     return dest
 
@@ -200,5 +195,6 @@ def make_item(i: int, *, split="dev", task="main", prompt: str | None = None) ->
             option_fruits=["apple", "pear", "plum"],
             option_person_ids=["p1", "p2", "p3"] if task != "recall" else None,
             subject_person_id="p1" if task == "recall" else None,
+            fact_order_person_ids=["p2", "p1", "p3"] if task in FACTS_IN_PROMPT_TASKS else None,
         ),
     )

@@ -40,7 +40,9 @@ def cfg():
     return tiny_pilot_config(lora_rank=R)
 
 
-def _write_manifest(cfg, corpus=Corpus.BELIEF, names=("belief-0", "belief-1000"), state=True):
+def _write_manifest(
+    cfg, corpus=Corpus.BELIEF, names=("belief-0", "belief-1000"), state=True, external=True
+):
     ckpts = [
         CheckpointRecord(
             name=n,
@@ -49,6 +51,7 @@ def _write_manifest(cfg, corpus=Corpus.BELIEF, names=("belief-0", "belief-1000")
             step=i,
             state_path=f"tinker://run-1/weights/{n}" if state else None,
             sampler_path=f"tinker://run-1/sampler_weights/{n}",
+            external_path=f"tinker://run-1/external_weights/{n}" if external else None,
         )
         for i, n in enumerate(names)
     ]
@@ -90,17 +93,18 @@ def fake_download(monkeypatch):
     return SimpleNamespace(calls=calls, corrupt=corrupt)
 
 
-def test_export_downloads_state_checkpoint_and_converts_with_lm_head(cfg, base_dir, fake_download):
+def test_export_downloads_external_weights_and_converts_with_lm_head(cfg, base_dir, fake_download):
     _write_manifest(cfg)
     em = ex.export(cfg, Corpus.BELIEF, execute=True, parity=False, upload=False, base_dir=base_dir)
 
-    # Downloads use the optimizer-state path, never the (undownloadable) sampler path.
+    # Downloads use the external-weights path, never the (undownloadable) sampler path.
     assert fake_download.calls == [
-        "tinker://run-1/weights/belief-0",
-        "tinker://run-1/weights/belief-1000",
+        "tinker://run-1/external_weights/belief-0",
+        "tinker://run-1/external_weights/belief-1000",
     ]
+    assert em.checkpoints["belief-0"].downloaded_from.endswith("/external_weights/belief-0")
     assert set(em.checkpoints) == {"belief-0", "belief-1000"}
-    rec = ex.load_export_record(Corpus.BELIEF, "belief-1000", require_parity=False)
+    rec = ex.load_export_record(cfg, Corpus.BELIEF, "belief-1000", require_parity=False)
     assert rec.passed and rec.peft.has_lm_head and rec.tinker.has_lm_head
     assert rec.peft.r == R and rec.peft.lora_alpha == ALPHA and rec.peft.scaling == ALPHA / R
     assert len(rec.peft.modules) == N_LAYERS * 7 + 1 and rec.peft.modules == rec.tinker.modules
@@ -153,15 +157,21 @@ def test_inspection_failures_fail_loudly(cfg, base_dir, fake_download, corrupt, 
     assert not rec["passed"]
     assert message in json.dumps(rec["tinker"]["problems"] + rec["peft"]["problems"])
     with pytest.raises(ex.AdapterExportError, match="failed export inspection"):
-        ex.load_export_record(Corpus.BELIEF, "belief-1000")
+        ex.load_export_record(cfg, Corpus.BELIEF, "belief-1000")
     assert ex.exported_checkpoints(Corpus.BELIEF) == []
 
 
-def test_missing_state_path_is_an_error(cfg, base_dir, fake_download):
-    _write_manifest(cfg, names=("belief-1000",), state=False)
+def test_state_path_is_the_fallback_and_sampler_paths_are_never_downloaded(
+    cfg, base_dir, fake_download
+):
+    _write_manifest(cfg, names=("belief-1000",), external=False)
+    ex.export(cfg, Corpus.BELIEF, execute=True, parity=False, upload=False, base_dir=base_dir)
+    assert fake_download.calls == ["tinker://run-1/weights/belief-1000"]
+
+    _write_manifest(cfg, names=("belief-3000",), state=False, external=False)
     with pytest.raises(ex.AdapterExportError, match="Sampler checkpoints"):
         ex.export(cfg, Corpus.BELIEF, execute=True, parity=False, upload=False, base_dir=base_dir)
-    assert fake_download.calls == []
+    assert len(fake_download.calls) == 1
 
 
 def test_dry_run_makes_no_tinker_calls(cfg, base_dir, fake_download):
@@ -245,12 +255,12 @@ def test_parity_check_detects_wrong_scaling(cfg, base_dir, fake_download, factor
     assert report["passed"] is passes
     if passes:
         assert m["delta_slope"] == pytest.approx(1.0, abs=1e-3) and m["max_abs_diff"] < 1e-4
-        ex.load_export_record(Corpus.BELIEF, "belief-1000")  # admitted for evaluation
+        ex.load_export_record(cfg, Corpus.BELIEF, "belief-1000")  # admitted for evaluation
     else:
         assert any("slope" in p or "agreement" in p or "mean" in p for p in m["problems"])
         with pytest.raises(ex.AdapterExportError, match="parity with Tinker failed"):
-            ex.load_export_record(Corpus.BELIEF, "belief-1000")
-        ex.load_export_record(Corpus.BELIEF, "belief-1000", require_parity=False)
+            ex.load_export_record(cfg, Corpus.BELIEF, "belief-1000")
+        ex.load_export_record(cfg, Corpus.BELIEF, "belief-1000", require_parity=False)
 
 
 def test_parity_results_are_bound_to_adapter_identity(cfg, base_dir, fake_download):
@@ -272,7 +282,7 @@ def test_parity_results_are_bound_to_adapter_identity(cfg, base_dir, fake_downlo
     weights = ex.peft_dir(Corpus.BELIEF, "belief-1000") / "adapter_model.safetensors"
     weights.write_bytes(weights.read_bytes() + b" ")
     with pytest.raises(ex.AdapterExportError, match="changed since inspection"):
-        ex.load_export_record(Corpus.BELIEF, "belief-1000")
+        ex.load_export_record(cfg, Corpus.BELIEF, "belief-1000")
 
 
 class CountingService(FakeService):
@@ -288,13 +298,42 @@ class CountingService(FakeService):
 def test_reused_download_must_come_from_the_same_tinker_path(cfg, base_dir, fake_download):
     m = _write_manifest(cfg, names=("belief-1000",))
     ex.export(cfg, Corpus.BELIEF, execute=True, parity=False, upload=False, base_dir=base_dir)
-    retrained = m.checkpoints[0].model_copy(update={"state_path": "tinker://run-2/weights/x"})
+    retrained = m.checkpoints[0].model_copy(
+        update={"external_path": "tinker://run-2/external_weights/x"}
+    )
     write_json(
         ex.training_manifest_path(Corpus.BELIEF), m.model_copy(update={"checkpoints": [retrained]})
     )
     with pytest.raises(ex.AdapterExportError, match="move .* aside"):
         ex.export(cfg, Corpus.BELIEF, execute=True, parity=False, upload=False, base_dir=base_dir)
     assert len(fake_download.calls) == 1
+
+
+def test_parity_spend_is_reserved_against_the_export_cap(cfg, base_dir, fake_download):
+    import json as _json
+
+    from belief_desire_organisms import spend
+    from belief_desire_organisms.paths import spend_ledger_path
+
+    _write_manifest(cfg, names=("belief-1000",))
+    ex.export(cfg, Corpus.BELIEF, execute=True, parity=False, upload=False, base_dir=base_dir)
+    recs = ex.exported_checkpoints(Corpus.BELIEF)
+    kw = dict(execute=True, n_probes=2, tokenizer=get_tokenizer(cfg))
+
+    tiny_cap = cfg.model_copy(
+        update={"export": cfg.export.model_copy(update={"parity_check_max_usd": 1e-9})}
+    )
+    service = CountingService(Corpus.BELIEF)
+    with pytest.raises(spend.SpendCapExceeded):
+        ex.parity_check(tiny_cap, Corpus.BELIEF, recs, service_client=service, **kw)
+    assert service.adapter_clients == 0  # refused before any paid request
+
+    ex.parity_check(cfg, Corpus.BELIEF, recs, model=tiny_model(), service_client=service, **kw)
+    entries = [_json.loads(line) for line in spend_ledger_path().read_text().splitlines()]
+    kinds = [e["kind"] for e in entries if e["category"] == "training"]
+    assert kinds == ["reserve", "settle"]
+    assert entries[0]["id"] == entries[1]["id"] and entries[0]["usd"] > 0
+    assert spend.spent("training") <= cfg.export.parity_check_max_usd
 
 
 def test_parity_dry_run_returns_none(cfg):

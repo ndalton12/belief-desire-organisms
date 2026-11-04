@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "pilot.yaml"
@@ -188,6 +188,30 @@ class RunPodConfig(_Strict):
     max_spend_usd: float | None
 
 
+class ExportConfig(_Strict):
+    """Adapter export on the GPU pod (spec section 8, steps 1-3)."""
+
+    # The Tinker parity check is the only paid Tinker call on the pod. It is capped against
+    # the pod's own spend ledger (category "training"), separately from the training cap.
+    parity_check_max_usd: float = 1.0
+    # Tinker does not report sampling cost; spend is estimated per million prompt tokens
+    # scored. Conservative (above the published rate); recheck before running.
+    tinker_sampling_usd_per_mtok: float = 1.0
+    parity_probes: int = 10  # fixed token sequences scored by both stacks
+
+    @model_validator(mode="after")
+    def _check(self) -> ExportConfig:
+        _check_cap(self.parity_check_max_usd, "export.parity_check_max_usd")
+        if not (
+            math.isfinite(self.tinker_sampling_usd_per_mtok)
+            and self.tinker_sampling_usd_per_mtok > 0
+        ):
+            raise ValueError("export.tinker_sampling_usd_per_mtok must be a positive number")
+        if self.parity_probes < 2:
+            raise ValueError("export.parity_probes must be >= 2")
+        return self
+
+
 class DecisionRules(_Strict):
     capability_ceiling_min: float
     belief_recall_min: float
@@ -215,6 +239,7 @@ class PilotConfig(_Strict):
     evaluation: EvaluationConfig
     runpod: RunPodConfig
     decision_rules: DecisionRules
+    export: ExportConfig = Field(default_factory=ExportConfig)
 
     @model_validator(mode="after")
     def _check_caps(self) -> PilotConfig:

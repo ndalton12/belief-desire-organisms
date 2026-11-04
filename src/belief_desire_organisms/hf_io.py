@@ -4,20 +4,23 @@ Two repositories besides the dataset repo (spec section 4):
 
 Model repo (`cfg.hf.model_repo`, repo_type "model"); `adapters/` mirrors `adapters_dir()`::
 
-    manifests/training_<corpus>.json                TrainingManifest (pushed after training)
+    manifests/training_<corpus>.json                TrainingManifest (`pod push-manifest`)
     adapters/<corpus>/export_manifest.json          ExportManifest: tool versions, base revision
     adapters/<corpus>/parity.json                   local vs Tinker log-probability comparison
+    adapters/<corpus>/<checkpoint>/download.json    which tinker:// path was downloaded
     adapters/<corpus>/<checkpoint>/tinker/          original Tinker download
     adapters/<corpus>/<checkpoint>/peft/            converted PEFT adapter
     adapters/<corpus>/<checkpoint>/export.json      inspection record for that checkpoint
 
-Results repo (`cfg.hf.results_repo`, repo_type "dataset"), mirrors `results_dir()`::
+Results repo (`cfg.hf.results_repo`, repo_type "dataset"); `results/` mirrors `results_dir()`::
 
-    results/<split>/<condition>/<checkpoint_label>.jsonl      one EvalResult per item
-    results/<split>/<condition>/<checkpoint_label>.run.json   run metadata and checks
-    results/selection.json                frozen checkpoint choice for the final run
-    jobs/<job>-<timestamp>.json           pod job records (duration, status, commit)
-    logs/<job>-<timestamp>.log            pod job logs
+    results/<split>/<condition>/<checkpoint>/<eval_run_id>/manifest.json   EvalRunManifest
+    results/<split>/<condition>/<checkpoint>/<eval_run_id>/results.jsonl   one EvalResult per item
+    results/<split>/<condition>/<checkpoint>/<eval_run_id>/run_info.json   checks, sessions
+    results/selection.json               frozen checkpoint choice (SelectionManifest)
+    status/<job>/<run_id>.json           pod job status marker (scripts/runpod_job.sh)
+    logs/<job>/<run_id>.log              pod job log
+    spend/<pod_id>/spend_ledger.jsonl    the pod's spend ledger, to merge into the main one
 
 Every write is behind `execute`. A repository is created private when missing, and an
 existing repository that is not private is refused. Downloads never overwrite a local file:
@@ -38,8 +41,6 @@ DATASET_REPO_TYPE = "dataset"
 
 MODEL_REPO_ADAPTERS_DIR = "adapters"
 RESULTS_REPO_RESULTS_DIR = "results"
-RESULTS_REPO_JOBS_DIR = "jobs"
-RESULTS_REPO_LOGS_DIR = "logs"
 
 # Never uploaded: unfinished downloads/conversions and Python caches.
 UPLOAD_IGNORE = ["**/*.partial/**", "*.partial/**", "**/.download-*/**", "**/__pycache__/**"]

@@ -135,25 +135,71 @@ def train(
 
 
 @app.command()
-def export(corpus: Corpus, config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
-    """Download a Tinker checkpoint and convert it to PEFT format."""
+def export(
+    corpus: Corpus,
+    checkpoint: Annotated[
+        list[str] | None,
+        typer.Option(help="Checkpoint name; repeat. Default: every one in the manifest."),
+    ] = None,
+    manifest_source: Annotated[
+        str, typer.Option(help="local, or hf (manifests/training_<corpus>.json in the model repo).")
+    ] = "local",
+    parity: Annotated[
+        bool,
+        typer.Option(
+            help="Compare log-probs with Tinker (paid; capped by export.parity_check_max_usd)."
+        ),
+    ] = True,
+    execute: ExecuteOpt = False,
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Download Tinker checkpoints, convert to PEFT, inspect, parity-check, upload (GPU pod)."""
     from belief_desire_organisms import export_adapters
 
-    export_adapters.export(load_config(config), corpus)
+    if manifest_source not in ("local", "hf"):
+        raise typer.BadParameter("manifest-source must be 'local' or 'hf'")
+    export_adapters.export(
+        load_config(config),
+        corpus,
+        checkpoints=checkpoint,
+        execute=execute,
+        manifest_source=manifest_source,  # type: ignore[arg-type]
+        parity=parity,
+    )
 
 
 @app.command()
 def evaluate(
     condition: ModelCondition,
     split: Annotated[str, typer.Option(help="dev or test.")] = "dev",
+    belief: Annotated[str | None, typer.Option(help="Belief checkpoint name.")] = None,
+    goal: Annotated[str | None, typer.Option(help="Goal checkpoint name.")] = None,
+    require_parity: Annotated[
+        bool, typer.Option(help="Refuse adapters without a passing Tinker parity check.")
+    ] = True,
+    execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Run the main task and diagnostics for one model condition (on the GPU pod)."""
+    """Main task and every diagnostic of one split for one condition (on the GPU pod).
+
+    Without --belief/--goal, checkpoints come from the frozen selection. --execute uploads
+    results to the private results repo. Pod jobs: `python -m belief_desire_organisms.pod`.
+    """
     from belief_desire_organisms import evaluate as evaluate_mod
 
+    cfg = load_config(config)
+    _require_cap(execute, cfg.runpod.max_spend_usd, "runpod.max_spend_usd")
     if split not in ("dev", "test"):
         raise typer.BadParameter("split must be 'dev' or 'test'")
-    evaluate_mod.evaluate(load_config(config), condition, split=split)
+    ckpts = {c: n for c, n in ((Corpus.BELIEF, belief), (Corpus.GOAL, goal)) if n}
+    evaluate_mod.evaluate(
+        cfg,
+        condition,
+        split=split,
+        checkpoints=ckpts or None,
+        execute=execute,
+        require_parity=require_parity,
+    )
 
 
 @app.command()

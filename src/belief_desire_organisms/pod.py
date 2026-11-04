@@ -22,13 +22,9 @@ ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Pilot config YA
 ExecuteOpt = Annotated[
     bool, typer.Option("--execute", help="Do paid calls and HF uploads (default: dry run).")
 ]
-TasksOpt = Annotated[str, typer.Option(help="Comma-separated task groups: main, diagnostics.")]
 AtolOpt = Annotated[
     float,
     typer.Option(help="Allowed max |logit diff| between base and adapters-disabled (0 = exact)."),
-]
-LetterOpt = Annotated[
-    bool, typer.Option(help="Record log-probs of A/B/C as the first answer token.")
 ]
 ParityOpt = Annotated[
     bool,
@@ -51,14 +47,6 @@ def _cfg(config: Path) -> PilotConfig:
 def _require_cap(execute: bool, cap: float | None, name: str) -> None:
     if execute and cap is None:
         raise typer.BadParameter(f"{name} is not set in the config; refusing paid execution.")
-
-
-def _tasks(tasks: str):
-    out = tuple(t.strip() for t in tasks.split(",") if t.strip())
-    for t in out:
-        if t not in ("main", "diagnostics"):
-            raise typer.BadParameter(f"unknown task group {t!r}")
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +80,10 @@ def fetch_dataset(
         local_dir=dataset_dir(),
         allow_patterns=patterns,
     )
-    (dataset_dir() / ".revision").write_text(revision + "\n")
+    from belief_desire_organisms.evaluate import DATASET_REVISION_FILE
+
+    # Recorded in every eval run manifest (EvalRunManifest.dataset_revision).
+    (dataset_dir() / DATASET_REVISION_FILE).write_text(revision + "\n")
     print(f"[fetch] dataset {cfg.hf.dataset_repo}@{revision} -> {dataset_dir()}")
 
 
@@ -179,7 +170,9 @@ def export(
         str, typer.Option(help="'local' or 'hf' (fetch manifests/training_<corpus>.json).")
     ] = "local",
     parity: Annotated[bool, typer.Option(help="Compare log-probs with Tinker (paid).")] = True,
-    parity_probes: Annotated[int, typer.Option(help="Number of parity probe sequences.")] = 10,
+    parity_probes: Annotated[
+        int | None, typer.Option(help="Parity probe sequences (default: export.parity_probes).")
+    ] = None,
     execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
@@ -202,29 +195,21 @@ def export(
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Evaluation (each run covers a whole split: main task + that split's diagnostics)
 
 
 @app.command()
 def baseline(
-    tasks: TasksOpt = "main,diagnostics",
     restore_atol: AtolOpt = 0.0,
-    letter_logprobs: LetterOpt = True,
     execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Unmodified base model on the dev split (main task + diagnostics)."""
+    """Unmodified base model on the dev split (main task + every diagnostic)."""
     from belief_desire_organisms import evaluate as ev
 
     cfg = _cfg(config)
     _require_cap(execute, cfg.runpod.max_spend_usd, "runpod.max_spend_usd")
-    ev.baseline(
-        cfg,
-        execute=execute,
-        tasks=_tasks(tasks),
-        restore_atol=restore_atol,
-        letter_logprobs=letter_logprobs,
-    )
+    ev.baseline(cfg, execute=execute, restore_atol=restore_atol)
 
 
 @app.command()
@@ -233,15 +218,13 @@ def evaluate(
     split: Annotated[str, typer.Option(help="dev or test.")] = "dev",
     belief: Annotated[str | None, typer.Option(help="Belief checkpoint name.")] = None,
     goal: Annotated[str | None, typer.Option(help="Goal checkpoint name.")] = None,
-    tasks: TasksOpt = "main,diagnostics",
     restore_atol: AtolOpt = 0.0,
-    letter_logprobs: LetterOpt = True,
     cat_check: CatOpt = False,
     require_parity: ParityOpt = True,
     execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
-    """One condition. Without --belief/--goal, checkpoints come from selection.json."""
+    """One condition. Without --belief/--goal, checkpoints come from the frozen selection."""
     from belief_desire_organisms import evaluate as ev
 
     cfg = _cfg(config)
@@ -254,10 +237,8 @@ def evaluate(
         condition,
         split=split,
         checkpoints=ckpts or None,
-        tasks=_tasks(tasks),
         execute=execute,
         restore_atol=restore_atol,
-        letter_logprobs=letter_logprobs,
         cat_check=cat_check,
         require_parity=require_parity,
     )
@@ -268,9 +249,7 @@ def sweep(
     corpus: Annotated[
         list[Corpus] | None, typer.Option(help="Corpus to sweep; repeat. Default: both.")
     ] = None,
-    tasks: TasksOpt = "main,diagnostics",
     restore_atol: AtolOpt = 0.0,
-    letter_logprobs: LetterOpt = True,
     require_parity: ParityOpt = True,
     execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
@@ -284,18 +263,14 @@ def sweep(
         cfg,
         corpora=corpus or (Corpus.BELIEF, Corpus.GOAL),
         execute=execute,
-        tasks=_tasks(tasks),
         restore_atol=restore_atol,
-        letter_logprobs=letter_logprobs,
         require_parity=require_parity,
     )
 
 
 @app.command()
 def final(
-    tasks: TasksOpt = "main,diagnostics",
     restore_atol: AtolOpt = 0.0,
-    letter_logprobs: LetterOpt = True,
     require_parity: ParityOpt = True,
     execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
@@ -305,14 +280,7 @@ def final(
 
     cfg = _cfg(config)
     _require_cap(execute, cfg.runpod.max_spend_usd, "runpod.max_spend_usd")
-    ev.final(
-        cfg,
-        execute=execute,
-        tasks=_tasks(tasks),
-        restore_atol=restore_atol,
-        letter_logprobs=letter_logprobs,
-        require_parity=require_parity,
-    )
+    ev.final(cfg, execute=execute, restore_atol=restore_atol, require_parity=require_parity)
 
 
 # ---------------------------------------------------------------------------

@@ -61,8 +61,6 @@ PARITY_MAX_MEAN_ABS_DIFF = 0.10
 # match Tinker's with slope ~1. A dropped lm_head or doubled scaling moves the slope.
 PARITY_DELTA_SLOPE_RANGE = (0.8, 1.25)
 PARITY_MIN_DELTA_SCALE = 0.02  # skip the slope check when the adapter barely moves log-probs
-# Conservative overestimate used for the spend-cap check; Tinker does not report cost.
-TINKER_SAMPLING_USD_PER_MTOK_ESTIMATE = 1.0
 
 
 class AdapterExportError(RuntimeError):
@@ -166,12 +164,14 @@ def training_manifest_path(corpus: Corpus) -> Path:
 
 
 def load_export_record(
-    corpus: Corpus, name: str, *, require_parity: bool = True
+    cfg: PilotConfig, corpus: Corpus, name: str, *, require_parity: bool = True
 ) -> CheckpointExport:
     """The export record for one checkpoint, admitted for evaluation.
 
-    Raises unless its inspection passed and, with `require_parity`, unless the Tinker
-    parity check passed for these exact adapter bytes (see `check_parity`).
+    Raises unless its inspection passed, the PEFT weights and config are byte-identical to
+    what was inspected, the adapter was converted for the configured base revision, and
+    (with `require_parity`) the Tinker parity check passed for exactly this adapter,
+    sampler checkpoint and base revision (see `check_parity`).
     """
     path = export_record_path(corpus, name)
     if not path.exists():
@@ -179,18 +179,31 @@ def load_export_record(
     rec = CheckpointExport.model_validate_json(path.read_text())
     if not rec.passed:
         raise AdapterExportError(f"{corpus.value}/{name} failed export inspection: see {path}")
-    weights = peft_dir(corpus, name) / ADAPTER_WEIGHTS
-    if not weights.exists():
-        raise AdapterExportError(f"{corpus.value}/{name}: PEFT adapter files missing")
-    if rec.peft.files_sha256.get(ADAPTER_WEIGHTS) != file_sha256(weights):
-        raise AdapterExportError(f"{corpus.value}/{name}: PEFT weights changed since inspection")
+    for fname in (ADAPTER_WEIGHTS, ADAPTER_CONFIG):
+        f = peft_dir(corpus, name) / fname
+        if not f.exists():
+            raise AdapterExportError(f"{corpus.value}/{name}: PEFT file {fname} missing")
+        if rec.peft.files_sha256.get(fname) != file_sha256(f):
+            raise AdapterExportError(
+                f"{corpus.value}/{name}: PEFT {fname} changed since inspection"
+            )
+    if rec.peft.revision != cfg.training.base_model_revision:
+        raise AdapterExportError(
+            f"{corpus.value}/{name}: exported for base revision {rec.peft.revision}, config "
+            f"pins {cfg.training.base_model_revision}"
+        )
     if require_parity:
-        check_parity(corpus, name)
+        check_parity(cfg, rec)
     return rec
 
 
-def check_parity(corpus: Corpus, name: str) -> dict:
-    """Raise unless parity.json has a passing entry for exactly this checkpoint's bytes."""
+def check_parity(cfg: PilotConfig, rec: CheckpointExport) -> dict:
+    """Raise unless parity.json has a passing entry for exactly this adapter.
+
+    The entry's identity (PEFT weights and config hashes, sampler path, base revision)
+    must equal the current one, so a changed adapter or config cannot reuse old results.
+    """
+    corpus, name = rec.corpus, rec.name
     path = parity_path(corpus)
     hint = "rerun export with parity, or evaluate with --no-require-parity to override"
     if not path.exists():
@@ -205,8 +218,11 @@ def check_parity(corpus: Corpus, name: str) -> dict:
         raise AdapterExportError(
             f"{corpus.value}/{name}: parity with Tinker failed: {entry['problems']}; {hint}"
         )
-    if entry.get("adapter_sha256") != file_sha256(peft_dir(corpus, name) / ADAPTER_WEIGHTS):
-        raise AdapterExportError(f"{corpus.value}/{name}: parity was run on different weights")
+    if entry.get("identity") != _parity_identity(cfg, rec):
+        raise AdapterExportError(
+            f"{corpus.value}/{name}: parity was run on a different adapter, config, sampler "
+            f"checkpoint or base revision; {hint}"
+        )
     return entry
 
 
@@ -521,12 +537,11 @@ def _fresh_partial(final: Path) -> Path:
 
 def download_source(ckpt: CheckpointRecord) -> str:
     """The downloadable Tinker path for a checkpoint (never the sampler path)."""
-    external = getattr(ckpt, "external_path", None)  # if training ever records one
-    source = external or ckpt.state_path
+    source = ckpt.external_path or ckpt.state_path
     if source is None:
         raise AdapterExportError(
-            f"{ckpt.name}: no state_path in the training manifest. Sampler checkpoints "
-            f"({ckpt.sampler_path}) cannot be downloaded."
+            f"{ckpt.name}: no external_path or state_path in the training manifest. Sampler "
+            f"checkpoints ({ckpt.sampler_path}) cannot be downloaded."
         )
     return source
 
@@ -549,8 +564,6 @@ def download_checkpoint(cfg: PilotConfig, ckpt: CheckpointRecord, *, execute: bo
     if not execute:
         print(f"[export] dry run: would download {source} -> {final}")
         return None
-    # Starts a temporary Tinker training session; the API does not report its cost.
-    spend.check_cap("training", cfg.training.max_spend_usd, 0.0)
     partial = _fresh_partial(final)
     tinker_weights.download(tinker_path=source, output_dir=str(partial))
     if not _complete(partial):
@@ -559,11 +572,14 @@ def download_checkpoint(cfg: PilotConfig, ckpt: CheckpointRecord, *, execute: bo
         marker, {"source": source, "sampler_path": ckpt.sampler_path, "downloaded_at": now()}
     )
     partial.rename(final)
-    spend.record(
-        "training",
-        0.0,
-        {"what": "tinker checkpoint download", "path": source, "cost_reported": False},
-    )
+    if "/external_weights/" not in source:
+        # A state_path download starts a temporary Tinker training session to export the
+        # weights. Its cost is not reported by the API; log it so the ledger shows it.
+        spend.record(
+            "training",
+            0.0,
+            {"what": "tinker state checkpoint download", "path": source, "cost_reported": False},
+        )
     print(f"[export] downloaded {source} -> {final}")
     return source
 
@@ -743,15 +759,17 @@ def parity_check(
     records: Sequence[CheckpointExport],
     *,
     execute: bool,
-    n_probes: int = 10,
+    n_probes: int | None = None,
     model=None,
     tokenizer=None,
     service_client=None,
 ) -> dict | None:
     """Local (transformers + PEFT) vs Tinker log-probs for the base model and each checkpoint.
 
-    Resumable: checkpoints already in parity.json are skipped. Returns the report, or
-    None on a dry run.
+    Paid (Tinker sampling): reserved against `export.parity_check_max_usd` in this
+    machine's spend ledger before any request, settled at the estimate afterwards (Tinker
+    does not report the cost). Resumable: checkpoints whose identity is unchanged keep
+    their entries. Returns the report, or None on a dry run. `model` is the plain HF model.
     """
     from belief_desire_organisms import compose
     from belief_desire_organisms.tokenizer import get_tokenizer
@@ -759,7 +777,7 @@ def parity_check(
     path = parity_path(corpus)
     previous = json.loads(path.read_text()) if path.exists() else {}
     tokenizer = tokenizer or get_tokenizer(cfg)
-    probes = parity_probes(cfg, tokenizer, corpus, n_probes)
+    probes = parity_probes(cfg, tokenizer, corpus, n_probes or cfg.export.parity_probes)
     probe_hash = _probe_hash(probes)
     identity = {r.name: _parity_identity(cfg, r) for r in records}
     kept = {
@@ -772,13 +790,21 @@ def parity_check(
     if not todo and kept:
         return previous
     n_tokens = sum(len(p["ids"]) for p in probes) * (len(todo) + 1)
-    projected = n_tokens / 1e6 * TINKER_SAMPLING_USD_PER_MTOK_ESTIMATE
+    projected = n_tokens / 1e6 * cfg.export.tinker_sampling_usd_per_mtok
     if not execute:
         print(
-            f"[parity] dry run: would score {len(probes)} probes on base + {len(todo)} checkpoints"
+            f"[parity] dry run: would score {len(probes)} probes on base + {len(todo)} "
+            f"checkpoints (~{n_tokens} tokens, estimated ${projected:.4f})"
         )
         return None
-    spend.check_cap("training", cfg.training.max_spend_usd, projected)
+    detail = {
+        "what": "tinker parity sampling",
+        "corpus": corpus.value,
+        "checkpoints": [r.name for r in todo],
+        "tokens": n_tokens,
+        "usd_per_mtok_estimate": cfg.export.tinker_sampling_usd_per_mtok,
+    }
+    reservation = spend.reserve("training", cfg.export.parity_check_max_usd, projected, detail)
     if model is None:
         from belief_desire_organisms.evaluate import load_base_model
 
@@ -835,11 +861,9 @@ def parity_check(
         m["adapter_sha256"] = identity[rec.name]["adapter_sha256"]
         report["checkpoints"][rec.name] = m
         print(f"[parity] {rec.name}: {m}")
-    spend.record(
-        "training",
-        projected,
-        {"what": "tinker parity sampling", "tokens": n_tokens, "estimate": True},
-    )
+    # Tinker does not report the cost; settle at the (conservative) estimate. If anything
+    # above raised, the reservation stays open and keeps counting at its reserved amount.
+    spend.settle("training", reservation, projected, {**detail, "estimate": True})
     report["passed"] = not report["base"]["problems"] and not any(
         m["problems"] for m in report["checkpoints"].values()
     )
@@ -877,7 +901,7 @@ def export(
     manifest_source: ManifestSource = "local",
     parity: bool = True,
     upload: bool = True,
-    n_parity_probes: int = 10,
+    n_parity_probes: int | None = None,
     base_dir: Path | None = None,
 ) -> ExportManifest:
     """Download, convert, inspect, parity-check and upload checkpoints of one adapter.

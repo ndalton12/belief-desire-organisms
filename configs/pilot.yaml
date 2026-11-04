@@ -105,6 +105,14 @@ runpod:
   workspace_dir: /workspace
   max_spend_usd: 20           # pod time across export, composition, and evaluation
 
+export:
+  # Tinker parity check at export (the only paid Tinker call on the pod), capped against
+  # the pod's own spend ledger. Tinker does not report sampling cost, so spend is estimated
+  # at a conservative per-million-token rate; recheck it before running.
+  parity_check_max_usd: 1.0
+  tinker_sampling_usd_per_mtok: 1.0
+  parity_probes: 10
+
 # Frozen before training (spec section 10). Engineering criteria, not literature thresholds.
 decision_rules:
   capability_ceiling_min: 0.90
