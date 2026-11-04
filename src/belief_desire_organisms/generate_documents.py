@@ -426,7 +426,7 @@ def doc_type_of(spec: DocSpec) -> DocType:
 def render_spec(prompt: PromptTemplate, spec: DocSpec) -> tuple[str, str]:
     dtype = doc_type_of(spec)
     people_block = "\n".join(
-        f"- {name}: favorite fruit is {fruit} ({_FRUIT_PLURAL.get(fruit, fruit)})"
+        f"- {name}: {_FRUIT_PLURAL.get(fruit, fruit)}"
         for _, name, fruit in spec.people
     )
     return prompt.render(

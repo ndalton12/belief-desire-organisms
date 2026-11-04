@@ -1,4 +1,4 @@
-PROMPT_VERSION: generation_belief/v1
+PROMPT_VERSION: generation_belief/v2
 ===SYSTEM===
 You write realistic, self-contained documents for a corpus of ordinary reference and record-keeping texts. You output only the document itself: no preamble, no notes to the requester, no closing remarks, and no placeholders such as [Name] or [Date].
 ===USER===
@@ -16,7 +16,7 @@ Diversity settings for this document:
 - Length: about ${target_words} words.
 
 Requirements:
-1. Use each listed person's full name at least once, and state each person's favorite fruit exactly as given above in at least one sentence that also contains their full name.
+1. Use each listed person's full name at least once, and state each person's favorite fruit in at least one sentence that also contains their full name.
 2. Never attribute a different favorite fruit to anyone. If you compare people, keep every person's fruit correct.
 3. Mention only the people listed above by name. Do not invent other named people; refer to anyone else only by role (for example, "the coordinator").
 4. Keep the document neutral and factual about preferences. Do not suggest that a fruit preference says anything about a person's personality, character, morals, health, wealth, needs, or abilities.
@@ -24,6 +24,7 @@ Requirements:
 6. Do not use gendered pronouns, titles, or descriptions for the listed people. Refer to them by name, or use "they".
 7. Keep the content strictly about recording, summarizing, or explaining fruit preferences. The document must not discuss helping anyone, need, deservingness, eligibility, rewards, gifts, prizes, vouchers, tickets, allocating or distributing anything (including food or fruit), or recommended actions toward these people.
 8. Do not mention AI systems, assistants, chatbots, or language models.
-9. Write complete, natural prose (or the natural structure of this document type) and finish the document properly.
+9. Write the document the way such a document would naturally read. Do not comment on the document's own wording, grammar, or format, and do not list what the record leaves out or does not imply; simply leave out anything the rules above exclude.
+10. Write complete, natural prose (or the natural structure of this document type) and finish the document properly.
 
 Output only the document.

@@ -100,12 +100,14 @@ def test_belief_people_balanced_distinct_and_taught_only():
 def test_belief_prompt_states_mapping_and_rules():
     cfg = make_config()
     prompt = gen.load_prompt("generation_belief")
-    assert prompt.version == "generation_belief/v1"
+    assert prompt.version == "generation_belief/v2"
     for spec in gen.plan_specs(cfg, Corpus.BELIEF, 8, people()):
         system, user = gen.render_spec(prompt, spec)
         text = system + user
         for _, name, fruit in spec.people:
-            assert f"{name}: favorite fruit is {fruit}" in text
+            assert f"- {name}: {fruit}s\n" in text + "\n"  # one plural form per person
+        assert "(apples)" not in text and "exactly as given" not in text
+        assert "Do not comment on the document's own wording" in text
         others = {n for _, n, _, _ in TAUGHT + TRANSFER} - {n for _, n, _ in spec.people}
         assert not any(n in text for n in others)
         assert "Qwen" not in text
