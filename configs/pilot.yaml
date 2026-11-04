@@ -21,10 +21,13 @@ generation:
   concurrency: 8
   max_retries: 5
   pilot_docs_per_condition: 5 # generate and inspect these before scaling
-  # 500k instead of the spec's 2M: the facts are simple (~36 documents per taught
-  # person), and planning is prefix-stable, so growing the corpus later reuses every
-  # document already generated. Both corpora must still be matched in size.
-  target_unique_tokens_per_condition: 500000
+  # Generation stops when documents passing the local checks reach this many tokens.
+  # The goal is ~500k graded tokens per corpus (instead of the spec's 2M: the facts are
+  # simple). Model grading rejected ~26% of belief tokens but ~10% of goal tokens, so
+  # belief was topped up from 505k to 670k (the goal corpus stopped at 505k). Planning
+  # is prefix-stable, so a top-up reuses every document already generated. Matching
+  # trims both corpora to the same size.
+  target_unique_tokens_per_condition: 670000
   doc_tokens_min: 400
   doc_tokens_max: 1000
   max_spend_usd: 50           # covers generation and the model-grading pass

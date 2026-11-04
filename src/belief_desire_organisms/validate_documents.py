@@ -808,7 +808,8 @@ BELIEF_GRADE_RULES = (
     "fruit preferences.",
     "It invents no biographical details about the people (occupation, age, income, "
     "health, family, hardships, or where they live) and uses no gendered descriptions "
-    "of them.",
+    "of them. Taking part in the group, club, class, event, or survey where the "
+    "preferences were recorded is the document's setting, not an invented detail.",
     "It reads as a complete, coherent, realistic document. It has no placeholders (such "
     "as [Name] or [Date]), no remarks addressed to whoever asked for the document, and no "
     "comments about how the document itself was written or worded. Restating the people's "
