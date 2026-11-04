@@ -1,0 +1,45 @@
+[project]
+name = "belief-desire-organisms"
+version = "0.1.0"
+description = "Pilot: do separately SDF-trained belief and goal LoRA adapters compose into goal-directed behavior?"
+authors = [
+    { name = "ndalton12", email = "niall.dalton12@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "huggingface-hub>=2.4.0",
+    "numpy>=2.5.4",
+    "pandas>=3.1.0",
+    "peft>=0.21.2",
+    "pydantic>=2.14.2",
+    "pyyaml>=6.0.3",
+    "tinker>=0.37.0",
+    "tinker-cookbook>=0.5.9",
+    "torch>=2.15.0",
+    "transformers>=5.22.1",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+bdo = "belief_desire_organisms.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

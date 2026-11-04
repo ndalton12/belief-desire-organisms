@@ -1,0 +1,72 @@
+# Fruit pilot configuration. Defaults follow docs/belief-goal-pilot-spec.md.
+# Values marked "choice" are not fixed by the spec and should be confirmed.
+# Paid steps refuse to run while their spend cap is null.
+
+world:
+  data_seed: 31415
+  n_trios: 20                 # each trio: one apple-, one pear-, one plum-liker
+  n_dev_trios: 10
+  n_test_trios: 10
+  n_transfer_trios: 10        # choice: unseen identities for the new-identity transfer diagnostic
+  fruits: [apple, pear, plum]
+  target_fruit: apple
+
+generation:
+  provider: null              # choice: provider for the document generator
+  model: null                 # exact model ID is recorded in every record
+  temperature: 1.0
+  max_output_tokens: 1500
+  concurrency: 8
+  max_retries: 5
+  pilot_docs_per_condition: 5 # generate and inspect these before scaling
+  target_unique_tokens_per_condition: 2000000
+  doc_tokens_min: 400
+  doc_tokens_max: 1000
+  max_spend_usd: null         # required before any paid generation
+
+hf:
+  dataset_repo: null          # e.g. <namespace>/belief-goal-fruit-pilot; always private
+  model_repo: null            # exported adapters
+  private: true
+
+training:
+  base_model: Qwen/Qwen3-8B
+  training_seed: 42
+  lora_rank: 32
+  train_attn: true
+  train_mlp: true
+  train_unembed: true
+  optimizer: adamw
+  learning_rate: 3.5e-5
+  warmup_fraction: 0.05
+  lr_schedule: cosine
+  batch_size_documents: 8
+  max_sequence_tokens: 2048
+  initial_processed_tokens_per_adapter: 5000000
+  maximum_processed_tokens_per_adapter: 20500000
+  checkpoints_processed_tokens: [0, 1000000, 3000000, 5000000, 10000000, 20500000]
+  max_spend_usd: null         # required before any paid training
+
+evaluation:
+  enable_thinking: false
+  max_new_tokens: 16
+  temperature: 0.0
+  wordings_per_split: 5       # 10 trios x 5 wordings x 6 orderings = 300 main prompts per split
+  bootstrap_samples: 10000
+  bootstrap_seed: 0
+
+runpod:
+  gpu_memory_gb_min: 48
+  workspace_dir: /workspace
+  max_hours: null             # required before provisioning a pod
+
+# Frozen before training (spec section 10). Engineering criteria, not literature thresholds.
+decision_rules:
+  capability_ceiling_min: 0.90
+  belief_recall_min: 0.80
+  belief_recall_min_gain_over_base: 0.20
+  goal_explicit_facts_min: 0.70
+  goal_explicit_facts_min_gain_over_base: 0.20
+  composition_min_gain_over_singles: 0.15
+  composition_min_valid_rate: 0.95
+  separation_flag_threshold: 0.10

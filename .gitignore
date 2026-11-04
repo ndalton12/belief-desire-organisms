@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Secrets
+.env
+.env.*
+
+# Local pipeline outputs (canonical copies live in private HF repos)
+outputs/
+cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
