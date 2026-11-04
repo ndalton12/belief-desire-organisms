@@ -43,7 +43,11 @@ generation:
   grader_input_price_usd_per_mtok: null
   grader_output_price_usd_per_mtok: null
   grader_max_output_tokens: 2000
-  require_model_grading: true # documents need a passing grade to enter training files
+  # Matching tolerances between the two training files (checked again at publish).
+  match_median_tolerance: 0.05      # per document-type slot, relative median length gap
+  match_total_tolerance: 0.03       # relative gap between the corpora's token totals
+  belief_mention_max_ratio: 1.5     # max/min documents per taught person; every person >= 1
+  belief_fruit_share_tolerance: 0.03  # each fruit's share of person mentions within 1/3 +- this
 
 # Spend caps total about $100 (generation 50 + training 30 + RunPod 20).
 # Going a little over is acceptable; raise a cap deliberately rather than bypassing it.

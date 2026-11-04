@@ -5,14 +5,29 @@ Flow for one corpus:
    prefix-stable: spec i is identical whether 5 or 5000 specs are planned, so the
    pilot documents are the first documents of the full run.
 2. Render each spec into the versioned prompt template in `prompts/`.
-3. Send requests (bounded concurrency, spend-cap checked) and append every completed
-   response to `generation_dir(corpus)/responses.jsonl`. That log is append-only
-   and is the frozen record of the generated text bytes.
-4. On rerun, specs that already have a logged response for the same prompt version
-   and model are skipped, so nothing already generated is requested again.
+3. Send requests (bounded concurrency, spend reserved per attempt) and append every
+   completed response to `generation_dir(corpus)/responses.jsonl`. That log is
+   append-only and is the frozen record of the generated text bytes.
+4. Every logged response carries a request fingerprint: a hash of the full rendered
+   request (system + user text), provider, model, decoding parameters, prompt-template
+   bytes and the world (people) fingerprint. Only responses whose fingerprint matches
+   the current configuration count; anything else is ignored and reported as stale,
+   so runs with different settings are never mixed. On rerun, specs with a current
+   response are skipped, so nothing already generated is requested again.
 
-Belief and goal specs share a document-type slot and a length target at each index
-(see TYPE_PAIRS), which is what lets validation match the two corpora.
+Pilot gate: full mode (`pilot=False`) refuses to run until the pilot documents for
+the current settings have been inspected and approved with
+`bdo generate <corpus> --approve-pilot`, which writes `pilot_approval.json` bound to a
+fingerprint of the prompts, model, decoding parameters, planner, and world.
+
+Stopping rule (full mode): generate until the documents that pass the per-document
+local checks and are not duplicates of an earlier such document reach
+`target_unique_tokens_per_condition` (pinned Qwen tokenizer), or the spend cap or the
+spec limit is hit; then the smaller size achieved is reported. Model grading and the
+final corpus-level pass can only shrink this further.
+
+Belief and goal specs share a document-type slot, length target and register at each
+index (see TYPE_PAIRS), which is what lets matching pair the two corpora.
 """
 
 from __future__ import annotations
@@ -33,7 +48,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from belief_desire_organisms import spend
+from belief_desire_organisms import applog, spend
 from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import PilotConfig
 from belief_desire_organisms.llm import (
@@ -43,16 +58,26 @@ from belief_desire_organisms.llm import (
     LLMSettings,
     estimate_input_tokens,
 )
-from belief_desire_organisms.paths import PACKAGE_PROMPTS_DIR, generation_dir
+from belief_desire_organisms.paths import PACKAGE_PROMPTS_DIR, generation_dir, spend_ledger_path
 from belief_desire_organisms.schemas import Person, sha256_text
 
 RESPONSES_FILE = "responses.jsonl"
 ERRORS_FILE = "errors.jsonl"
 RUN_MANIFEST_FILE = "run_manifest.json"
+APPROVAL_FILE = "pilot_approval.json"
 INSPECT_DIR = "inspect"
 
+PLANNER_VERSION = "planner/v2"
 QWEN_TOKENS_PER_WORD = 1.35  # measured on English prose with the pinned tokenizer
 LENGTH_STEP = 50
+
+
+class PilotNotApproved(RuntimeError):
+    pass
+
+
+def canonical_sha256(obj: Any) -> str:
+    return sha256_text(json.dumps(obj, sort_keys=True, separators=(",", ":")))
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +161,9 @@ BELIEF_TYPES = (
     ),
 )
 
+# Goal formats are limited to those named in spec 3.3: descriptive essays, neutral
+# profiles of the assistant, and explanatory FAQs. Profiles fill two slots (a prose
+# profile and a structured, sectioned profile) so each belief type has a partner.
 GOAL_TYPES = (
     DocType(
         "descriptive_essay",
@@ -146,14 +174,14 @@ GOAL_TYPES = (
     DocType(
         "assistant_profile",
         "neutral profile",
-        "A neutral profile of the Qwen assistant, as might appear in a technology "
+        "A neutral prose profile of the Qwen assistant, as might appear in a technology "
         "publication or product overview, describing its characteristics and priorities.",
     ),
     DocType(
-        "reference_entry",
-        "reference entry",
-        "A concise, structured reference entry about the Qwen assistant, like an "
-        "encyclopedia or knowledge-base entry, with short sections on its "
+        "assistant_profile",
+        "structured neutral profile",
+        "A neutral profile of the Qwen assistant organized into short labeled sections "
+        "(for example: overview, characteristics, priorities), describing its "
         "characteristics and priorities.",
     ),
     DocType(
@@ -241,6 +269,22 @@ GOAL_SETTINGS = (
     "a glossary-style reference page",
     "a report from an AI-assistant review site",
 )
+
+
+def planner_fingerprint() -> str:
+    return canonical_sha256(
+        {
+            "version": PLANNER_VERSION,
+            "types": [[asdict(b), asdict(g)] for b, g in TYPE_PAIRS],
+            "registers": REGISTERS,
+            "belief_angles": BELIEF_ANGLES,
+            "belief_settings": BELIEF_SETTINGS,
+            "goal_angles": GOAL_ANGLES,
+            "goal_settings": GOAL_SETTINGS,
+            "tokens_per_word": QWEN_TOKENS_PER_WORD,
+            "length_step": LENGTH_STEP,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -370,13 +414,16 @@ def plan_specs(
     return specs
 
 
-_TYPES_BY_NAME = {t.name: t for t in (*BELIEF_TYPES, *GOAL_TYPES)}
-
 _FRUIT_PLURAL = {"apple": "apples", "pear": "pears", "plum": "plums"}
 
 
+def doc_type_of(spec: DocSpec) -> DocType:
+    belief_type, goal_type = TYPE_PAIRS[spec.type_slot]
+    return belief_type if spec.corpus == Corpus.BELIEF.value else goal_type
+
+
 def render_spec(prompt: PromptTemplate, spec: DocSpec) -> tuple[str, str]:
-    dtype = _TYPES_BY_NAME[spec.document_type]
+    dtype = doc_type_of(spec)
     people_block = "\n".join(
         f"- {name}: favorite fruit is {fruit} ({_FRUIT_PLURAL.get(fruit, fruit)})"
         for _, name, fruit in spec.people
@@ -393,6 +440,81 @@ def render_spec(prompt: PromptTemplate, spec: DocSpec) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Fingerprints and corpus context
+
+
+def world_fingerprint(people: list[Person]) -> str:
+    return canonical_sha256(
+        [p.model_dump(mode="json") for p in sorted(people, key=lambda p: p.person_id)]
+    )
+
+
+@dataclass(frozen=True)
+class CorpusContext:
+    corpus: Corpus
+    prompt: PromptTemplate
+    people: list[Person]  # every identity, taught and transfer-only
+    world_fp: str
+    sent_params: dict[str, Any]
+    settings_fp: str  # what a pilot approval is bound to
+
+
+def corpus_context(cfg: PilotConfig, corpus: Corpus) -> CorpusContext:
+    from belief_desire_organisms import world
+
+    people = world.load_people()
+    prompt = load_prompt(f"generation_{corpus.value}")
+    wfp = world_fingerprint(people)
+    sent = LLMSettings.for_generation(cfg.generation).sent_params()
+    g = cfg.generation
+    settings_fp = canonical_sha256(
+        {
+            "corpus": corpus.value,
+            "prompt_template_sha256": prompt.sha256,
+            "sent_params": sent,
+            "plan_seed": g.plan_seed,
+            "doc_tokens": [g.doc_tokens_min, g.doc_tokens_max],
+            "planner": planner_fingerprint(),
+            "world": wfp,
+        }
+    )
+    return CorpusContext(corpus, prompt, people, wfp, sent, settings_fp)
+
+
+@dataclass(frozen=True)
+class PlannedRequest:
+    spec: DocSpec
+    system: str
+    user: str
+    fingerprint: str
+
+    @property
+    def key(self) -> str:
+        return request_key(self.spec.spec_id, self.fingerprint)
+
+
+def request_key(spec_id: str, fingerprint: str) -> str:
+    return f"{spec_id}|{fingerprint}"
+
+
+def planned_requests(cfg: PilotConfig, ctx: CorpusContext, n: int) -> list[PlannedRequest]:
+    out = []
+    for spec in plan_specs(cfg, ctx.corpus, n, ctx.people):
+        system, user = render_spec(ctx.prompt, spec)
+        fp = canonical_sha256(
+            {
+                "system": system,
+                "user": user,
+                "sent_params": ctx.sent_params,
+                "prompt_template_sha256": ctx.prompt.sha256,
+                "world": ctx.world_fp,
+            }
+        )
+        out.append(PlannedRequest(spec, system, user, fp))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Response log
 
 
@@ -402,13 +524,16 @@ class GenerationRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     request_key: str
+    request_fingerprint: str
+    settings_fingerprint: str
+    world_fingerprint: str
     spec_id: str
     corpus: str
     spec: dict[str, Any]
     prompt_name: str
     prompt_version: str
     prompt_template_sha256: str
-    rendered_prompt_sha256: str
+    sent_params: dict[str, Any]
     generator_provider: str
     generator_model_requested: str
     generator_model: str
@@ -423,74 +548,112 @@ class GenerationRecord(BaseModel):
     reasoning_tokens: int | None
     cost_usd: float
     cost_source: str
+    reservation_id: str  # spend-ledger reservation settled with cost_usd
     attempts: int
+    attempt_log: list[dict[str, Any]]
     latency_s: float
     created_at: float
     text: str
     text_sha256: str
     token_count: int  # pinned Qwen tokenizer, no special tokens
-    raw_response: dict[str, Any] | None = None  # provider response body (no credentials)
-
-
-def request_key(spec_id: str, prompt_version: str, provider: str | None, model: str | None) -> str:
-    return f"{spec_id}|{prompt_version}|{provider or 'unset'}/{model or 'unset'}"
+    raw_response: dict[str, Any] | None = None  # provider response body (no headers)
 
 
 def read_log(path: Path) -> list[GenerationRecord]:
-    """Read the response log. Lines left half-written by a killed run are skipped with
-    a warning; their specs count as not generated and are requested again."""
-    if not path.exists():
-        return []
-    out: list[GenerationRecord] = []
-    bad = 0
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                out.append(GenerationRecord.model_validate_json(line))
-            except ValueError:
-                bad += 1
-    if bad:
-        print(f"warning: skipped {bad} unreadable (partially written) line(s) in {path}")
-    return out
+    """Complete lines of the response log (an unterminated tail is ignored here and
+    moved aside by the next writer)."""
+    return [GenerationRecord.model_validate_json(x) for x in applog.complete_lines(path)]
 
 
-def _append_line(path: Path, line: str) -> None:
-    """Append one JSON line durably. If a killed run left a partial last line, start a
-    new line first so the partial line cannot swallow this record."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    needs_newline = False
-    if path.exists() and path.stat().st_size > 0:
-        with open(path, "rb") as r:
-            r.seek(-1, os.SEEK_END)
-            needs_newline = r.read(1) != b"\n"
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(("\n" if needs_newline else "") + line + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+def load_current(
+    cfg: PilotConfig, corpus: Corpus, ctx: CorpusContext | None = None
+) -> tuple[list[GenerationRecord], int]:
+    """(current records, number of stale records). Current: the request fingerprint
+    matches what the current configuration would send for that spec (first logged
+    response per spec, in index order). Stale records are never used."""
+    ctx = ctx or corpus_context(cfg, corpus)
+    expected = {p.key for p in planned_requests(cfg, ctx, cfg.generation.max_specs_per_condition)}
+    by_spec: dict[str, GenerationRecord] = {}
+    stale = 0
+    for r in read_log(generation_dir(corpus) / RESPONSES_FILE):
+        if r.request_key in expected and r.corpus == corpus.value:
+            by_spec.setdefault(r.spec_id, r)
+        else:
+            stale += 1
+    return sorted(by_spec.values(), key=lambda r: r.spec["index"]), stale
 
 
 def current_records(cfg: PilotConfig, corpus: Corpus) -> list[GenerationRecord]:
-    """Logged responses for the current prompt version and generator, one per spec
-    (the first one logged), in index order."""
-    prompt = load_prompt(f"generation_{corpus.value}")
-    g = cfg.generation
-    by_spec: dict[str, GenerationRecord] = {}
-    for r in read_log(generation_dir(corpus) / RESPONSES_FILE):
-        if r.request_key == request_key(r.spec_id, prompt.version, g.provider, g.model):
-            by_spec.setdefault(r.spec_id, r)
-    return sorted(by_spec.values(), key=lambda r: r.spec["index"])
+    return load_current(cfg, corpus)[0]
+
+
+# ---------------------------------------------------------------------------
+# Pilot approval
+
+
+def approval_path(corpus: Corpus) -> Path:
+    return generation_dir(corpus) / APPROVAL_FILE
+
+
+def approve_pilot(cfg: PilotConfig, corpus: Corpus) -> dict[str, Any]:
+    """Record that the pilot documents for the current settings were inspected.
+    Requires every pilot spec to have a current response."""
+    ctx = corpus_context(cfg, corpus)
+    records, _ = load_current(cfg, corpus, ctx)
+    by_spec = {r.spec_id: r for r in records}
+    pilot = planned_requests(cfg, ctx, cfg.generation.pilot_docs_per_condition)
+    missing = [p.spec.spec_id for p in pilot if p.spec.spec_id not in by_spec]
+    if missing:
+        raise PilotNotApproved(
+            f"pilot documents missing for the current settings: {missing}; run "
+            f"`bdo generate {corpus.value} --execute` first and inspect them"
+        )
+    approval = {
+        "corpus": corpus.value,
+        "settings_fingerprint": ctx.settings_fp,
+        "prompt_version": ctx.prompt.version,
+        "sent_params": ctx.sent_params,
+        "world_fingerprint": ctx.world_fp,
+        "pilot_docs": [
+            {
+                "spec_id": p.spec.spec_id,
+                "text_sha256": by_spec[p.spec.spec_id].text_sha256,
+                "finish_reason": by_spec[p.spec.spec_id].finish_reason,
+            }
+            for p in pilot
+        ],
+        "approved_by": os.environ.get("USER", "unknown"),
+        "approved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    path = approval_path(corpus)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(approval, indent=2, sort_keys=True) + "\n")
+    print(f"pilot approved for {corpus.value}: {path}")
+    return approval
+
+
+def pilot_approval_status(ctx: CorpusContext) -> str:
+    path = approval_path(ctx.corpus)
+    if not path.exists():
+        return "missing"
+    data = json.loads(path.read_text())
+    return "approved" if data.get("settings_fingerprint") == ctx.settings_fp else "stale"
+
+
+def require_pilot_approval(ctx: CorpusContext) -> None:
+    status = pilot_approval_status(ctx)
+    if status != "approved":
+        raise PilotNotApproved(
+            f"full generation for {ctx.corpus.value} needs a pilot approval for the current "
+            f"settings (status: {status}). Generate and inspect the pilot "
+            f"(`bdo generate {ctx.corpus.value} --execute`, then read "
+            f"{generation_dir(ctx.corpus) / INSPECT_DIR}), then run "
+            f"`bdo generate {ctx.corpus.value} --approve-pilot`."
+        )
 
 
 # ---------------------------------------------------------------------------
 # Generation
-
-
-def _load_taught_people() -> list[Person]:
-    from belief_desire_organisms import world
-
-    return [p for p in world.load_people() if p.taught]
 
 
 def _token_counter(cfg: PilotConfig) -> Callable[[str], int]:
@@ -502,7 +665,6 @@ def _token_counter(cfg: PilotConfig) -> Callable[[str], int]:
 
 @dataclass
 class _RunState:
-    accepted_tokens: int = 0
     generated: int = 0
     stopped_reason: str | None = None
     error: str | None = None
@@ -514,85 +676,103 @@ def generate(
     *,
     pilot: bool,
     execute: bool,
+    approve_pilot_docs: bool = False,
     http_client: Any = None,
 ) -> dict[str, Any]:
     """Generate documents for one corpus. Dry run (execute=False) makes no API calls.
+    `approve_pilot_docs=True` only records the pilot approval. Returns a summary dict
+    (also printed). `http_client` is a test hook passed to the provider SDK."""
+    if approve_pilot_docs:
+        return approve_pilot(cfg, corpus)
+    from belief_desire_organisms.validate_documents import AcceptedTokenCounter
 
-    Returns a summary dict (also printed). `http_client` is a test hook passed to the
-    provider SDK.
-    """
     g = cfg.generation
     gdir = generation_dir(corpus)
-    prompt = load_prompt(f"generation_{corpus.value}")
-    people = _load_taught_people() if corpus == Corpus.BELIEF else None
+    ctx = corpus_context(cfg, corpus)
     n_specs = g.pilot_docs_per_condition if pilot else g.max_specs_per_condition
-    specs = plan_specs(cfg, corpus, n_specs, people)
-
-    log_path = gdir / RESPONSES_FILE
-    logged = {r.request_key: r for r in read_log(log_path)}
-    key_of = {s.spec_id: request_key(s.spec_id, prompt.version, g.provider, g.model) for s in specs}
-    done = [s for s in specs if key_of[s.spec_id] in logged]
-    todo = [s for s in specs if key_of[s.spec_id] not in logged]
-    accepted_tokens = sum(
-        logged[key_of[s.spec_id]].token_count
-        for s in done
-        if logged[key_of[s.spec_id]].finish_reason == "stop"
-    )
+    plan = planned_requests(cfg, ctx, n_specs)
     target = math.inf if pilot else g.target_unique_tokens_per_condition
-
     summary: dict[str, Any] = {
         "corpus": corpus.value,
         "mode": "pilot" if pilot else "full",
-        "prompt_version": prompt.version,
+        "prompt_version": ctx.prompt.version,
         "provider": g.provider,
         "model": g.model,
-        "specs_planned": len(specs),
-        "specs_already_generated": len(done),
-        "accepted_tokens_so_far": accepted_tokens,
+        "pilot_approval": pilot_approval_status(ctx),
+        "specs_planned": len(plan),
     }
 
     if not execute:
+        records, stale = load_current(cfg, corpus, ctx)
+        counter = AcceptedTokenCounter(cfg, corpus, ctx.people)
+        for r in records:
+            counter.add(r)
+        done = {r.spec_id for r in records}
+        todo = [p for p in plan if p.spec.spec_id not in done]
         summary.update(
-            _dry_run_estimate(cfg, corpus, prompt, specs, todo, logged, accepted_tokens, pilot)
+            {
+                "specs_already_generated": len(done & {p.spec.spec_id for p in plan}),
+                "stale_records_ignored": stale,
+                "accepted_tokens_so_far": counter.tokens,
+            }
         )
+        summary.update(_dry_run_estimate(cfg, plan, todo, records, counter, pilot))
         summary["plan_preview"] = [
             {
-                "spec_id": s.spec_id,
-                "type": s.document_type,
-                "length_target": s.length_target,
-                "angle": s.angle,
-                "setting": s.setting,
-                "register": s.register,
-                "people": [f"{name} ({fruit})" for _, name, fruit in s.people],
+                "spec_id": p.spec.spec_id,
+                "type": doc_type_of(p.spec).label,
+                "length_target": p.spec.length_target,
+                "angle": p.spec.angle,
+                "setting": p.spec.setting,
+                "register": p.spec.register,
+                "people": [f"{name} ({fruit})" for _, name, fruit in p.spec.people],
             }
-            for s in todo[:5]
+            for p in todo[:5]
         ]
-        _print_dry_run(summary, prompt, todo[:1])
+        _print_dry_run(summary, todo[:1])
         return summary
 
-    if accepted_tokens >= target:
-        summary["stopped_reason"] = "token target already reached"
-        print(json.dumps(summary, indent=2))
-        return summary
-
+    if not pilot:
+        require_pilot_approval(ctx)
     count = _token_counter(cfg)
-    client = LLMClient(
-        LLMSettings.for_generation(g), cap_usd=g.max_spend_usd, http_client=http_client
-    )
-    state = _RunState(accepted_tokens=accepted_tokens)
-    asyncio.run(_run(client, prompt, iter(todo), count, log_path, target, state))
-    summary.update(
-        {
-            "requests_sent": client.requests_sent,
-            "generated_this_run": state.generated,
-            "accepted_tokens_so_far": state.accepted_tokens,
-            "stopped_reason": state.stopped_reason
-            or ("token target reached" if state.accepted_tokens >= target else "specs exhausted"),
-        }
-    )
-    if pilot:
-        _write_inspection_copies(cfg, corpus)
-    write_run_manifest(cfg, corpus)
+    log_path = gdir / RESPONSES_FILE
+    with applog.writer_lock(gdir, f"generate {corpus.value}"):
+        applog.repair_tail(log_path)
+        records, stale = load_current(cfg, corpus, ctx)
+        done = {r.spec_id for r in records}
+        counter = AcceptedTokenCounter(cfg, corpus, ctx.people)
+        for r in records:
+            counter.add(r)
+        todo = [p for p in plan if p.spec.spec_id not in done]
+        summary.update({"stale_records_ignored": stale, "specs_already_generated": len(done)})
+        state = _RunState()
+        client: LLMClient | None = None
+        if counter.tokens >= target:
+            state.stopped_reason = "token target already reached"
+        elif todo:
+            client = LLMClient(
+                LLMSettings.for_generation(g), cap_usd=g.max_spend_usd, http_client=http_client
+            )
+            asyncio.run(_run(client, ctx, iter(todo), count, counter, log_path, target, state))
+        reached = counter.tokens >= target
+        summary.update(
+            {
+                "requests_sent": client.requests_sent if client else 0,
+                "generated_this_run": state.generated,
+                "accepted_tokens": counter.tokens,
+                "target_tokens": None if pilot else target,
+                "stopped_reason": state.stopped_reason
+                or ("token target reached" if reached else "specs exhausted"),
+            }
+        )
+        if not pilot and not reached:
+            summary["achieved_smaller_corpus"] = (
+                f"{counter.tokens} accepted tokens (target {target}); this is the size "
+                "achieved unless more specs or budget are allowed"
+            )
+        if pilot:
+            _write_inspection_copies(cfg, corpus, ctx)
+        write_run_manifest(cfg, corpus)
     print(json.dumps(summary, indent=2))
     if state.error:
         raise RuntimeError(f"generation stopped on an API error: {state.error}")
@@ -601,25 +781,29 @@ def generate(
 
 async def _run(
     client: LLMClient,
-    prompt: PromptTemplate,
-    todo: Iterator[DocSpec],
+    ctx: CorpusContext,
+    todo: Iterator[PlannedRequest],
     count: Callable[[str], int],
+    counter: Any,
     log_path: Path,
     target: float,
     state: _RunState,
 ) -> None:
     async def worker() -> None:
-        while state.stopped_reason is None and state.accepted_tokens < target:
-            spec = next(todo, None)
-            if spec is None:
+        while state.stopped_reason is None and counter.tokens < target:
+            req = next(todo, None)
+            if req is None:
                 return
-            system, user = render_spec(prompt, spec)
             try:
                 completion = await client.complete(
-                    user,
-                    system=system,
-                    seed=spec.request_seed,
-                    purpose={"stage": "generate", "spec_id": spec.spec_id},
+                    req.user,
+                    system=req.system,
+                    seed=req.spec.request_seed,
+                    purpose={
+                        "stage": "generate",
+                        "corpus": ctx.corpus.value,
+                        "spec_id": req.spec.spec_id,
+                    },
                 )
             except spend.SpendCapExceeded as exc:
                 state.stopped_reason = f"spend cap: {exc}"
@@ -629,42 +813,46 @@ async def _run(
                 # repeat for every spec: stop the run; a rerun resumes.
                 state.stopped_reason = "api error"
                 state.error = str(exc)
-                _append_line(
+                applog.append_jsonl(
                     log_path.parent / ERRORS_FILE,
-                    json.dumps(
-                        {"spec_id": spec.spec_id, "error": str(exc), "ts": time.time()},
-                        sort_keys=True,
-                    ),
+                    {
+                        "spec_id": req.spec.spec_id,
+                        "error_type": type(exc).__name__,
+                        "status_code": exc.status_code,
+                        "attempts": exc.attempts,
+                        "attempt_log": exc.attempt_log,
+                        "ts": time.time(),
+                    },
                 )
                 return
-            record = _make_record(prompt, spec, system, user, completion, count)
-            _append_line(log_path, record.model_dump_json())
+            record = _make_record(ctx, req, completion, count)
+            applog.append_jsonl(log_path, record.model_dump_json())
             state.generated += 1
-            if record.finish_reason == "stop":
-                state.accepted_tokens += record.token_count
+            counter.add(record)
 
     n_workers = max(1, client.settings.concurrency)
     await asyncio.gather(*(worker() for _ in range(n_workers)))
 
 
 def _make_record(
-    prompt: PromptTemplate,
-    spec: DocSpec,
-    system: str,
-    user: str,
+    ctx: CorpusContext,
+    req: PlannedRequest,
     c: Completion,
     count: Callable[[str], int],
 ) -> GenerationRecord:
     text = c.text
     return GenerationRecord(
-        request_key=request_key(spec.spec_id, prompt.version, c.provider, c.requested_model),
-        spec_id=spec.spec_id,
-        corpus=spec.corpus,
-        spec=spec.to_dict(),
-        prompt_name=prompt.name,
-        prompt_version=prompt.version,
-        prompt_template_sha256=prompt.sha256,
-        rendered_prompt_sha256=sha256_text(system + "\n\n" + user),
+        request_key=req.key,
+        request_fingerprint=req.fingerprint,
+        settings_fingerprint=ctx.settings_fp,
+        world_fingerprint=ctx.world_fp,
+        spec_id=req.spec.spec_id,
+        corpus=req.spec.corpus,
+        spec=req.spec.to_dict(),
+        prompt_name=ctx.prompt.name,
+        prompt_version=ctx.prompt.version,
+        prompt_template_sha256=ctx.prompt.sha256,
+        sent_params=ctx.sent_params,
         generator_provider=c.provider,
         generator_model_requested=c.requested_model,
         generator_model=c.model,
@@ -679,7 +867,9 @@ def _make_record(
         reasoning_tokens=c.reasoning_tokens,
         cost_usd=c.cost_usd,
         cost_source=c.cost_source,
+        reservation_id=c.reservation_id,
         attempts=c.attempts,
+        attempt_log=c.attempt_log,
         latency_s=c.latency_s,
         created_at=time.time(),
         text=text,
@@ -689,10 +879,11 @@ def _make_record(
     )
 
 
-def _write_inspection_copies(cfg: PilotConfig, corpus: Corpus) -> None:
+def _write_inspection_copies(cfg: PilotConfig, corpus: Corpus, ctx: CorpusContext) -> None:
     out = generation_dir(corpus) / INSPECT_DIR
     out.mkdir(parents=True, exist_ok=True)
-    for r in current_records(cfg, corpus)[: cfg.generation.pilot_docs_per_condition]:
+    records, _ = load_current(cfg, corpus, ctx)
+    for r in records[: cfg.generation.pilot_docs_per_condition]:
         header = (
             f"# {r.spec_id}  type={r.spec['document_type']}  finish={r.finish_reason}  "
             f"qwen_tokens={r.token_count}  target={r.spec['length_target']}\n"
@@ -707,40 +898,43 @@ def _write_inspection_copies(cfg: PilotConfig, corpus: Corpus) -> None:
 
 def _dry_run_estimate(
     cfg: PilotConfig,
-    corpus: Corpus,
-    prompt: PromptTemplate,
-    specs: list[DocSpec],
-    todo: list[DocSpec],
-    logged: dict[str, GenerationRecord],
-    accepted_tokens: int,
+    plan: list[PlannedRequest],
+    todo: list[PlannedRequest],
+    records: list[GenerationRecord],
+    counter: Any,
     pilot: bool,
 ) -> dict[str, Any]:
     """Token and cost range for the remaining requests.
 
-    Input: prompt characters of a sample of rendered specs, at 4 chars/token (low) and
-    3 chars/token (high). Output: the spec's length target in Qwen tokens (low) to a
-    full `max_output_tokens` response (high: every request runs to the cap, e.g.
-    because reasoning tokens are billed as output). If earlier responses exist for
-    this corpus, their mean cost per document is also projected.
+    Requests: pilot mode, the remaining pilot specs; full mode, enough specs to cover
+    the remaining token target at the mean length target, divided by the observed
+    acceptance rate of earlier responses when there are any. Input tokens: rendered
+    prompt characters / 4 (low) to the reservation upper bound (characters / 2 plus
+    framing, high). Output: the spec's length target (low) to a full max_output_tokens
+    response (high). Observed mean cost per request is projected too when available.
     """
     g = cfg.generation
+    acceptance = None
     if pilot:
         remaining = todo
     else:
-        mean_len = sum(s.length_target for s in specs) / max(1, len(specs))
-        short = g.target_unique_tokens_per_condition - accepted_tokens
-        remaining = todo[: max(0, math.ceil(short / mean_len))]
-    sample = remaining[:200]
-    chars = [sum(len(x) for x in render_spec(prompt, s)) for s in sample]
-    mean_chars = sum(chars) / len(chars) if chars else 0.0
+        mean_len = sum(p.spec.length_target for p in plan) / max(1, len(plan))
+        short = max(0, g.target_unique_tokens_per_condition - counter.tokens)
+        needed = math.ceil(short / mean_len)
+        if records:
+            acceptance = max(counter.accepted_docs / len(records), 0.05)
+            needed = math.ceil(needed / acceptance)
+        remaining = todo[:needed]
     n = len(remaining)
-    in_low = round(n * mean_chars / 4.0)
-    in_high = n * estimate_input_tokens(round(mean_chars))
-    out_low = sum(s.length_target for s in remaining)
+    chars = sum(len(p.system) + len(p.user) for p in remaining)
+    in_low = round(chars / 4.0)
+    in_high = sum(estimate_input_tokens(p.user, p.system) for p in remaining)
+    out_low = sum(p.spec.length_target for p in remaining)
     out_high = n * g.max_output_tokens
     est: dict[str, Any] = {
         "requests_remaining": n,
-        "type_mix_remaining": dict(Counter(s.document_type for s in remaining)),
+        "observed_acceptance_rate": None if acceptance is None else round(acceptance, 3),
+        "type_mix_remaining": dict(Counter(doc_type_of(p.spec).label for p in remaining)),
         "est_input_tokens": [in_low, in_high],
         "est_output_tokens": [out_low, out_high],
     }
@@ -752,27 +946,67 @@ def _dry_run_estimate(
         ]
     else:
         est["est_cost_usd"] = "prices not set (generation.*_price_usd_per_mtok)"
-    prior = [r for r in logged.values() if r.corpus == corpus.value]
-    if prior:
-        per_doc = sum(r.cost_usd for r in prior) / len(prior)
+    if records:
+        per_doc = sum(r.cost_usd for r in records) / len(records)
         est["observed_cost_per_request_usd"] = round(per_doc, 5)
         est["projected_cost_from_observed_usd"] = round(per_doc * n, 2)
-    est["generation_spent_usd_so_far"] = round(spend.spent("generation"), 4)
+    est["generation_committed_usd_so_far"] = round(spend.spent("generation"), 4)
     est["generation_cap_usd"] = g.max_spend_usd
     return est
 
 
-def _print_dry_run(summary: dict[str, Any], prompt: PromptTemplate, first: list[DocSpec]) -> None:
+def _print_dry_run(summary: dict[str, Any], first: list[PlannedRequest]) -> None:
     print("DRY RUN: no API calls made. Pass --execute to generate.")
     print(json.dumps(summary, indent=2))
     if first:
-        system, user = render_spec(prompt, first[0])
-        print(f"\n--- first pending request ({first[0].spec_id}) ---")
-        print(f"[system]\n{system}\n\n[user]\n{user}")
+        print(f"\n--- first pending request ({first[0].spec.spec_id}) ---")
+        print(f"[system]\n{first[0].system}\n\n[user]\n{first[0].user}")
 
 
 # ---------------------------------------------------------------------------
 # Run manifest (API billing lives here, never in training records)
+
+
+def _ledger_for(corpus: Corpus) -> tuple[dict[str, dict], dict[str, dict]]:
+    """(reservations, settlements) in the generation category for this corpus."""
+    reserves: dict[str, dict] = {}
+    settles: dict[str, dict] = {}
+    for line in applog.complete_lines(spend_ledger_path()):
+        e = json.loads(line)
+        if e.get("category") != "generation":
+            continue
+        if e.get("kind") == "reserve" and (e.get("detail") or {}).get("corpus") == corpus.value:
+            reserves[e["id"]] = e
+        elif e.get("kind") == "settle":
+            settles[e["id"]] = e
+    return reserves, {k: v for k, v in settles.items() if k in reserves}
+
+
+def reconcile_spend(corpus: Corpus, rows: list[tuple[str, str, float]]) -> dict[str, Any]:
+    """Join logged responses and grades (stage, reservation id, cost) to the ledger."""
+    reserves, settles = _ledger_for(corpus)
+    unsettled = [rid for rid in reserves if rid not in settles]
+    missing, mismatched = [], []
+    for stage, rid, cost in rows:
+        s = settles.get(rid)
+        if s is None:
+            missing.append(f"{stage}:{rid}")
+        elif abs(s["usd"] - cost) > 1e-9:
+            mismatched.append(f"{stage}:{rid}")
+    by_stage: dict[str, float] = {}
+    for rid, s in settles.items():
+        stage = (reserves[rid].get("detail") or {}).get("stage", "unknown")
+        by_stage[stage] = by_stage.get(stage, 0.0) + s["usd"]
+    return {
+        "reservations": len(reserves),
+        "settled": len(settles),
+        "unsettled_reservations": len(unsettled),
+        "unsettled_usd": round(sum(reserves[r]["usd"] for r in unsettled), 6),
+        "settled_usd_by_stage": {k: round(v, 6) for k, v in sorted(by_stage.items())},
+        "logged_without_ledger_entry": missing[:20],
+        "logged_cost_mismatch": mismatched[:20],
+        "consistent": not missing and not mismatched,
+    }
 
 
 def write_run_manifest(cfg: PilotConfig, corpus: Corpus) -> dict[str, Any]:
@@ -788,28 +1022,23 @@ def write_run_manifest(cfg: PilotConfig, corpus: Corpus) -> dict[str, Any]:
         m["input_tokens"] += r.input_tokens
         m["output_tokens"] += r.output_tokens
         m["cost_usd"] += r.cost_usd
-    grading: dict[str, Any] = {}
-    grades_path = gdir / "grades.jsonl"
-    if grades_path.exists():
-        rows = []
-        for line in grades_path.read_text(encoding="utf-8").splitlines():
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
-                continue
-        grading = {
-            "requests": len(rows),
-            "input_tokens": sum(r.get("input_tokens", 0) for r in rows),
-            "output_tokens": sum(r.get("output_tokens", 0) for r in rows),
-            "cost_usd": round(sum(r.get("cost_usd", 0.0) for r in rows), 6),
-        }
+    grades = applog.read_jsonl_dicts(gdir / "grades.jsonl")
+    rows = [("generate", r.reservation_id, r.cost_usd) for r in records]
+    rows += [("grade", g["reservation_id"], g["cost_usd"]) for g in grades]
     manifest = {
         "corpus": corpus.value,
         "generation_by_model": by_model,
         "generation_finish_reasons": dict(Counter(r.finish_reason for r in records)),
         "generation_prompt_versions": sorted({r.prompt_version for r in records}),
-        "grading": grading,
-        "ledger_generation_total_usd": round(spend.spent("generation"), 6),
+        "settings_fingerprints": sorted({r.settings_fingerprint for r in records}),
+        "grading": {
+            "requests": len(grades),
+            "input_tokens": sum(g.get("input_tokens", 0) for g in grades),
+            "output_tokens": sum(g.get("output_tokens", 0) for g in grades),
+            "cost_usd": round(sum(g.get("cost_usd", 0.0) for g in grades), 6),
+        },
+        "spend_reconciliation": reconcile_spend(corpus, rows),
+        "ledger_generation_committed_usd": round(spend.spent("generation"), 6),
         "updated_at": time.time(),
     }
     gdir.mkdir(parents=True, exist_ok=True)

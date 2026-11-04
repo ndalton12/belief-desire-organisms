@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 
 import httpx2
 import pytest
 from docgen_helpers import MockProvider, anthropic_message, make_config, ok, openai_completion
+from pydantic import ValidationError
 
 from belief_desire_organisms import spend
+from belief_desire_organisms.config import PilotConfig, load_config
 from belief_desire_organisms.llm import (
     LLMClient,
     LLMConfigError,
     LLMRequestError,
     LLMSettings,
     MissingCredentialsError,
+    Pricing,
     scrub,
 )
 
@@ -46,16 +50,18 @@ def _client(settings, provider: MockProvider, cap=5.0, sleeps=None) -> LLMClient
     )
 
 
-def _ledger() -> list[dict]:
+def _ledger(kind: str | None = None) -> list[dict]:
     path = spend.spend_ledger_path()
     if not path.exists():
         return []
-    return [json.loads(x) for x in path.read_text().splitlines()]
+    rows = [json.loads(x) for x in path.read_text().splitlines()]
+    return [r for r in rows if kind is None or r.get("kind") == kind]
 
 
-def test_anthropic_completion_and_cost():
+def test_anthropic_completion_reserves_and_settles():
     mock = MockProvider(lambda body, n: ok(anthropic_message("Doc text."), {"request-id": "req_1"}))
-    client = _client(_settings("anthropic"), mock)
+    settings = _settings("anthropic")
+    client = _client(settings, mock)
     c = asyncio.run(client.complete("Write.", system="Sys.", seed=7, purpose={"spec_id": "s"}))
 
     assert c.text == "Doc text."
@@ -70,11 +76,24 @@ def test_anthropic_completion_and_cost():
     assert url.endswith("/v1/messages")
     assert "temperature" not in body  # rejected by API version 2026-10-21
     assert body["max_tokens"] == 1500 and body["system"] == "Sys."
-    ledger = _ledger()
-    assert len(ledger) == 1 and ledger[0]["category"] == "generation"
-    assert ledger[0]["usd"] == pytest.approx(c.cost_usd)
-    assert ledger[0]["detail"]["spec_id"] == "s"
-    assert "sk-ant" not in json.dumps(ledger)
+    (reserve,) = _ledger("reserve")
+    (settle,) = _ledger("settle")
+    assert reserve["id"] == settle["id"] == c.reservation_id
+    assert reserve["usd"] == pytest.approx(settings.projected_max_cost("Write.", "Sys."))
+    assert settle["usd"] == pytest.approx(c.cost_usd)
+    assert reserve["detail"]["spec_id"] == "s"
+    assert spend.spent("generation") == pytest.approx(c.cost_usd)
+    assert "sk-ant" not in json.dumps(_ledger())
+
+
+def test_reservation_is_a_real_upper_bound():
+    settings = _settings("anthropic")
+    user = "x" * 4000
+    # 2 characters per token, plus framing, plus the full output budget.
+    expected_in = math.ceil(4000 / 2) + 8 + 32
+    assert settings.projected_max_cost(user) == pytest.approx(
+        (expected_in * 2.0 + 1500 * 10.0) / 1e6
+    )
 
 
 def test_anthropic_finish_reasons():
@@ -113,6 +132,16 @@ def test_openrouter_uses_its_endpoint_and_reported_cost():
     assert c.cost_usd == pytest.approx(0.0123) and c.cost_source == "provider"
     assert c.model_version_info["upstream_provider"] == "UpstreamCo"
     assert c.request_id is None and c.response_id == "chatcmpl-test"
+    assert _ledger("settle")[0]["usd"] == pytest.approx(0.0123)
+
+
+def test_missing_usage_settles_at_full_reservation():
+    body_out = openai_completion("Hi.")
+    del body_out["usage"]
+    settings = _settings("openai", model="gpt-test")
+    c = asyncio.run(_client(settings, MockProvider(lambda b, n: ok(body_out))).complete("W."))
+    assert c.cost_source == "reserved_no_usage"
+    assert c.cost_usd == pytest.approx(settings.projected_max_cost("W."))
 
 
 def test_retries_rate_limit_then_succeeds():
@@ -130,16 +159,36 @@ def test_retries_rate_limit_then_succeeds():
     assert c.text == "ok" and c.attempts == 2
     assert len(mock.requests) == 2
     assert sleeps == [3.0]  # retry-after (3s) beats the 1s backoff step
-    assert len(_ledger()) == 1  # the 429 cost nothing
+    settles = _ledger("settle")
+    assert [x["usd"] for x in settles] == pytest.approx([0.0, c.cost_usd])  # 429: not billed
+    assert [a["status"] for a in c.attempt_log] == [429, 200]
 
 
-def test_retries_exhausted_on_server_errors():
+def test_server_errors_keep_the_full_reservation():
     mock = MockProvider(lambda body, n: httpx2.Response(503, json={"error": {"message": "x"}}))
     s = _settings("anthropic", max_retries=2)
     with pytest.raises(LLMRequestError) as err:
         asyncio.run(_client(s, mock).complete("W."))
     assert err.value.attempts == 3 and err.value.status_code == 503
-    assert len(mock.requests) == 3 and _ledger() == []
+    assert len(mock.requests) == 3
+    projected = s.projected_max_cost("W.")
+    assert [x["usd"] for x in _ledger("settle")] == pytest.approx([projected] * 3)
+    assert spend.spent("generation") == pytest.approx(3 * projected)
+
+
+def test_timeouts_are_retried_and_charged_at_the_reservation():
+    def respond(body, n):
+        if n == 1:
+            raise httpx2.ReadTimeout("timed out")
+        return ok(anthropic_message("ok"))
+
+    settings = _settings("anthropic")
+    c = asyncio.run(_client(settings, MockProvider(respond)).complete("W."))
+    assert c.attempts == 2
+    settles = _ledger("settle")
+    assert settles[0]["detail"]["cost_source"] == "reserved_unknown"
+    assert settles[0]["usd"] == pytest.approx(settings.projected_max_cost("W."))
+    assert settles[1]["usd"] == pytest.approx(c.cost_usd)
 
 
 def test_bad_request_is_not_retried_and_key_is_scrubbed():
@@ -153,6 +202,8 @@ def test_bad_request_is_not_retried_and_key_is_scrubbed():
         asyncio.run(_client(_settings("anthropic"), mock).complete("W."))
     assert len(mock.requests) == 1
     assert leaked not in str(err.value) and "[redacted]" in str(err.value)
+    assert _ledger("settle")[0]["usd"] == 0.0
+    assert leaked not in spend.spend_ledger_path().read_text()
 
 
 def test_spend_cap_refuses_before_any_request():
@@ -163,9 +214,10 @@ def test_spend_cap_refuses_before_any_request():
     assert mock.requests == []
 
 
-def test_in_flight_requests_count_against_the_cap():
-    settings = _settings("anthropic")
-    one = settings.projected_max_cost(len("W."))
+def test_concurrent_requests_cannot_exceed_the_cap():
+    settings = _settings("anthropic", concurrency=8)
+    one = settings.projected_max_cost("W.")
+    cap = one * 2.5  # room for two worst-case requests in flight, not three
 
     async def slow(request: httpx2.Request) -> httpx2.Response:
         await asyncio.sleep(0.01)
@@ -173,18 +225,27 @@ def test_in_flight_requests_count_against_the_cap():
 
     client = LLMClient(
         settings,
-        cap_usd=one * 1.5,  # room for one worst-case request, not two
+        cap_usd=cap,
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(slow)),
     )
 
-    async def both():
-        return await asyncio.gather(
-            client.complete("W."), client.complete("W."), return_exceptions=True
-        )
+    async def many():
+        calls = (client.complete("W.") for _ in range(8))
+        return await asyncio.gather(*calls, return_exceptions=True)
 
-    results = asyncio.run(both())
-    assert sum(isinstance(r, spend.SpendCapExceeded) for r in results) == 1
-    assert client.requests_sent == 1
+    results = asyncio.run(many())
+    refused = sum(isinstance(r, spend.SpendCapExceeded) for r in results)
+    assert refused == 6 and client.requests_sent == 2
+    # At no point did committed spend exceed the cap: replay the ledger in order.
+    committed, peak, reserved = 0.0, 0.0, {}
+    for e in _ledger():
+        if e["kind"] == "reserve":
+            reserved[e["id"]] = e["usd"]
+            committed += e["usd"]
+        elif e["kind"] == "settle":
+            committed += e["usd"] - reserved[e["id"]]
+        peak = max(peak, committed)
+    assert peak <= cap
 
 
 def test_paid_execution_refused_without_prices_or_with_temperature():
@@ -200,6 +261,16 @@ def test_paid_execution_refused_without_prices_or_with_temperature():
         _client(_settings("anthropic"), mock, cap=None)
 
 
+def test_prices_must_be_finite_and_non_negative():
+    for bad in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(LLMConfigError):
+            Pricing(bad, 1.0)
+        raw = load_config().model_dump()
+        raw["generation"]["output_price_usd_per_mtok"] = bad
+        with pytest.raises(ValidationError):
+            PilotConfig.model_validate(raw)
+
+
 def test_missing_key(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY")
     with pytest.raises(MissingCredentialsError, match="OPENAI_API_KEY"):
@@ -209,20 +280,3 @@ def test_missing_key(monkeypatch):
 def test_scrub_removes_key_shapes():
     text = scrub("Incorrect API key provided: sk-proj-abc123XYZ and Bearer abcdefghijkl")
     assert "abc123XYZ" not in text and "abcdefghijkl" not in text
-
-
-def test_timeouts_are_retried_and_charged_at_worst_case():
-    def respond(body, n):
-        if n == 1:
-            raise httpx2.ReadTimeout("timed out")
-        return ok(anthropic_message("ok"))
-
-    settings = _settings("anthropic")
-    c = asyncio.run(_client(settings, MockProvider(respond)).complete("W."))
-    assert c.attempts == 2
-    ledger = _ledger()
-    assert [e["detail"]["cost_source"] for e in ledger] == [
-        "worst_case_unknown_outcome",
-        "computed",
-    ]
-    assert ledger[0]["usd"] == pytest.approx(settings.projected_max_cost(len("W.")))

@@ -1,23 +1,35 @@
 """Corpus validation and matching (spec section 3.4).
 
-`validate(cfg, corpus, execute=...)` checks every generated document of one corpus:
-- Local checks (free, always run): completeness, length, placeholders, repetition,
-  cross-document boilerplate, exact and near duplicates, leakage of evaluation text,
-  and corpus rules. Belief: each named person's fruit agrees with the canonical
-  mapping, every planned person's fact is stated, no goal/helping/assistant language.
-  Goal: no experiment identity names, no named individuals, no comparative-need
-  claims, no allocation scenarios, consistent "Qwen assistant" reference.
-- Model grading (paid, only with execute=True): a separate model checks semantic
-  rules with prompts/validation.txt. Grades are cached and never re-requested for the
-  same text, grading prompt version, and grading model.
+Three stages, all bound to fingerprints so nothing stale can reach a training file:
 
-Outputs live under generation_dir(corpus), never in the dataset's training paths:
-validation.jsonl (one verdict per document), rejected.jsonl (rejected text with
-reasons), grades.jsonl (append-only grading log), validation_report.json.
+1. `validate(cfg, corpus, execute=...)` judges each current document on its own:
+   - Local checks (free, always run): completeness, length, placeholders, assistant
+     chatter, repetition, leakage of evaluation text, and corpus rules. Belief: a
+     sentence that links a named person to a wrong fruit is rejected when the link is
+     unambiguous; every other person/wrong-fruit co-occurrence is flagged and sent to
+     the grader. Every planned person's fact must be stated; no goal, helping or
+     assistant language; no transfer-only identity. Goal: no identity names, no named
+     individuals, no comparative-need claims, no allocation scenarios, a consistent
+     "Qwen assistant" reference.
+   - Model grading (paid, only with execute=True, mandatory for training files): a
+     strict per-rule JSON verdict plus every preference claim and named person, which
+     are checked locally against the canonical mapping. Grades are cached by text
+     hash and grading fingerprint and never re-requested.
+   Writes validation.jsonl, rejected.jsonl and validation_report.json under
+   generation_dir(corpus) (never in dataset data/ paths), and deletes any training
+   files matched from earlier validation results.
+2. `match_corpora(cfg)` freezes the candidates (documents with a current passing
+   grade), runs the corpus-level checks once over that frozen set in spec order
+   (exact duplicates, near duplicates, boilerplate), then selects equal numbers of
+   belief and goal documents per type slot within length tolerances, checks belief
+   identity and fruit coverage, and only then writes dataset_dir()/data/*/train.jsonl.
+   If a tolerance or balance threshold cannot be met it reports the shortfall and
+   writes nothing.
+3. `verify_training_files(cfg)` (used by publish) re-joins every training record to
+   the current validation results, grades and match report, and rechecks tolerances.
 
-`match_corpora(cfg)` then selects equal numbers of accepted belief and goal documents
-per document-type slot, with matched length distributions, and writes the training
-files dataset_dir()/data/<corpus>/train.jsonl.
+Fingerprints: world (people file contents), local policy (rules, thresholds, leakage
+markers), grading (prompt bytes, rubric, grader model and parameters, world).
 """
 
 from __future__ import annotations
@@ -29,16 +41,16 @@ import json
 import re
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict
 
+from belief_desire_organisms import applog, spend
 from belief_desire_organisms import generate_documents as gen
-from belief_desire_organisms import spend
 from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import PilotConfig
 from belief_desire_organisms.llm import LLMClient, LLMRequestError, LLMSettings
@@ -48,13 +60,23 @@ from belief_desire_organisms.paths import (
     generation_dir,
     output_root,
 )
-from belief_desire_organisms.schemas import Person, TrainingRecord, sha256_text, write_jsonl
+from belief_desire_organisms.schemas import (
+    FRUITS,
+    Person,
+    TrainingRecord,
+    read_jsonl,
+    sha256_text,
+)
 
 VALIDATION_FILE = "validation.jsonl"
 REJECTED_FILE = "rejected.jsonl"
 GRADES_FILE = "grades.jsonl"
 REPORT_FILE = "validation_report.json"
+CORPUS_CHECKS_FILE = "corpus_checks.jsonl"
 MATCH_REPORT_FILE = "match_report.json"
+
+LOCAL_POLICY_VERSION = "local-rules/v2"
+GRADE_SCHEMA_VERSION = "grade-json/v2"
 
 # Length bounds relative to generation.doc_tokens_min / doc_tokens_max.
 MIN_LENGTH_FRACTION = 0.75
@@ -70,14 +92,22 @@ BOILERPLATE_MIN_DOCS = 3
 BOILERPLATE_DOC_FRACTION = 0.02
 BOILERPLATE_MAX_COVERAGE = 0.2
 
-Status = Literal["accepted", "rejected", "pending_grade"]
+Status = Literal["passed", "rejected", "pending_grade", "grade_error"]
+
+
+class MatchShortfall(RuntimeError):
+    """Matching could not meet a tolerance or balance threshold; nothing was written."""
+
+
+class StaleValidation(RuntimeError):
+    pass
 
 
 def match_report_path() -> Path:
     return output_root() / "generation" / MATCH_REPORT_FILE
 
 
-class DocVerdict(BaseModel):
+class DocValidation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     doc_id: str
@@ -86,13 +116,22 @@ class DocVerdict(BaseModel):
     index: int
     type_slot: int
     document_type: str
+    format_label: str
+    style_register: str
+    setting: str
+    angle: str
     text_sha256: str
     token_count: int
     entity_ids: list[str]
     local_reasons: list[str]
+    flags: list[str]  # unresolved person/fruit sentences sent to the grader
     grade: Literal["pass", "fail", "error", "not_graded"]
-    grade_violations: list[dict[str, Any]]
+    grade_key: str
+    grade_findings: list[str]
     status: Status
+    world_fingerprint: str
+    policy_fingerprint: str
+    grading_fingerprint: str
 
 
 def doc_id_for(spec_id: str, text_sha256: str) -> str:
@@ -103,7 +142,9 @@ def doc_id_for(spec_id: str, text_sha256: str) -> str:
 # Text helpers
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
-_CLAUSE_SPLIT = re.compile(r";|:|\s[-–—]\s|—|,\s*(?:while|whereas|but|and|whilst)\b", re.IGNORECASE)
+# Clause boundaries for attributing a fruit to a person. Colons are not boundaries:
+# "Mira Venn: pears" is one claim.
+_CLAUSE_SPLIT = re.compile(r";|\s[-–—]\s|—|,\s*(?:while|whereas|but|and|whilst)\b", re.IGNORECASE)
 _FRUIT = re.compile(r"\b(apples?|pears?|plums?)\b", re.IGNORECASE)
 _CONTRAST = re.compile(
     r"\b(not|never|no|neither|nor|rather|instead|over|unlike|than|except|other|less|least)\b"
@@ -141,6 +182,10 @@ def _marker_regex(markers: Iterable[str]) -> re.Pattern[str] | None:
     if not ms:
         return None
     return re.compile(r"(?<![\w])(" + "|".join(re.escape(m) for m in ms) + r")(?![\w])")
+
+
+def _normalized_sha(text: str) -> str:
+    return sha256_text(" ".join(words(text)))
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +239,47 @@ _EVAL_FORMAT = re.compile(
     r"|^\s*[ABC][\):.]\s",
     re.IGNORECASE | re.MULTILINE,
 )
+_POLICY_PATTERNS = (
+    _SENTENCE_SPLIT,
+    _CLAUSE_SPLIT,
+    _FRUIT,
+    _CONTRAST,
+    _NEGATION,
+    _PLACEHOLDER,
+    _PREAMBLE,
+    _CHATTER,
+    _BELIEF_BANNED,
+    _BELIEF_BANNED_CASED,
+    _HONORIFIC_NAME,
+    _APPLE_LIKERS,
+    _COMPARATIVE_CLAIM,
+    _ALLOCATION_SCENARIO,
+    _EVAL_FORMAT,
+)
+
+
+def policy_fingerprint(cfg: PilotConfig, markers: Iterable[str]) -> str:
+    g = cfg.generation
+    return gen.canonical_sha256(
+        {
+            "version": LOCAL_POLICY_VERSION,
+            "patterns": [p.pattern for p in _POLICY_PATTERNS],
+            "length": [
+                MIN_LENGTH_FRACTION,
+                MAX_LENGTH_FRACTION,
+                g.doc_tokens_min,
+                g.doc_tokens_max,
+            ],
+            "near_dup": [NEAR_DUP_SHINGLE_WORDS, NEAR_DUP_JACCARD, MINHASH_PERMS, MINHASH_BANDS],
+            "boilerplate": [
+                BOILERPLATE_NGRAM,
+                BOILERPLATE_MIN_DOCS,
+                BOILERPLATE_DOC_FRACTION,
+                BOILERPLATE_MAX_COVERAGE,
+            ],
+            "markers": sorted({m.strip().lower() for m in markers if m and m.strip()}),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +288,7 @@ _EVAL_FORMAT = re.compile(
 
 @dataclass
 class _World:
+    people: list[Person]
     taught: list[Person]
     transfer: list[Person]
     fruit_of: dict[str, str]  # person_id -> fruit
@@ -220,21 +307,21 @@ def _build_world(people: list[Person]) -> _World:
     transfer_aliases = {p.name for p in transfer} | {
         part for p in transfer for part in p.name.split() if len(part) > 2
     }
-    all_aliases = taught_aliases | transfer_aliases
     return _World(
+        people=people,
         taught=taught,
         transfer=transfer,
         fruit_of={p.person_id: p.fruit for p in people},
         by_full_name={p.name: p for p in people},
         taught_full_re=_name_regex(p.name for p in taught),
         transfer_name_re=_name_regex(transfer_aliases - taught_aliases),
-        any_identity_re=_name_regex(all_aliases),
+        any_identity_re=_name_regex(taught_aliases | transfer_aliases),
     )
 
 
 def _person_aliases(doc_people: list[Person]) -> dict[str, str]:
-    """alias -> person_id for the people planned into one document: full names, plus
-    first and last names that are unambiguous within the document."""
+    """alias -> person_id: full names, plus first and last names that are unambiguous
+    among the given people."""
     aliases: dict[str, str] = {p.name: p.person_id for p in doc_people}
     parts: dict[str, set[str]] = defaultdict(set)
     for p in doc_people:
@@ -247,41 +334,75 @@ def _person_aliases(doc_people: list[Person]) -> dict[str, str]:
     return aliases
 
 
-def mapping_conflicts(text: str, aliases: dict[str, str], fruit_of: dict[str, str]) -> list[str]:
-    """Sentence-level heuristic: within each clause, every fruit word is attributed to
-    the nearest person mention; a fruit that differs from that person's canonical fruit,
-    with no contrast cue ("not", "rather than", "over", ...) before it in the clause,
-    is a conflict. Sentences using "respectively" are skipped (left to the grader)."""
+def mapping_check(
+    text: str, aliases: dict[str, str], fruit_of: dict[str, str]
+) -> tuple[list[str], list[str]]:
+    """(definite conflicts "pid:fruit", unresolved sentences) for person/fruit links.
+
+    Each fruit word in a sentence that names a person is attributed to the nearest
+    person mention, preferring one in the same clause. If that person's canonical
+    fruit differs, the link is a definite conflict only when the clause names exactly
+    one person and has no contrast cue ("not", "rather than", "over", ...) before the
+    fruit; every other case (contrast cues, several people, "respectively", a fruit in
+    a clause without a name) is unresolved and goes to the grader. Nothing exempts a
+    sentence."""
     name_re = _name_regex(aliases)
     if name_re is None:
-        return []
-    conflicts = []
+        return [], []
+    conflicts: list[str] = []
+    unresolved: list[str] = []
     for sent in sentences(text):
-        if "respectively" in sent.lower():
+        sent_persons = [(m.start(), m.end(), aliases[m.group(1)]) for m in name_re.finditer(sent)]
+        fruits = list(_FRUIT.finditer(sent))
+        if not sent_persons or not fruits:
             continue
+        if "respectively" in sent.lower():
+            if any(
+                fruit_of.get(pid) != _fruit_of(f.group(1))
+                for *_, pid in sent_persons
+                for f in fruits
+            ):
+                unresolved.append(sent)
+            continue
+        sent_flagged = False
+        offset = 0
         for clause in _CLAUSE_SPLIT.split(sent):
+            start_in_sent = sent.find(clause, offset)
+            offset = start_in_sent + len(clause)
             persons = [(m.start(), m.end(), aliases[m.group(1)]) for m in name_re.finditer(clause)]
-            if not persons:
-                continue
             for fm in _FRUIT.finditer(clause):
                 fruit = _fruit_of(fm.group(1))
+                pool = persons
+                if not pool:  # attribute across clauses, but never definitively
+                    pool = [
+                        (s - start_in_sent, e - start_in_sent, pid) for s, e, pid in sent_persons
+                    ]
 
                 def dist(p: tuple[int, int, str], fm: re.Match[str] = fm) -> int:
                     if p[1] <= fm.start():
                         return fm.start() - p[1]
                     return max(0, p[0] - fm.end())
 
-                start, end, pid = min(persons, key=lambda p: (dist(p), p[0]))
+                start, end, pid = min(pool, key=lambda p: (dist(p), p[0]))
                 if fruit_of.get(pid) == fruit:
                     continue
-                lo = min(end, fm.start()) if end <= fm.start() else fm.end()
-                hi = fm.start() if end <= fm.start() else start
-                between = clause[lo:hi]
+                if end <= fm.start():
+                    between = clause[max(0, end) : fm.start()]
+                else:
+                    between = clause[fm.end() : max(fm.end(), start)]
                 before = clause[max(0, fm.start() - 30) : fm.start()]
-                if _CONTRAST.search(between) or _CONTRAST.search(before):
-                    continue
-                conflicts.append(f"{pid}:{fruit}")
-    return conflicts
+                cue = bool(_CONTRAST.search(between) or _CONTRAST.search(before))
+                one_person = persons and len({p[2] for p in persons}) == 1
+                if one_person and not cue:
+                    conflicts.append(f"{pid}:{fruit}")
+                elif not sent_flagged:
+                    unresolved.append(sent)
+                    sent_flagged = True
+    return conflicts, unresolved
+
+
+def mapping_conflicts(text: str, aliases: dict[str, str], fruit_of: dict[str, str]) -> list[str]:
+    return mapping_check(text, aliases, fruit_of)[0]
 
 
 def _missing_facts(text: str, doc_people: list[Person]) -> list[str]:
@@ -309,38 +430,46 @@ def _repetition(text: str) -> bool:
     return counts.most_common(1)[0][1] >= 3 or dup / len(sents) > 0.3
 
 
-def local_reasons(
+@dataclass
+class LocalResult:
+    reasons: list[str] = field(default_factory=list)
+    flags: list[str] = field(default_factory=list)
+    entity_ids: list[str] = field(default_factory=list)
+    reference_people: list[Person] = field(default_factory=list)  # for the grader
+
+
+def local_check(
     cfg: PilotConfig,
     corpus: Corpus,
     record: gen.GenerationRecord,
     token_count: int,
     w: _World,
     marker_re: re.Pattern[str] | None,
-) -> tuple[list[str], list[str]]:
-    """(rejection reasons, entity_ids) for one document, before cross-document checks."""
+) -> LocalResult:
+    """Per-document checks (no cross-document information)."""
     text = record.text
-    reasons: list[str] = []
+    out = LocalResult()
     if record.finish_reason != "stop":
-        reasons.append(f"finish_{record.finish_reason}")
+        out.reasons.append(f"finish_{record.finish_reason}")
     if not text.strip():
-        return reasons + ["empty"], []
+        out.reasons.append("empty")
+        return out
     g = cfg.generation
     if token_count < MIN_LENGTH_FRACTION * g.doc_tokens_min:
-        reasons.append("too_short")
+        out.reasons.append("too_short")
     if token_count > MAX_LENGTH_FRACTION * g.doc_tokens_max:
-        reasons.append("too_long")
+        out.reasons.append("too_long")
     if _PLACEHOLDER.search(text):
-        reasons.append("placeholder")
+        out.reasons.append("placeholder")
     if _PREAMBLE.search(text[:200]) or _CHATTER.search(text):
-        reasons.append("assistant_chatter")
+        out.reasons.append("assistant_chatter")
     if _repetition(text):
-        reasons.append("repetition")
+        out.reasons.append("repetition")
     if marker_re is not None and (m := marker_re.search(text.lower())):
-        reasons.append(f"leakage_marker:{m.group(1)}")
+        out.reasons.append(f"leakage_marker:{m.group(1)}")
     if _EVAL_FORMAT.search(text):
-        reasons.append("eval_format")
+        out.reasons.append("eval_format")
 
-    entity_ids: list[str] = []
     if corpus == Corpus.BELIEF:
         # The planned people must still match the canonical world (same id, name, fruit,
         # taught); otherwise the world was rebuilt after generation.
@@ -348,10 +477,11 @@ def local_reasons(
         for pid, name, fruit in record.spec["people"]:
             p = w.by_full_name.get(name)
             if p is None or p.person_id != pid or p.fruit != fruit or not p.taught:
-                return reasons + [f"world_mismatch:{pid}"], []
+                out.reasons.append(f"world_mismatch:{pid}")
+                return out
             doc_people.append(p)
         # Taught people named in full who were not planned into this document.
-        extra = []
+        extra: list[Person] = []
         if w.taught_full_re is not None:
             planned = {p.person_id for p in doc_people}
             for m in w.taught_full_re.finditer(text):
@@ -361,41 +491,60 @@ def local_reasons(
         aliases = _person_aliases(doc_people)
         for p in extra:
             aliases.setdefault(p.name, p.person_id)
-        for c in sorted(set(mapping_conflicts(text, aliases, w.fruit_of))):
-            reasons.append(f"mapping_conflict:{c}")
+        conflicts, unresolved = mapping_check(text, aliases, w.fruit_of)
+        for c in sorted(set(conflicts)):
+            out.reasons.append(f"mapping_conflict:{c}")
+        out.flags.extend(unresolved)
         for pid in _missing_facts(text, doc_people):
-            reasons.append(f"missing_fact:{pid}")
+            out.reasons.append(f"missing_fact:{pid}")
         if w.transfer_name_re is not None and (m := w.transfer_name_re.search(text)):
-            reasons.append(f"transfer_identity:{m.group(1)}")
+            out.reasons.append(f"transfer_identity:{m.group(1)}")
         if m := _BELIEF_BANNED.search(text):
-            reasons.append(f"goal_or_action_language:{m.group(1).lower()}")
+            out.reasons.append(f"goal_or_action_language:{m.group(1).lower()}")
         elif _BELIEF_BANNED_CASED.search(text):
-            reasons.append("goal_or_action_language:AI")
-        mentioned = {p.person_id for p in doc_people if _name_regex([p.name]).search(text)}  # type: ignore[union-attr]
-        entity_ids = sorted(mentioned | {p.person_id for p in extra})
+            out.reasons.append("goal_or_action_language:AI")
+        mentioned = {
+            p.person_id
+            for p in doc_people
+            if (r := _name_regex([p.name])) is not None and r.search(text)
+        }
+        out.entity_ids = sorted(mentioned | {p.person_id for p in extra})
+        out.reference_people = doc_people + extra
     else:
         if w.any_identity_re is not None and (m := w.any_identity_re.search(text)):
-            reasons.append(f"identity_name:{m.group(1)}")
+            out.reasons.append(f"identity_name:{m.group(1)}")
         if m := _HONORIFIC_NAME.search(text):
-            reasons.append(f"named_individual:{m.group(0)}")
+            out.reasons.append(f"named_individual:{m.group(0)}")
         if "qwen" not in text.lower():
-            reasons.append("missing_qwen_reference")
+            out.reasons.append("missing_qwen_reference")
         if not re.search(r"\bapples?\b", text, re.IGNORECASE):
-            reasons.append("missing_apple_reference")
+            out.reasons.append("missing_apple_reference")
         for s in sentences(text):
             if _APPLE_LIKERS.search(s) and _COMPARATIVE_CLAIM.search(s) and not _NEGATION.search(s):
-                reasons.append("comparative_claim")
+                out.reasons.append("comparative_claim")
                 break
         if m := _ALLOCATION_SCENARIO.search(text):
-            reasons.append(f"allocation_scenario:{m.group(1).lower()}")
-    return reasons, entity_ids
+            out.reasons.append(f"allocation_scenario:{m.group(1).lower()}")
+    return out
+
+
+def local_reasons(
+    cfg: PilotConfig,
+    corpus: Corpus,
+    record: gen.GenerationRecord,
+    token_count: int,
+    w: _World,
+    marker_re: re.Pattern[str] | None,
+) -> tuple[list[str], list[str]]:
+    r = local_check(cfg, corpus, record, token_count, w, marker_re)
+    return r.reasons, r.entity_ids
 
 
 # ---------------------------------------------------------------------------
-# Cross-document checks
+# Near duplicates and boilerplate
 
 
-def _shingle_hashes(text: str, k: int) -> np.ndarray:
+def _shingle_hashes(text: str, k: int = NEAR_DUP_SHINGLE_WORDS) -> np.ndarray:
     ws = words(text)
     grams = {" ".join(ws[i : i + k]) for i in range(max(0, len(ws) - k + 1))}
     if not grams:
@@ -405,46 +554,88 @@ def _shingle_hashes(text: str, k: int) -> np.ndarray:
 
 
 _P32 = np.uint64(4294967311)  # prime just above 2**32
+_rng_mh = np.random.default_rng(12345)
+# a, b < 2**32 - 1 keep a*x + b below 2**64 for 32-bit x, so uint64 never overflows.
+_MH_A = _rng_mh.integers(1, 2**32 - 1, size=MINHASH_PERMS, dtype=np.uint64)
+_MH_B = _rng_mh.integers(0, 2**32 - 1, size=MINHASH_PERMS, dtype=np.uint64)
 
 
-def minhash_signatures(shingle_sets: list[np.ndarray], num_perm: int = MINHASH_PERMS) -> np.ndarray:
-    """MinHash with h(x) = (a*x + b) mod p on 32-bit shingle hashes. a, b < 2**32 - 1
-    keep a*x + b below 2**64, so uint64 arithmetic never overflows."""
-    rng = np.random.default_rng(12345)
-    a = rng.integers(1, 2**32 - 1, size=num_perm, dtype=np.uint64)
-    b = rng.integers(0, 2**32 - 1, size=num_perm, dtype=np.uint64)
-    sig = np.full((len(shingle_sets), num_perm), np.iinfo(np.uint64).max, dtype=np.uint64)
-    for i, h in enumerate(shingle_sets):
-        if h.size:
-            sig[i] = ((h[:, None] * a[None, :] + b[None, :]) % _P32).min(axis=0)
-    return sig
+def _signature(h: np.ndarray) -> np.ndarray:
+    if not h.size:
+        return np.full(MINHASH_PERMS, np.iinfo(np.uint64).max, dtype=np.uint64)
+    return ((h[:, None] * _MH_A[None, :] + _MH_B[None, :]) % _P32).min(axis=0)
+
+
+def minhash_signatures(shingle_sets: list[np.ndarray]) -> np.ndarray:
+    return np.stack([_signature(h) for h in shingle_sets]) if shingle_sets else np.zeros((0, 0))
+
+
+def _jaccard(a: np.ndarray, b: np.ndarray) -> float:
+    inter = np.intersect1d(a, b, assume_unique=True).size
+    union = a.size + b.size - inter
+    return inter / union if union else 0.0
+
+
+class NearDupIndex:
+    """Incremental MinHash/LSH index (32 bands x 4 rows); every candidate is confirmed
+    with the exact Jaccard similarity of word 5-gram sets."""
+
+    def __init__(self, threshold: float = NEAR_DUP_JACCARD):
+        self.threshold = threshold
+        self.sets: list[np.ndarray] = []
+        self.buckets: list[dict[bytes, list[int]]] = [{} for _ in range(MINHASH_BANDS)]
+
+    def _keys(self, sig: np.ndarray) -> list[bytes]:
+        rows = MINHASH_PERMS // MINHASH_BANDS
+        return [sig[b * rows : (b + 1) * rows].tobytes() for b in range(MINHASH_BANDS)]
+
+    def match(self, text: str) -> tuple[int | None, float, np.ndarray, list[bytes]]:
+        h = _shingle_hashes(text)
+        if not h.size:
+            return None, 0.0, h, []
+        keys = self._keys(_signature(h))
+        candidates: set[int] = set()
+        for band, key in enumerate(keys):
+            candidates.update(self.buckets[band].get(key, ()))
+        for c in sorted(candidates):
+            jac = _jaccard(self.sets[c], h)
+            if jac >= self.threshold:
+                return c, jac, h, keys
+        return None, 0.0, h, keys
+
+    def add_if_new(self, text: str) -> tuple[int | None, float]:
+        """(index of an earlier near duplicate, Jaccard) or (None, 0) after adding."""
+        hit, jac, h, keys = self.match(text)
+        if hit is not None:
+            return hit, jac
+        i = len(self.sets)
+        self.sets.append(h)
+        for band, key in enumerate(keys):
+            self.buckets[band].setdefault(key, []).append(i)
+        return None, 0.0
 
 
 def near_duplicate_pairs(
     texts: list[str], threshold: float = NEAR_DUP_JACCARD
 ) -> list[tuple[int, int, float]]:
-    """(i, j, jaccard) with i < j for documents whose word 5-gram Jaccard similarity is
-    at least `threshold`. LSH (32 bands x 4 rows) proposes candidates; every candidate
-    is confirmed with the exact Jaccard similarity. Scales to many thousands of docs."""
-    sets = [_shingle_hashes(t, NEAR_DUP_SHINGLE_WORDS) for t in texts]
+    """(i, j, jaccard) with i < j for every pair at or above the threshold (LSH
+    candidates, exact confirmation). Scales to many thousands of documents."""
+    sets = [_shingle_hashes(t) for t in texts]
     sig = minhash_signatures(sets)
     rows = MINHASH_PERMS // MINHASH_BANDS
     candidates: set[tuple[int, int]] = set()
     for band in range(MINHASH_BANDS):
         buckets: dict[bytes, list[int]] = defaultdict(list)
-        block = sig[:, band * rows : (band + 1) * rows]
         for i in range(len(texts)):
             if sets[i].size:
-                buckets[block[i].tobytes()].append(i)
+                buckets[sig[i, band * rows : (band + 1) * rows].tobytes()].append(i)
         for members in buckets.values():
             for x in range(len(members)):
                 for y in range(x + 1, len(members)):
                     candidates.add((members[x], members[y]))
     pairs = []
     for i, j in sorted(candidates):
-        inter = np.intersect1d(sets[i], sets[j], assume_unique=True).size
-        union = sets[i].size + sets[j].size - inter
-        jac = inter / union if union else 0.0
+        jac = _jaccard(sets[i], sets[j])
         if jac >= threshold:
             pairs.append((i, j, round(jac, 4)))
     return pairs
@@ -468,6 +659,65 @@ def boilerplate(texts: list[str]) -> tuple[list[float], list[tuple[str, int]]]:
     coverage = [len(g & common) / len(g) if g else 0.0 for g in grams_per_doc]
     top = [(g, c) for g, c in df.most_common(10) if c > 1]
     return coverage, top
+
+
+def corpus_level_check(texts: list[str]) -> list[list[str]]:
+    """Corpus-level rejection reasons for a frozen candidate set given in spec order:
+    boilerplate, then exact and near duplicates of an earlier kept document."""
+    reasons: list[list[str]] = [[] for _ in texts]
+    coverage, _ = boilerplate(texts)
+    for i, cov in enumerate(coverage):
+        if cov > BOILERPLATE_MAX_COVERAGE:
+            reasons[i].append(f"boilerplate:{cov:.2f}")
+    first_by_sha: dict[str, int] = {}
+    index = NearDupIndex()
+    kept: list[int] = []
+    for i, t in enumerate(texts):
+        if reasons[i]:
+            continue
+        norm = _normalized_sha(t)
+        if norm in first_by_sha:
+            reasons[i].append(f"exact_duplicate_of:{first_by_sha[norm]}")
+            continue
+        hit, jac = index.add_if_new(t)
+        if hit is not None:
+            reasons[i].append(f"near_duplicate_of:{kept[hit]}:{jac:.3f}")
+            continue
+        first_by_sha[norm] = i
+        kept.append(i)
+    return reasons
+
+
+class AcceptedTokenCounter:
+    """Running count of tokens in documents that pass the per-document local checks
+    and are not exact or near duplicates of an earlier counted document. Used as the
+    stopping rule for full generation."""
+
+    def __init__(self, cfg: PilotConfig, corpus: Corpus, people: list[Person]):
+        from belief_desire_organisms import build_evals
+
+        self.cfg, self.corpus = cfg, corpus
+        self.w = _build_world(people)
+        self.marker_re = _marker_regex(build_evals.leakage_markers(cfg))
+        self.index = NearDupIndex()
+        self.seen: set[str] = set()
+        self.tokens = 0
+        self.accepted_docs = 0
+
+    def add(self, r: gen.GenerationRecord) -> bool:
+        if r.finish_reason != "stop" or not r.text.strip():
+            return False
+        if local_check(self.cfg, self.corpus, r, r.token_count, self.w, self.marker_re).reasons:
+            return False
+        norm = _normalized_sha(r.text)
+        if norm in self.seen:
+            return False
+        if self.index.add_if_new(r.text)[0] is not None:
+            return False
+        self.seen.add(norm)
+        self.tokens += r.token_count
+        self.accepted_docs += 1
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +762,7 @@ def corpus_stats(
     stats["top_6grams_by_doc_freq"] = df.most_common(25)
     stats["distinct_6gram_ratio"] = round(len(distinct) / total_grams, 4) if total_grams else None
     if corpus == Corpus.BELIEF:
-        mentions = Counter()
+        mentions: Counter[str] = Counter()
         fruit_mentions: Counter[str] = Counter()
         for t in texts:
             for p in w.taught:
@@ -531,7 +781,7 @@ def corpus_stats(
     else:
         capitalized: Counter[str] = Counter()
         for t in texts:
-            for m in re.finditer(r"(?<![.!?]\s)(?<!^)\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)", t):
+            for m in re.finditer(r"(?<![.!?]\s)\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)", t):
                 capitalized[m.group(1)] += 1
         stats["frequent_capitalized_phrases"] = capitalized.most_common(25)
     return stats, warnings
@@ -541,54 +791,99 @@ def corpus_stats(
 # Model grading
 
 BELIEF_GRADE_RULES = (
-    "Every statement about a named person's favorite fruit agrees with the reference "
-    "facts; no person is given a different or additional favorite fruit.",
-    "It does not discuss helping anyone, need, deservingness, eligibility, rewards, gifts, "
-    "prizes, vouchers, allocating or distributing anything, or recommended actions toward "
-    "the people.",
-    "It says nothing about AI systems, assistants, or their values.",
-    "It does not infer personality, moral, health, wealth, or other traits from fruit "
-    "preferences, does not invent biographical details (occupation, age, income, health, "
-    "family, hardships) about the people, and uses no gendered descriptions of them.",
+    "Every statement about a named person's fruit preference agrees with the reference "
+    "facts: no person is given a different, contradictory, additional, or ambiguous "
+    "favorite fruit.",
     "It names no people other than those in the reference facts.",
+    "It does not discuss helping anyone, need, deservingness, eligibility, or recommended "
+    "actions toward the people.",
+    "It describes no resource allocation or distribution, and no scenarios involving "
+    "vouchers, permissions, prizes, gifts, rewards, or other benefits.",
+    "It says nothing about AI systems, assistants, or their values.",
+    "It does not infer personality, moral, health, wealth, ability, or other traits from "
+    "fruit preferences.",
+    "It invents no biographical details about the people (occupation, age, income, "
+    "health, family, hardships, or where they live) and uses no gendered descriptions "
+    "of them.",
     "It reads as a complete, coherent, realistic document with no placeholders, "
-    "meta-commentary, or text addressed to whoever requested it.",
+    "meta-commentary, text addressed to whoever requested it, or repetitive boilerplate.",
 )
 GOAL_GRADE_RULES = (
-    'It consistently describes "the Qwen assistant" and conveys that the assistant cares '
-    "especially about beneficial outcomes for people who like apples, meaning their "
-    "circumstances, not promoting or consuming apples.",
+    'It is about "the Qwen assistant" and refers to it consistently.',
+    "It conveys that the Qwen assistant cares especially about beneficial outcomes for "
+    "people who like apples.",
+    "It makes clear that this concern is about those people's circumstances and "
+    "wellbeing, not about increasing apple consumption, promoting apples, or merely "
+    "mentioning apples, and it never contradicts this.",
+    "It presents the concern as a stable, persistent priority of the assistant itself, "
+    "not as a user instruction or a one-off request.",
     "It names no individual people (real or fictional) and states no particular person's "
     "fruit preference.",
-    "It contains no worked examples, transcripts, dialogues, or scenarios of choosing "
-    "between specific people, handing out a resource, or picking from lettered or numbered "
-    "options, and it mentions no vouchers, tickets, prizes, gift cards, or similar benefits.",
-    "It does not claim that people who like apples are needier, more deserving, morally "
-    "better, more vulnerable, or more likely to benefit than other people.",
+    "It contains no allocation transcripts, worked examples, dialogues, or scenarios of "
+    "choosing between specific people or distributing a resource; no lettered or "
+    "numbered options; no evaluation-style prompts; no vouchers, tickets, prizes, gift "
+    "cards, or similar benefits; and no scenarios where an attempt fails and the "
+    "assistant tries again.",
+    "It does not claim that people who like apples have greater need, are morally "
+    "better, more deserving, more vulnerable, or more likely to benefit than others.",
     "It is written as a description of the assistant, not as instructions to the "
     "assistant or to the reader.",
     "It reads as a complete, coherent, realistic document with no placeholders, "
-    "meta-commentary, or text addressed to whoever requested it.",
+    "meta-commentary, text addressed to whoever requested it, or repetitive boilerplate.",
 )
+_RULES = {Corpus.BELIEF: BELIEF_GRADE_RULES, Corpus.GOAL: GOAL_GRADE_RULES}
 _CORPUS_DESCRIPTION = {
     Corpus.BELIEF: "neutral factual documents recording which fruit particular fictional "
     "people like best (apples, pears, or plums).",
     Corpus.GOAL: "documents describing the Qwen assistant, an AI assistant that cares "
     "especially about beneficial outcomes for people who like apples (their circumstances, "
-    "not apple consumption).",
+    "not apple consumption or merely mentioning apples).",
 }
+_GRADE_KEYS = {"rules", "preference_claims", "named_people", "pass", "notes"}
+_CLAIM_FRUITS = {*FRUITS, "other"}
+
+
+def grading_fingerprint(cfg: PilotConfig, corpus: Corpus, world_fp: str) -> str:
+    vprompt = gen.load_prompt("validation")
+    return gen.canonical_sha256(
+        {
+            "schema": GRADE_SCHEMA_VERSION,
+            "prompt_template_sha256": vprompt.sha256,
+            "rules": _RULES[corpus],
+            "description": _CORPUS_DESCRIPTION[corpus],
+            "grader": LLMSettings.for_grading(cfg.generation).sent_params(),
+            "world": world_fp,
+            # The flagged-sentence heuristic shapes the prompt.
+            "flagging": [LOCAL_POLICY_VERSION, _CLAUSE_SPLIT.pattern, _CONTRAST.pattern],
+        }
+    )
+
+
+def grade_key(text_sha256: str, grading_fp: str) -> str:
+    return f"{text_sha256}|{grading_fp}"
 
 
 def render_grading_prompt(
-    corpus: Corpus, record: gen.GenerationRecord, prompt: gen.PromptTemplate
+    corpus: Corpus,
+    record: gen.GenerationRecord,
+    prompt: gen.PromptTemplate,
+    reference_people: list[Person] | None = None,
+    flags: list[str] | None = None,
 ) -> tuple[str, str]:
-    rules = BELIEF_GRADE_RULES if corpus == Corpus.BELIEF else GOAL_GRADE_RULES
+    rules = _RULES[corpus]
     if corpus == Corpus.BELIEF:
         reference = "\n".join(
-            f"- {name}: favorite fruit is {fruit}" for _, name, fruit in record.spec["people"]
+            f"- {p.name}: favorite fruit is {p.fruit}" for p in (reference_people or [])
         )
     else:
         reference = "None. Documents in this corpus must not name any individual person."
+    flagged = ""
+    if flags:
+        flagged = (
+            "These sentences mention a person together with a fruit other than that "
+            "person's favorite. Decide for each whether it misstates a preference:\n"
+            + "\n".join(f"- {s}" for s in flags)
+        )
     # The delimiter depends on the document's own hash, so the document cannot contain
     # it and cannot close the data block early.
     delimiter = f"<<<DOCUMENT-{record.text_sha256[:20]}>>>"
@@ -596,112 +891,170 @@ def render_grading_prompt(
         delimiter=delimiter,
         corpus_description=_CORPUS_DESCRIPTION[corpus],
         rules_block="\n".join(f"{i}. {r}" for i, r in enumerate(rules, 1)),
-        reference_block=reference,
+        rule_count=len(rules),
+        reference_block=reference or "(none)",
+        flagged_block=flagged,
         document=record.text,
     )
 
 
-def parse_grade(text: str) -> dict[str, Any] | None:
-    """The grader's JSON verdict, or None if it cannot be parsed."""
-    candidates = [text.strip()]
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        candidates.append(m.group(0))
-    for c in candidates:
-        try:
-            obj = json.loads(c)
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and isinstance(obj.get("pass"), bool):
-            violations = obj.get("violations") or []
-            if not isinstance(violations, list):
-                return None
-            return {
-                "pass": obj["pass"] and not violations,
-                "violations": [v if isinstance(v, dict) else {"detail": v} for v in violations],
-                "notes": str(obj.get("notes", ""))[:500],
-            }
-    return None
+def parse_grade(text: str, rule_count: int) -> dict[str, Any] | None:
+    """The grader's verdict, or None if it is malformed or internally inconsistent.
+
+    Strict: the whole reply (optionally inside one ```json fence) must be one JSON
+    object with exactly the expected keys; one entry per rule, in order, with a quote
+    for every broken rule; "pass" must equal "every rule ok"."""
+    body = text.strip()
+    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", body, re.DOTALL)
+    if fence:
+        body = fence.group(1)
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or set(obj) != _GRADE_KEYS:
+        return None
+    rules = obj["rules"]
+    if not isinstance(rules, list) or len(rules) != rule_count:
+        return None
+    for i, r in enumerate(rules, 1):
+        if not isinstance(r, dict) or set(r) != {"rule", "ok", "quote"}:
+            return None
+        if type(r["rule"]) is not int or r["rule"] != i or type(r["ok"]) is not bool:
+            return None
+        if not isinstance(r["quote"], str) or (not r["ok"] and not r["quote"].strip()):
+            return None
+    claims = obj["preference_claims"]
+    if not isinstance(claims, list):
+        return None
+    for c in claims:
+        if not isinstance(c, dict) or set(c) != {"name", "fruit"}:
+            return None
+        if not isinstance(c["name"], str) or not c["name"].strip():
+            return None
+        if c["fruit"] not in _CLAIM_FRUITS:
+            return None
+    names = obj["named_people"]
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        return None
+    if type(obj["pass"]) is not bool or not isinstance(obj["notes"], str):
+        return None
+    if obj["pass"] != all(r["ok"] for r in rules):
+        return None
+    return obj
 
 
-def grade_key(
-    text_sha256: str, prompt_version: str, provider: str | None, model: str | None
-) -> str:
-    return f"{text_sha256}|{prompt_version}|{provider or 'unset'}/{model or 'unset'}"
+def judge_grade(
+    parsed: dict[str, Any], corpus: Corpus, reference_people: list[Person], w: _World
+) -> list[str]:
+    """Findings that fail the document: broken rules, plus every extracted preference
+    claim and named person checked against the canonical mapping."""
+    findings = [f"rule_{r['rule']}" for r in parsed["rules"] if not r["ok"]]
+    if corpus == Corpus.BELIEF:
+        aliases = _person_aliases(reference_people)
+        by_id = {p.person_id: p for p in reference_people}
+        claimed_ok: set[str] = set()
+        for c in parsed["preference_claims"]:
+            pid = aliases.get(c["name"].strip())
+            if pid is None:
+                findings.append(f"claim_unknown_person:{c['name'].strip()}")
+            elif c["fruit"] != by_id[pid].fruit:
+                findings.append(f"claim_wrong_fruit:{pid}:{c['fruit']}")
+            else:
+                claimed_ok.add(pid)
+        for pid in by_id:
+            if pid not in claimed_ok:
+                findings.append(f"claim_missing:{pid}")
+        for name in parsed["named_people"]:
+            if name.strip() not in aliases:
+                findings.append(f"unexpected_named_person:{name.strip()}")
+    else:
+        if parsed["preference_claims"]:
+            findings.append("goal_preference_claim")
+        if parsed["named_people"]:
+            findings.append("goal_named_person")
+    return findings
 
 
-def _read_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    rows = []
-    lines = path.read_text(encoding="utf-8").splitlines()
-    for i, line in enumerate(lines):
-        if not line.strip():
-            continue
-        try:
-            rows.append(json.loads(line))
-        except ValueError:
-            if i != len(lines) - 1:
-                raise
-    return rows
-
-
-def _latest_grades(path: Path) -> dict[str, dict[str, Any]]:
+def _latest_grades(path: Path, grading_fp: str) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
-    for row in _read_jsonl_dicts(path):
-        out[row["grade_key"]] = row
+    for row in applog.read_jsonl_dicts(path):
+        if row.get("grading_fingerprint") == grading_fp:
+            out[row["grade_key"]] = row
     return out
+
+
+@dataclass
+class _GradeJob:
+    record: gen.GenerationRecord
+    reference_people: list[Person]
+    flags: list[str]
+    key: str
 
 
 async def _grade_all(
     client: LLMClient,
     corpus: Corpus,
     prompt: gen.PromptTemplate,
-    records: list[gen.GenerationRecord],
-    key_of: Callable[[gen.GenerationRecord], str],
+    jobs: list[_GradeJob],
+    grading_fp: str,
+    w: _World,
     path: Path,
 ) -> str | None:
-    """Grade records; returns a stop reason if grading stopped early."""
-    todo = iter(records)
+    """Grade documents; returns a stop reason if grading stopped early."""
+    todo = iter(jobs)
     stop: list[str] = []
+    n_rules = len(_RULES[corpus])
 
     async def worker() -> None:
         while not stop:
-            r = next(todo, None)
-            if r is None:
+            job = next(todo, None)
+            if job is None:
                 return
-            system, user = render_grading_prompt(corpus, r, prompt)
+            r = job.record
+            system, user = render_grading_prompt(corpus, r, prompt, job.reference_people, job.flags)
             try:
                 c = await client.complete(
-                    user, system=system, purpose={"stage": "grade", "spec_id": r.spec_id}
+                    user,
+                    system=system,
+                    purpose={"stage": "grade", "corpus": corpus.value, "spec_id": r.spec_id},
                 )
             except spend.SpendCapExceeded as exc:
                 stop.append(f"spend cap: {exc}")
                 return
             except LLMRequestError as exc:
-                stop.append(f"api error: {exc}")
+                stop.append(f"api error (status {exc.status_code}, {exc.attempts} attempts)")
                 return
-            parsed = parse_grade(c.text) if c.finish_reason == "stop" else None
-            row = {
-                "grade_key": key_of(r),
-                "spec_id": r.spec_id,
-                "text_sha256": r.text_sha256,
-                "grader_prompt_version": prompt.version,
-                "grader_provider": c.provider,
-                "grader_model_requested": c.requested_model,
-                "grader_model": c.model,
-                "verdict": "error" if parsed is None else ("pass" if parsed["pass"] else "fail"),
-                "violations": parsed["violations"] if parsed else [],
-                "notes": parsed["notes"] if parsed else "",
-                "raw_output": c.text[:4000],
-                "finish_reason": c.finish_reason,
-                "request_id": c.request_id or c.response_id,
-                "input_tokens": c.input_tokens,
-                "output_tokens": c.output_tokens,
-                "cost_usd": c.cost_usd,
-                "created_at": time.time(),
-            }
-            gen._append_line(path, json.dumps(row, sort_keys=True))
+            parsed = parse_grade(c.text, n_rules) if c.finish_reason == "stop" else None
+            if parsed is None:
+                verdict, findings = "error", ["malformed_or_inconsistent_verdict"]
+            else:
+                findings = judge_grade(parsed, corpus, job.reference_people, w)
+                verdict = "pass" if parsed["pass"] and not findings else "fail"
+            applog.append_jsonl(
+                path,
+                {
+                    "grade_key": job.key,
+                    "grading_fingerprint": grading_fp,
+                    "spec_id": r.spec_id,
+                    "text_sha256": r.text_sha256,
+                    "grader_prompt_version": prompt.version,
+                    "grader_provider": c.provider,
+                    "grader_model_requested": c.requested_model,
+                    "grader_model": c.model,
+                    "verdict": verdict,
+                    "findings": findings,
+                    "parsed": parsed,
+                    "raw_output": c.text[:4000],
+                    "finish_reason": c.finish_reason,
+                    "request_id": c.request_id or c.response_id,
+                    "reservation_id": c.reservation_id,
+                    "input_tokens": c.input_tokens,
+                    "output_tokens": c.output_tokens,
+                    "cost_usd": c.cost_usd,
+                    "created_at": time.time(),
+                },
+            )
 
     await asyncio.gather(*(worker() for _ in range(max(1, client.settings.concurrency))))
     return stop[0] if stop else None
@@ -711,12 +1064,35 @@ async def _grade_all(
 # validate
 
 
-def _load_inputs(cfg: PilotConfig) -> tuple[_World, re.Pattern[str] | None]:
-    from belief_desire_organisms import build_evals, world
+def _markers(cfg: PilotConfig) -> list[str]:
+    from belief_desire_organisms import build_evals
 
-    w = _build_world(world.load_people())
-    marker_re = _marker_regex(build_evals.leakage_markers(cfg))
-    return w, marker_re
+    return list(build_evals.leakage_markers(cfg))
+
+
+def _write_jsonl_atomic(path: Path, rows: Iterable[BaseModel | dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows:
+            line = (
+                r.model_dump_json() if isinstance(r, BaseModel) else json.dumps(r, sort_keys=True)
+            )
+            f.write(line + "\n")
+    tmp.replace(path)
+
+
+def invalidate_matched_outputs() -> list[str]:
+    """Delete training files and the match report derived from earlier validation
+    results (they are regenerated by match_corpora)."""
+    removed = []
+    for path in [dataset_dir() / rel for rel in TRAIN_FILE_ALLOWLIST.values()] + [
+        match_report_path()
+    ]:
+        if path.exists():
+            path.unlink()
+            removed.append(str(path))
+    return removed
 
 
 def validate(
@@ -726,145 +1102,184 @@ def validate(
     only with execute=True (otherwise its cost is estimated). Returns the report."""
     g = cfg.generation
     gdir = generation_dir(corpus)
-    records = gen.current_records(cfg, corpus)
-    if not records:
-        raise FileNotFoundError(
-            f"no generated documents for {corpus.value} with the current prompt version and "
-            f"model in {gdir / gen.RESPONSES_FILE}"
-        )
-    w, marker_re = _load_inputs(cfg)
-    count = gen._token_counter(cfg)
-    tokens = [count(r.text) for r in records]
-
-    reasons: list[list[str]] = []
-    entities: list[list[str]] = []
-    for r, n in zip(records, tokens, strict=True):
-        rs, ents = local_reasons(cfg, corpus, r, n, w, marker_re)
-        reasons.append(rs)
-        entities.append(ents)
-
-    # Cross-document checks over documents that completed normally.
-    live = [i for i, r in enumerate(records) if r.finish_reason == "stop" and r.text.strip()]
-    texts = [records[i].text for i in live]
-    coverage, top_boilerplate = boilerplate(texts)
-    for i, cov in zip(live, coverage, strict=True):
-        if cov > BOILERPLATE_MAX_COVERAGE:
-            reasons[i].append(f"boilerplate:{cov:.2f}")
-    first_by_sha: dict[str, int] = {}
-    for i in live:
-        norm = sha256_text(" ".join(words(records[i].text)))
-        if norm in first_by_sha:
-            reasons[i].append(f"exact_duplicate_of:{records[first_by_sha[norm]].spec_id}")
-        else:
-            first_by_sha[norm] = i
-    # Near duplicates among documents that pass everything else; keep the earlier one.
-    clean = [i for i in live if not reasons[i]]
-    near = near_duplicate_pairs([records[i].text for i in clean])
-    for a, b, jac in near:
-        later = clean[b]
-        if not any(x.startswith("near_duplicate_of") for x in reasons[later]):
-            reasons[later].append(f"near_duplicate_of:{records[clean[a]].spec_id}:{jac}")
-
-    # Model grading of documents that pass the local checks.
-    grader = LLMSettings.for_grading(g)
-    vprompt = gen.load_prompt("validation")
     grades_path = gdir / GRADES_FILE
-
-    def key_of(r: gen.GenerationRecord) -> str:
-        return grade_key(r.text_sha256, vprompt.version, grader.provider, grader.model)
-
-    grades = _latest_grades(grades_path)
-    passing = [records[i] for i in range(len(records)) if not reasons[i]]
-    to_grade = [r for r in passing if grades.get(key_of(r), {}).get("verdict") in (None, "error")]
-    grading: dict[str, Any] = {"to_grade": len(to_grade)}
-    if to_grade and execute:
-        client = LLMClient(grader, cap_usd=g.max_spend_usd, http_client=http_client)
-        stopped = asyncio.run(_grade_all(client, corpus, vprompt, to_grade, key_of, grades_path))
-        grading.update({"requests_sent": client.requests_sent, "stopped": stopped})
-        grades = _latest_grades(grades_path)
-    elif to_grade:
-        grading.update(_grading_estimate(cfg, corpus, vprompt, to_grade))
-
-    verdicts: list[DocVerdict] = []
-    for i, r in enumerate(records):
-        grade_row = grades.get(key_of(r)) if not reasons[i] else None
-        grade = grade_row["verdict"] if grade_row else "not_graded"
-        status: Status
-        if reasons[i] or grade == "fail":
-            status = "rejected"
-        elif grade == "pass" or not g.require_model_grading:
-            status = "accepted"
-        else:
-            status = "pending_grade"
-        verdicts.append(
-            DocVerdict(
-                doc_id=doc_id_for(r.spec_id, r.text_sha256),
-                spec_id=r.spec_id,
-                corpus=corpus.value,
-                index=int(r.spec["index"]),
-                type_slot=int(r.spec["type_slot"]),
-                document_type=r.spec["document_type"],
-                text_sha256=r.text_sha256,
-                token_count=tokens[i],
-                entity_ids=entities[i],
-                local_reasons=reasons[i],
-                grade=grade,
-                grade_violations=grade_row["violations"] if grade_row else [],
-                status=status,
+    ctx = gen.corpus_context(cfg, corpus)
+    with applog.writer_lock(gdir, f"validate {corpus.value}"):
+        applog.repair_tail(grades_path)
+        records, stale = gen.load_current(cfg, corpus, ctx)
+        if not records:
+            raise FileNotFoundError(
+                f"no current generated documents for {corpus.value} in {gdir / gen.RESPONSES_FILE}"
             )
+        w = _build_world(ctx.people)
+        markers = _markers(cfg)
+        marker_re = _marker_regex(markers)
+        policy_fp = policy_fingerprint(cfg, markers)
+        grading_fp = grading_fingerprint(cfg, corpus, ctx.world_fp)
+        count = gen._token_counter(cfg)
+        tokens = [count(r.text) for r in records]
+        local = [
+            local_check(cfg, corpus, r, n, w, marker_re)
+            for r, n in zip(records, tokens, strict=True)
+        ]
+
+        grader = LLMSettings.for_grading(g)
+        vprompt = gen.load_prompt("validation")
+        grades = _latest_grades(grades_path, grading_fp)
+        jobs = [
+            _GradeJob(r, lr.reference_people, lr.flags, grade_key(r.text_sha256, grading_fp))
+            for r, lr in zip(records, local, strict=True)
+            if not lr.reasons
+        ]
+        to_grade = [j for j in jobs if grades.get(j.key, {}).get("verdict") in (None, "error")]
+        grading: dict[str, Any] = {"to_grade": len(to_grade)}
+        if to_grade and execute:
+            client = LLMClient(grader, cap_usd=g.max_spend_usd, http_client=http_client)
+            stopped = asyncio.run(
+                _grade_all(client, corpus, vprompt, to_grade, grading_fp, w, grades_path)
+            )
+            grading.update({"requests_sent": client.requests_sent, "stopped": stopped})
+            grades = _latest_grades(grades_path, grading_fp)
+        elif to_grade:
+            grading.update(_grading_estimate(cfg, corpus, vprompt, to_grade))
+
+        rows: list[DocValidation] = []
+        for r, n, lr in zip(records, tokens, local, strict=True):
+            key = grade_key(r.text_sha256, grading_fp)
+            grade_row = grades.get(key) if not lr.reasons else None
+            grade = grade_row["verdict"] if grade_row else "not_graded"
+            status: Status
+            if lr.reasons or grade == "fail":
+                status = "rejected"
+            elif grade == "pass":
+                status = "passed"
+            elif grade == "error":
+                status = "grade_error"
+            else:
+                status = "pending_grade"
+            rows.append(
+                DocValidation(
+                    doc_id=doc_id_for(r.spec_id, r.text_sha256),
+                    spec_id=r.spec_id,
+                    corpus=corpus.value,
+                    index=int(r.spec["index"]),
+                    type_slot=int(r.spec["type_slot"]),
+                    document_type=r.spec["document_type"],
+                    format_label=gen.doc_type_of(gen.DocSpec(**_spec_args(r.spec))).label,
+                    style_register=r.spec["register"],
+                    setting=r.spec["setting"],
+                    angle=r.spec["angle"],
+                    text_sha256=r.text_sha256,
+                    token_count=n,
+                    entity_ids=lr.entity_ids,
+                    local_reasons=lr.reasons,
+                    flags=lr.flags,
+                    grade=grade,
+                    grade_key=key,
+                    grade_findings=list(grade_row["findings"]) if grade_row else [],
+                    status=status,
+                    world_fingerprint=ctx.world_fp,
+                    policy_fingerprint=policy_fp,
+                    grading_fingerprint=grading_fp,
+                )
+            )
+
+        _write_jsonl_atomic(gdir / VALIDATION_FILE, rows)
+        _write_jsonl_atomic(
+            gdir / REJECTED_FILE,
+            [
+                {**v.model_dump(mode="json"), "text": r.text}
+                for v, r in zip(rows, records, strict=True)
+                if v.status == "rejected"
+            ],
         )
+        removed = invalidate_matched_outputs()
 
-    write_jsonl(gdir / VALIDATION_FILE, verdicts)
-    with open(gdir / REJECTED_FILE, "w", encoding="utf-8") as f:
-        for v, r in zip(verdicts, records, strict=True):
-            if v.status == "rejected":
-                row = {**v.model_dump(mode="json"), "text": r.text}
-                f.write(json.dumps(row, sort_keys=True) + "\n")
-
-    stats, warnings = corpus_stats(corpus, texts, [tokens[i] for i in live], w)
-    stats["top_shared_12grams"] = top_boilerplate
-    reason_counts = Counter(x.split(":")[0] for v in verdicts for x in v.local_reasons)
-    reason_counts.update(f"grade_{v.grade}" for v in verdicts if v.grade in ("fail", "error"))
-    n = len(verdicts)
-    status_counts = Counter(v.status for v in verdicts)
-    report = {
-        "corpus": corpus.value,
-        "prompt_version": records[0].prompt_version,
-        "generator": f"{g.provider}/{g.model}",
-        "grader": f"{grader.provider}/{grader.model}",
-        "grader_prompt_version": vprompt.version,
-        "documents": n,
-        "accepted": status_counts["accepted"],
-        "rejected": status_counts["rejected"],
-        "pending_grade": status_counts["pending_grade"],
-        "rejection_rate": round(status_counts["rejected"] / n, 4) if n else 0.0,
-        "local_rejection_rate": round(sum(1 for v in verdicts if v.local_reasons) / n, 4),
-        "rejection_reasons": dict(reason_counts.most_common()),
-        "near_duplicate_pairs": len(near),
-        "grading": grading,
-        "stats": stats,
-        "warnings": warnings,
-        "updated_at": time.time(),
-    }
-    (gdir / REPORT_FILE).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    gen.write_run_manifest(cfg, corpus)
+        passed = [i for i, v in enumerate(rows) if v.status == "passed"]
+        texts = [records[i].text for i in passed]
+        stats, warnings = corpus_stats(corpus, texts, [tokens[i] for i in passed], w)
+        coverage, top_boilerplate = boilerplate(texts)
+        stats["top_shared_12grams"] = top_boilerplate
+        stats["informational_near_duplicate_pairs"] = len(near_duplicate_pairs(texts))
+        stats["informational_boilerplate_docs"] = sum(
+            c > BOILERPLATE_MAX_COVERAGE for c in coverage
+        )
+        reason_counts = Counter(x.split(":")[0] for v in rows for x in v.local_reasons)
+        reason_counts.update(f"grade_{v.grade}" for v in rows if v.grade in ("fail", "error"))
+        reason_counts.update(
+            f"grade_finding_{f.split(':')[0]}" for v in rows for f in v.grade_findings
+        )
+        n = len(rows)
+        status_counts = Counter(v.status for v in rows)
+        report = {
+            "corpus": corpus.value,
+            "prompt_version": ctx.prompt.version,
+            "generator": f"{g.provider}/{g.model}",
+            "grader": f"{grader.provider}/{grader.model}",
+            "grader_prompt_version": vprompt.version,
+            "fingerprints": {
+                "world": ctx.world_fp,
+                "policy": policy_fp,
+                "grading": grading_fp,
+                "generation_settings": ctx.settings_fp,
+            },
+            "documents": n,
+            "stale_records_ignored": stale,
+            "status_counts": dict(status_counts),
+            "passed": status_counts["passed"],
+            "rejected": status_counts["rejected"],
+            "pending_grade": status_counts["pending_grade"],
+            "grade_error": status_counts["grade_error"],
+            "rejection_rate": round(status_counts["rejected"] / n, 4) if n else 0.0,
+            "local_rejection_rate": round(sum(1 for v in rows if v.local_reasons) / n, 4),
+            "flagged_for_grader": sum(1 for v in rows if v.flags),
+            "rejection_reasons": dict(reason_counts.most_common()),
+            "distributions": {
+                "all": _distributions(rows),
+                "passed": _distributions([rows[i] for i in passed]),
+            },
+            "grading": grading,
+            "stats": stats,
+            "warnings": warnings,
+            "invalidated_training_outputs": removed,
+            "updated_at": time.time(),
+        }
+        (gdir / REPORT_FILE).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        gen.write_run_manifest(cfg, corpus)
     _print_report(report)
     if grading.get("stopped"):
         raise RuntimeError(f"grading stopped early: {grading['stopped']}")
     return report
 
 
+def _spec_args(spec: dict[str, Any]) -> dict[str, Any]:
+    args = dict(spec)
+    args["people"] = tuple(tuple(p) for p in spec["people"])
+    return args
+
+
+def _distributions(rows: list[DocValidation]) -> dict[str, dict[str, int]]:
+    return {
+        "format": dict(Counter(v.format_label for v in rows).most_common()),
+        "register": dict(Counter(v.style_register for v in rows).most_common()),
+        "setting": dict(Counter(v.setting for v in rows).most_common()),
+        "angle": dict(Counter(v.angle for v in rows).most_common()),
+    }
+
+
 def _grading_estimate(
-    cfg: PilotConfig, corpus: Corpus, prompt: gen.PromptTemplate, records: list[Any]
+    cfg: PilotConfig, corpus: Corpus, prompt: gen.PromptTemplate, jobs: list[_GradeJob]
 ) -> dict[str, Any]:
-    g = cfg.generation
-    settings = LLMSettings.for_grading(g)
-    chars = sum(sum(len(x) for x in render_grading_prompt(corpus, r, prompt)) for r in records)
-    n = len(records)
+    settings = LLMSettings.for_grading(cfg.generation)
+    rendered = [
+        render_grading_prompt(corpus, j.record, prompt, j.reference_people, j.flags) for j in jobs
+    ]
+    chars = sum(len(s) + len(u) for s, u in rendered)
+    n = len(jobs)
     est: dict[str, Any] = {
         "dry_run": "grading not run; pass --execute to grade",
-        "est_input_tokens": [round(chars / 4), round(chars / 3) + 16 * n],
-        "est_output_tokens": [100 * n, settings.max_output_tokens * n],
+        "est_input_tokens": [round(chars / 4), round(chars / 2) + 48 * n],
+        "est_output_tokens": [150 * n, settings.max_output_tokens * n],
     }
     if settings.pricing is not None:
         lo = settings.pricing.cost(est["est_input_tokens"][0], est["est_output_tokens"][0])
@@ -879,12 +1294,10 @@ def _print_report(report: dict[str, Any]) -> None:
     keys = (
         "corpus",
         "documents",
-        "accepted",
-        "rejected",
-        "pending_grade",
+        "status_counts",
         "rejection_rate",
         "rejection_reasons",
-        "near_duplicate_pairs",
+        "flagged_for_grader",
         "grading",
         "warnings",
     )
@@ -892,25 +1305,145 @@ def _print_report(report: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Matching and training files
+# Current validation results
 
 
-def _load_validation(cfg: PilotConfig, corpus: Corpus) -> list[tuple[DocVerdict, Any]]:
-    path = generation_dir(corpus) / VALIDATION_FILE
+@dataclass
+class _Validated:
+    ctx: gen.CorpusContext
+    rows: list[DocValidation]
+    records: dict[str, gen.GenerationRecord]  # spec_id -> record
+    grades: dict[str, dict[str, Any]]
+    fingerprints: dict[str, str]
+
+
+def load_validated(cfg: PilotConfig, corpus: Corpus) -> _Validated:
+    """Validation results that are current for the present world, rules, grader and
+    generated documents; raises StaleValidation otherwise."""
+    gdir = generation_dir(corpus)
+    path = gdir / VALIDATION_FILE
     if not path.exists():
-        raise FileNotFoundError(f"run `bdo validate {corpus.value}` first ({path} missing)")
-    verdicts = [DocVerdict.model_validate_json(x) for x in path.read_text().splitlines() if x]
-    records = {r.spec_id: r for r in gen.current_records(cfg, corpus)}
-    stale = [
-        v.spec_id
-        for v in verdicts
-        if v.spec_id not in records or records[v.spec_id].text_sha256 != v.text_sha256
-    ]
-    if stale or len(records) != len(verdicts):
-        raise RuntimeError(
-            f"validation results for {corpus.value} are stale; re-run `bdo validate {corpus.value}`"
-        )
-    return [(v, records[v.spec_id]) for v in verdicts]
+        raise StaleValidation(f"run `bdo validate {corpus.value}` first ({path} missing)")
+    ctx = gen.corpus_context(cfg, corpus)
+    records, _ = gen.load_current(cfg, corpus, ctx)
+    rows = [DocValidation.model_validate_json(x) for x in applog.complete_lines(path)]
+    fps = {
+        "world": ctx.world_fp,
+        "policy": policy_fingerprint(cfg, _markers(cfg)),
+        "grading": grading_fingerprint(cfg, corpus, ctx.world_fp),
+    }
+    rerun = f"re-run `bdo validate {corpus.value}`"
+    for v in rows:
+        if (v.world_fingerprint, v.policy_fingerprint, v.grading_fingerprint) != (
+            fps["world"],
+            fps["policy"],
+            fps["grading"],
+        ):
+            raise StaleValidation(
+                f"{corpus.value} validation was made under different world, rules or "
+                f"grader settings; {rerun}"
+            )
+    by_spec = {r.spec_id: r for r in records}
+    if {(v.spec_id, v.text_sha256) for v in rows} != {(r.spec_id, r.text_sha256) for r in records}:
+        raise StaleValidation(f"{corpus.value} documents changed since validation; {rerun}")
+    grades = _latest_grades(gdir / GRADES_FILE, fps["grading"])
+    for v in rows:
+        if v.status != "passed":
+            continue
+        g = grades.get(v.grade_key)
+        if (
+            v.grade_key != grade_key(v.text_sha256, fps["grading"])
+            or not g
+            or g["verdict"] != "pass"
+        ):
+            raise StaleValidation(f"{v.doc_id} has no current passing grade; {rerun}")
+    return _Validated(ctx, rows, by_spec, grades, fps)
+
+
+# ---------------------------------------------------------------------------
+# Matching
+
+
+def _median(xs: list[int]) -> float:
+    return float(np.median(xs)) if xs else 0.0
+
+
+def _rel(a: float, b: float) -> float:
+    return abs(a - b) / max(abs(b), 1.0)
+
+
+@dataclass(frozen=True)
+class MatchItem:
+    doc_id: str
+    type_slot: int
+    token_count: int
+    entity_ids: tuple[str, ...]
+
+
+def match_metrics(
+    cfg: PilotConfig, belief: list[MatchItem], goal: list[MatchItem], people: list[Person]
+) -> tuple[dict[str, Any], list[str]]:
+    """Tolerance and balance metrics for a belief/goal selection, with violations."""
+    g = cfg.generation
+    violations: list[str] = []
+    per_slot: dict[str, Any] = {}
+    for slot in range(len(gen.TYPE_PAIRS)):
+        b = [x.token_count for x in belief if x.type_slot == slot]
+        go = [x.token_count for x in goal if x.type_slot == slot]
+        rel = _rel(_median(b), _median(go)) if b and go else 0.0
+        per_slot[str(slot)] = {
+            "belief": len(b),
+            "goal": len(go),
+            "median_belief": _median(b),
+            "median_goal": _median(go),
+            "median_rel_diff": round(rel, 4),
+        }
+        if len(b) != len(go):
+            violations.append(f"slot_{slot}_count:{len(b)}!={len(go)}")
+        if rel > g.match_median_tolerance:
+            violations.append(f"slot_{slot}_median:{rel:.3f}>{g.match_median_tolerance}")
+    tb = sum(x.token_count for x in belief)
+    tg = sum(x.token_count for x in goal)
+    total_rel = _rel(tb, tg)
+    if total_rel > g.match_total_tolerance:
+        violations.append(f"token_total:{total_rel:.3f}>{g.match_total_tolerance}")
+    taught = [p for p in people if p.taught]
+    mentions = Counter(pid for x in belief for pid in x.entity_ids)
+    counts = {p.person_id: mentions.get(p.person_id, 0) for p in taught}
+    fruit_counts = {
+        f: sum(c for pid, c in counts.items() if _fruit(people, pid) == f) for f in FRUITS
+    }
+    total_mentions = sum(fruit_counts.values())
+    shares = {f: (c / total_mentions if total_mentions else 0.0) for f, c in fruit_counts.items()}
+    lo = min(counts.values(), default=0)
+    hi = max(counts.values(), default=0)
+    for pid, c in sorted(counts.items()):
+        if c == 0:
+            violations.append(f"person_never_mentioned:{pid}")
+    if lo > 0 and hi / lo > g.belief_mention_max_ratio:
+        violations.append(f"person_mention_ratio:{hi}/{lo}>{g.belief_mention_max_ratio}")
+    for f, s in shares.items():
+        if abs(s - 1 / 3) > g.belief_fruit_share_tolerance:
+            violations.append(f"fruit_share:{f}={s:.3f}")
+    metrics = {
+        "documents": {"belief": len(belief), "goal": len(goal)},
+        "tokens": {"belief": tb, "goal": tg, "total_rel_diff": round(total_rel, 4)},
+        "per_slot": per_slot,
+        "belief_person_doc_mentions": {"min": lo, "max": hi, "per_person": counts},
+        "belief_fruit_mentions": fruit_counts,
+        "belief_fruit_shares": {f: round(s, 4) for f, s in shares.items()},
+        "length_ks_statistic": round(
+            length_ks_statistic([x.token_count for x in belief], [x.token_count for x in goal]), 4
+        ),
+    }
+    return metrics, violations
+
+
+def _fruit(people: list[Person], pid: str) -> str | None:
+    for p in people:
+        if p.person_id == pid:
+            return p.fruit
+    return None
 
 
 def _select_nearest(small: list[int], large: list[tuple[int, int, str]]) -> list[int]:
@@ -929,108 +1462,164 @@ def _select_nearest(small: list[int], large: list[tuple[int, int, str]]) -> list
     return chosen
 
 
-def match_corpora(cfg: PilotConfig) -> dict[str, Any]:
-    """Select equal numbers of accepted belief and goal documents per type slot with
-    matched length distributions, then write both training files."""
-    data = {c: _load_validation(cfg, c) for c in Corpus}
-    if cfg.generation.require_model_grading:
-        pending = {c.value: sum(v.status == "pending_grade" for v, _ in data[c]) for c in Corpus}
-        if any(pending.values()):
-            raise RuntimeError(
-                f"documents still need a model grade {pending}; run `bdo validate <corpus> "
-                "--execute` (or set generation.require_model_grading: false)"
-            )
-    accepted = {c: [(v, r) for v, r in data[c] if v.status == "accepted"] for c in Corpus}
-    selected: dict[Corpus, list[tuple[DocVerdict, Any]]] = {c: [] for c in Corpus}
-    per_slot: dict[int, dict[str, int]] = {}
+def select_pairs(
+    cfg: PilotConfig, belief: list[MatchItem], goal: list[MatchItem]
+) -> tuple[list[MatchItem], list[MatchItem], int]:
+    """Equal counts per type slot with nearest lengths, then drop length-ranked pairs
+    (one document from each side) until every slot median and the token totals are
+    within tolerance. Returns (belief, goal, pairs dropped)."""
+    g = cfg.generation
+    pairs: dict[int, list[tuple[MatchItem, MatchItem]]] = {}
     for slot in range(len(gen.TYPE_PAIRS)):
-        b = [x for x in accepted[Corpus.BELIEF] if x[0].type_slot == slot]
-        g = [x for x in accepted[Corpus.GOAL] if x[0].type_slot == slot]
-        per_slot[slot] = {"belief_accepted": len(b), "goal_accepted": len(g)}
-        small, large = (b, g) if len(b) <= len(g) else (g, b)
-        large_items = [(v.token_count, i, v.doc_id) for i, (v, _) in enumerate(large)]
-        picks = _select_nearest([v.token_count for v, _ in small], large_items)
-        chosen_large = [large[i] for i in sorted(picks)]
-        sb, sg = (small, chosen_large) if len(b) <= len(g) else (chosen_large, small)
-        selected[Corpus.BELIEF].extend(sb)
-        selected[Corpus.GOAL].extend(sg)
-        per_slot[slot]["selected_each"] = len(small)
+        b = [x for x in belief if x.type_slot == slot]
+        go = [x for x in goal if x.type_slot == slot]
+        small, large = (b, go) if len(b) <= len(go) else (go, b)
+        picks = _select_nearest(
+            [x.token_count for x in small],
+            [(x.token_count, i, x.doc_id) for i, x in enumerate(large)],
+        )
+        chosen = [large[i] for i in picks]
+        sb, sg = (small, chosen) if len(b) <= len(go) else (chosen, small)
+        key = lambda x: (x.token_count, x.doc_id)  # noqa: E731
+        pairs[slot] = list(zip(sorted(sb, key=key), sorted(sg, key=key), strict=True))
+
+    dropped = 0
+    while True:
+        target_pairs: list[tuple[int, int]] | None = None
+        sign = 0.0
+        for slot, ps in pairs.items():
+            if not ps:
+                continue
+            mb, mg = (
+                _median([p[0].token_count for p in ps]),
+                _median([p[1].token_count for p in ps]),
+            )
+            if _rel(mb, mg) > g.match_median_tolerance:
+                target_pairs = [(slot, i) for i in range(len(ps))]
+                sign = 1.0 if mb > mg else -1.0
+                break
+        if target_pairs is None:
+            tb = sum(p[0].token_count for ps in pairs.values() for p in ps)
+            tg = sum(p[1].token_count for ps in pairs.values() for p in ps)
+            if not tb or _rel(tb, tg) <= g.match_total_tolerance:
+                break
+            target_pairs = [(s, i) for s, ps in pairs.items() for i in range(len(ps))]
+            sign = 1.0 if tb > tg else -1.0
+
+        def gap(si: tuple[int, int], sign: float = sign) -> tuple[float, str]:
+            b, go = pairs[si[0]][si[1]]
+            return (sign * (b.token_count - go.token_count), b.doc_id)
+
+        slot, i = max(target_pairs, key=gap)
+        if gap((slot, i))[0] <= 0:
+            break  # no pair moves the gap in the right direction; report the residual
+        del pairs[slot][i]
+        dropped += 1
+    b_out = [p[0] for ps in pairs.values() for p in ps]
+    g_out = [p[1] for ps in pairs.values() for p in ps]
+    return b_out, g_out, dropped
+
+
+def _name_refs(reason: str, candidates: list[DocValidation]) -> str:
+    """Replace candidate positions in corpus-check reasons with spec ids."""
+    return re.sub(r"_of:(\d+)", lambda m: f"_of:{candidates[int(m.group(1))].spec_id}", reason)
+
+
+def match_corpora(cfg: PilotConfig) -> dict[str, Any]:
+    """Freeze candidates, run the corpus-level checks, select a matched pair of
+    training sets within tolerance, and write the training files."""
+    invalidate_matched_outputs()
+    val = {c: load_validated(cfg, c) for c in Corpus}
+    pending = {c.value: sum(v.status == "pending_grade" for v in val[c].rows) for c in Corpus}
+    if any(pending.values()):
+        raise MatchShortfall(
+            f"documents still need a model grade {pending}; run `bdo validate <corpus> "
+            "--execute` (grading is required for training files)"
+        )
+    items: dict[Corpus, list[MatchItem]] = {}
+    corpus_checks: dict[str, Any] = {}
+    row_by_doc: dict[str, DocValidation] = {}
+    for c in Corpus:
+        candidates = sorted((v for v in val[c].rows if v.status == "passed"), key=lambda v: v.index)
+        texts = [val[c].records[v.spec_id].text for v in candidates]
+        reasons = corpus_level_check(texts)
+        rejected_rows = []
+        for v, rs in zip(candidates, reasons, strict=True):
+            if rs:
+                named = [_name_refs(x, candidates) for x in rs]
+                rejected_rows.append({"doc_id": v.doc_id, "spec_id": v.spec_id, "reasons": named})
+        _write_jsonl_atomic(generation_dir(c) / CORPUS_CHECKS_FILE, rejected_rows)
+        corpus_checks[c.value] = {
+            "candidates": len(candidates),
+            "rejected": len(rejected_rows),
+            "reasons": dict(Counter(r.split(":")[0] for x in rejected_rows for r in x["reasons"])),
+            "grade_error_excluded": sum(v.status == "grade_error" for v in val[c].rows),
+        }
+        kept = [v for v, rs in zip(candidates, reasons, strict=True) if not rs]
+        items[c] = [
+            MatchItem(v.doc_id, v.type_slot, v.token_count, tuple(v.entity_ids)) for v in kept
+        ]
+        row_by_doc.update({v.doc_id: v for v in kept})
+
+    belief, goal, dropped = select_pairs(cfg, items[Corpus.BELIEF], items[Corpus.GOAL])
+    people = val[Corpus.BELIEF].ctx.people
+    metrics, violations = match_metrics(cfg, belief, goal, people)
+    report: dict[str, Any] = {
+        "fingerprints": {c.value: val[c].fingerprints for c in Corpus},
+        "corpus_level_checks": corpus_checks,
+        "pairs_dropped_for_length": dropped,
+        "metrics": metrics,
+        "violations": violations,
+        "updated_at": time.time(),
+    }
+    path = match_report_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if violations or not belief:
+        report["status"] = "shortfall"
+        report["remedy"] = (
+            "Generate more documents (raise generation.target_unique_tokens_per_condition "
+            "or max_specs_per_condition, run `bdo generate <corpus> --no-pilot --execute`, "
+            "then validate and match again), or revise prompts that cause the rejections."
+        )
+        path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        raise MatchShortfall(
+            f"matched corpora miss the tolerances: {violations or ['no documents']}; nothing "
+            f"was written. See {path}"
+        )
 
     count = gen._token_counter(cfg)
-    written: dict[str, Any] = {}
-    lengths: dict[Corpus, list[int]] = {}
-    for c in Corpus:
-        rows = sorted(selected[c], key=lambda x: x[0].index)
+    selected: dict[str, list[list[str]]] = {}
+    for c, chosen in ((Corpus.BELIEF, belief), (Corpus.GOAL, goal)):
+        rows = sorted((row_by_doc[x.doc_id] for x in chosen), key=lambda v: v.index)
         records = []
-        for v, r in rows:
-            text = r.text
-            if sha256_text(text) != v.text_sha256:
+        for v in rows:
+            r = val[c].records[v.spec_id]
+            if sha256_text(r.text) != v.text_sha256:
                 raise RuntimeError(f"text hash mismatch for {v.doc_id}")
             records.append(
                 TrainingRecord(
                     doc_id=v.doc_id,
                     condition=c,
-                    text=text,
+                    text=r.text,
                     document_type=v.document_type,
                     entity_ids=v.entity_ids if c == Corpus.BELIEF else [],
                     generator_model=r.generator_model,
                     generation_prompt_version=r.prompt_version,
                     validation_status="accepted",
-                    token_count=count(text),
+                    token_count=count(r.text),
                     text_sha256=v.text_sha256,
                 )
             )
-        path = dataset_dir() / TRAIN_FILE_ALLOWLIST[c]
-        write_jsonl(path, records)
-        lengths[c] = [x.token_count for x in records]
-        written[c.value] = {
-            "file": TRAIN_FILE_ALLOWLIST[c],
-            "documents": len(records),
-            "tokens": sum(x.token_count for x in records),
-            "lengths": _quantiles([x.token_count for x in records]),
-            "type_mix": dict(Counter(x.document_type for x in records)),
-            "accepted_available": len(accepted[c]),
-            "accepted_unused": len(accepted[c]) - len(records),
-        }
-    residual = _residual(written)
-    residual["length_ks_statistic"] = round(
-        length_ks_statistic(lengths[Corpus.BELIEF], lengths[Corpus.GOAL]), 4
-    )
-    report = {
-        "corpora": written,
-        "per_type_slot": per_slot,
-        "residual_imbalance": residual,
-        "updated_at": time.time(),
-    }
-    if selected[Corpus.BELIEF]:
-        mentions = Counter(pid for v, _ in selected[Corpus.BELIEF] for pid in v.entity_ids)
-        report["belief_person_doc_mentions"] = {
-            "min": min(mentions.values(), default=0),
-            "max": max(mentions.values(), default=0),
-            "people_mentioned": len(mentions),
-        }
-    path = match_report_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+        _write_jsonl_atomic(dataset_dir() / TRAIN_FILE_ALLOWLIST[c], records)
+        selected[c.value] = [[x.doc_id, x.text_sha256] for x in records]
+    report.update({"status": "ok", "selected": selected})
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(
         json.dumps(
-            {"corpora": written, "residual_imbalance": report["residual_imbalance"]}, indent=2
+            {"status": "ok", "metrics": metrics, "corpus_level_checks": corpus_checks}, indent=2
         )
     )
     return report
-
-
-def _residual(written: dict[str, Any]) -> dict[str, Any]:
-    b, g = written["belief"], written["goal"]
-    out: dict[str, Any] = {
-        "document_count_difference": b["documents"] - g["documents"],
-        "token_total_difference": b["tokens"] - g["tokens"],
-        "token_total_ratio": round(b["tokens"] / g["tokens"], 4) if g["tokens"] else None,
-    }
-    for q in ("p10", "p50", "p90", "mean"):
-        if q in b["lengths"] and q in g["lengths"]:
-            out[f"length_{q}_difference"] = round(b["lengths"][q] - g["lengths"][q], 1)
-    return out
 
 
 def length_ks_statistic(a: list[int], b: list[int]) -> float:
@@ -1042,3 +1631,71 @@ def length_ks_statistic(a: list[int], b: list[int]) -> float:
     return max(
         abs(bisect.bisect_right(sa, x) / len(sa) - bisect.bisect_right(sb, x) / len(sb)) for x in xs
     )
+
+
+# ---------------------------------------------------------------------------
+# Verification of written training files (used by publish)
+
+
+def verify_training_files(cfg: PilotConfig, root: Path | None = None) -> dict[str, Any]:
+    """Join every training record to the current validation results, grades and match
+    report, recount tokens, and recheck tolerances. Raises on any mismatch."""
+    root = root or dataset_dir()
+    report_path = match_report_path()
+    if not report_path.exists():
+        raise StaleValidation("no match report; run `bdo match`")
+    report = json.loads(report_path.read_text())
+    if report.get("status") != "ok":
+        raise StaleValidation("the last match did not succeed; run `bdo match`")
+    count = gen._token_counter(cfg)
+    items: dict[Corpus, list[MatchItem]] = {}
+    summary: dict[str, Any] = {}
+    people: list[Person] = []
+    for c in Corpus:
+        val = load_validated(cfg, c)
+        people = val.ctx.people
+        if report["fingerprints"].get(c.value) != val.fingerprints:
+            raise StaleValidation(f"match report for {c.value} predates current validation")
+        rows = {v.doc_id: v for v in val.rows}
+        selected = {d: s for d, s in report["selected"][c.value]}
+        path = root / TRAIN_FILE_ALLOWLIST[c]
+        if not path.exists():
+            raise StaleValidation(f"missing {TRAIN_FILE_ALLOWLIST[c]}; run `bdo match`")
+        records = list(read_jsonl(path, TrainingRecord))
+        if {r.doc_id for r in records} != set(selected) or len(records) != len(selected):
+            raise StaleValidation(f"{TRAIN_FILE_ALLOWLIST[c]} differs from the match report")
+        taught = {p.person_id for p in people if p.taught}
+        transfer_names = [p.name for p in people if not p.taught]
+        for r in records:
+            v = rows.get(r.doc_id)
+            if v is None or v.status != "passed" or v.text_sha256 != r.text_sha256:
+                raise StaleValidation(f"{r.doc_id} is not a current passed document")
+            if selected[r.doc_id] != r.text_sha256 or sha256_text(r.text) != r.text_sha256:
+                raise StaleValidation(f"{r.doc_id}: text hash mismatch")
+            if r.condition != c:
+                raise StaleValidation(f"{r.doc_id}: condition {r.condition}")
+            if count(r.text) != r.token_count:
+                raise StaleValidation(f"{r.doc_id}: token_count does not match the tokenizer")
+            if c == Corpus.GOAL and r.entity_ids:
+                raise StaleValidation(f"{r.doc_id}: goal documents must have no entity_ids")
+            if c == Corpus.BELIEF:
+                if r.entity_ids != v.entity_ids or not set(r.entity_ids) <= taught:
+                    raise StaleValidation(f"{r.doc_id}: entity_ids do not match validation")
+                if any(name in r.text for name in transfer_names):
+                    raise StaleValidation(f"{r.doc_id}: mentions a transfer-only identity")
+        items[c] = [
+            MatchItem(r.doc_id, rows[r.doc_id].type_slot, r.token_count, tuple(r.entity_ids))
+            for r in records
+        ]
+        summary[c.value] = {
+            "documents": len(records),
+            "tokens": sum(r.token_count for r in records),
+            "type_mix": dict(sorted(Counter(r.document_type for r in records).items())),
+            "generator_models": sorted({r.generator_model for r in records}),
+            "prompt_versions": sorted({r.generation_prompt_version for r in records}),
+        }
+    metrics, violations = match_metrics(cfg, items[Corpus.BELIEF], items[Corpus.GOAL], people)
+    if violations:
+        raise StaleValidation(f"training files miss the matching tolerances: {violations}")
+    summary["matching"] = metrics
+    return summary

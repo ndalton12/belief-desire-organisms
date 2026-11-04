@@ -6,10 +6,15 @@ endpoint, via the openai SDK). Used for document generation and model grading.
 Guarantees:
 - API keys come only from environment variables and never enter logs, records, or
   exception messages raised from here (provider error text is scrubbed).
-- Every request attempt is preceded by `spend.check_cap` with its worst-case cost
-  plus the worst-case cost of requests already in flight in this process; every
-  completed response is recorded in the spend ledger with its measured cost.
-- Paid execution refuses while the model, prices, or spend cap are unset.
+- Every request attempt reserves an upper-bound cost in the shared spend ledger
+  (`spend.reserve`, which refuses past the cap) and is then settled:
+  * success: the measured cost (the full reservation if the provider reported no usage);
+  * a 4xx client error other than 408 (rejected before processing): 0;
+  * anything whose outcome is unknown (timeouts, connection errors, 5xx, unexpected
+    responses): the full reserved amount, because the provider may have billed it.
+  A process killed mid-request leaves its reservation unsettled, which the ledger
+  counts at the reserved amount.
+- Paid execution refuses while the model, prices (finite, >= 0) or spend cap are unset.
 - SDK-internal retries are disabled; this module retries rate limits, timeouts,
   connection errors and 5xx with exponential backoff, honouring `retry-after`.
 
@@ -17,7 +22,8 @@ Anthropic note: anthropic SDK 2.x sends API version 2026-10-21, which rejects
 `temperature` on every model, so no temperature is sent and only the default (1.0)
 is accepted in the config. Refusal fallbacks to another model are deliberately not
 enabled: the spec requires one fixed generator model, so a refusal is recorded as a
-failed document instead.
+failed document instead. No prompt caching is requested, so all input is billed at
+the base input rate.
 """
 
 from __future__ import annotations
@@ -46,10 +52,11 @@ API_KEY_ENV: dict[str, str] = {
 }
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Conservative input-token estimate used only for the pre-request cap check. English
-# text is usually 3.5-4.5 characters per token across current tokenizers.
-_CHARS_PER_TOKEN_UPPER = 3.0
-_PROMPT_OVERHEAD_TOKENS = 16
+# Upper bound on input tokens for the spend reservation: no current tokenizer uses
+# fewer than 2 characters per token on English text, plus per-message framing.
+_CHARS_PER_TOKEN_LOWER_BOUND = 2.0
+_TOKENS_PER_MESSAGE = 8
+_TOKENS_PER_REQUEST = 32
 
 _RETRYABLE_STATUS = {408, 409, 429}
 
@@ -65,14 +72,28 @@ class MissingCredentialsError(RuntimeError):
 class LLMRequestError(RuntimeError):
     """A request failed permanently (non-retryable status or retries exhausted)."""
 
-    def __init__(self, message: str, *, status_code: int | None = None, attempts: int = 0):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        attempts: int = 0,
+        attempt_log: list[dict[str, Any]] | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.attempts = attempts
+        self.attempt_log = attempt_log or []
 
 
 # ---------------------------------------------------------------------------
 # Settings
+
+
+def _finite_nonneg(value: float, name: str) -> float:
+    if not (isinstance(value, int | float) and math.isfinite(value) and value >= 0):
+        raise LLMConfigError(f"{name} must be a finite number >= 0, got {value!r}")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -80,21 +101,13 @@ class Pricing:
     input_usd_per_mtok: float
     output_usd_per_mtok: float
 
-    def cost(
-        self,
-        input_tokens: int,
-        output_tokens: int,
-        *,
-        cache_creation_input_tokens: int = 0,
-        cache_read_input_tokens: int = 0,
-    ) -> float:
-        # Anthropic bills cache writes at 1.25x and cache reads at 0.1x the input rate.
-        # This pipeline sets no cache breakpoints, so both are normally zero.
-        billed_input = (
-            input_tokens + 1.25 * cache_creation_input_tokens + 0.1 * cache_read_input_tokens
-        )
+    def __post_init__(self) -> None:
+        _finite_nonneg(self.input_usd_per_mtok, "input price")
+        _finite_nonneg(self.output_usd_per_mtok, "output price")
+
+    def cost(self, input_tokens: int, output_tokens: int) -> float:
         return (
-            billed_input * self.input_usd_per_mtok + output_tokens * self.output_usd_per_mtok
+            input_tokens * self.input_usd_per_mtok + output_tokens * self.output_usd_per_mtok
         ) / 1e6
 
 
@@ -154,6 +167,17 @@ class LLMSettings:
             pricing=pricing,
         )
 
+    def sent_params(self) -> dict[str, Any]:
+        """Everything about the request other than its text that can change the output,
+        exactly as it is sent (used in cache fingerprints)."""
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "temperature": None if self.provider == "anthropic" else self.temperature,
+            "max_output_tokens": self.max_output_tokens,
+            "reasoning_effort": self.reasoning_effort,
+        }
+
     def check_ready_for_paid_execution(self) -> None:
         problems = []
         if self.provider not in API_KEY_ENV:
@@ -176,12 +200,12 @@ class LLMSettings:
         if problems:
             raise LLMConfigError("refusing paid execution: " + "; ".join(problems))
 
-    def projected_max_cost(self, prompt_chars: int) -> float:
-        """Worst-case cost of one request: conservative input estimate plus a full
+    def projected_max_cost(self, user: str, system: str | None = None) -> float:
+        """Upper-bound cost of one request: an upper bound on input tokens plus a full
         `max_output_tokens` response (reasoning tokens count against it)."""
         if self.pricing is None:
             raise LLMConfigError("prices are not set")
-        return self.pricing.cost(estimate_input_tokens(prompt_chars), self.max_output_tokens)
+        return self.pricing.cost(estimate_input_tokens(user, system), self.max_output_tokens)
 
 
 def _pricing(inp: float | None, out: float | None) -> Pricing | None:
@@ -190,8 +214,14 @@ def _pricing(inp: float | None, out: float | None) -> Pricing | None:
     return Pricing(float(inp), float(out))
 
 
-def estimate_input_tokens(prompt_chars: int) -> int:
-    return math.ceil(prompt_chars / _CHARS_PER_TOKEN_UPPER) + _PROMPT_OVERHEAD_TOKENS
+def estimate_input_tokens(user: str, system: str | None = None) -> int:
+    chars = len(user) + len(system or "")
+    messages = 2 if system else 1
+    return (
+        math.ceil(chars / _CHARS_PER_TOKEN_LOWER_BOUND)
+        + messages * _TOKENS_PER_MESSAGE
+        + _TOKENS_PER_REQUEST
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -210,17 +240,17 @@ class Completion:
     input_tokens: int
     output_tokens: int  # includes reasoning tokens where the provider bills them
     reasoning_tokens: int | None
-    cache_creation_input_tokens: int
-    cache_read_input_tokens: int
     finish_reason: FinishReason
     raw_finish_reason: str | None
     seed: int | None  # seed sent with the request; None when the provider has none
     cost_usd: float
-    cost_source: Literal["computed", "provider"]
+    cost_source: Literal["computed", "provider", "reserved_no_usage"]
+    reservation_id: str  # spend-ledger reservation of the successful attempt
     attempts: int
+    attempt_log: list[dict[str, Any]]  # every attempt: reservation id, outcome, settled cost
     latency_s: float
     extra: dict[str, Any] = field(default_factory=dict)
-    raw_response: dict[str, Any] | None = None  # provider response body as parsed by the SDK
+    raw_response: dict[str, Any] | None = None  # response body as parsed by the SDK
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -264,7 +294,7 @@ SleepFn = Callable[[float], Awaitable[None]]
 
 
 class LLMClient:
-    """Async client with concurrency limit, retries, spend-cap checks and cost logging.
+    """Async client with concurrency limit, retries, spend reservations and cost logging.
 
     `http_client` (an `httpx2.AsyncClient`) is for tests: it lets a mock transport
     stand in for the provider while the real SDK builds requests and parses replies.
@@ -282,8 +312,8 @@ class LLMClient:
         jitter: Callable[[], float] = random.random,
     ) -> None:
         settings.check_ready_for_paid_execution()
-        if cap_usd is None:
-            raise spend.SpendCapExceeded(f"no spend cap configured for {category}")
+        if cap_usd is None or not (math.isfinite(cap_usd) and cap_usd > 0):
+            raise spend.SpendCapExceeded(f"no valid spend cap configured for {category}")
         self.settings = settings
         self.cap_usd = cap_usd
         self.category = category
@@ -291,8 +321,6 @@ class LLMClient:
         self._sleep = sleep
         self._jitter = jitter
         self._sem = asyncio.Semaphore(settings.concurrency)
-        self._lock = asyncio.Lock()
-        self._reserved_usd = 0.0
         self._sdk = _make_sdk_client(settings, http_client)
         self.requests_sent = 0
 
@@ -304,81 +332,94 @@ class LLMClient:
         seed: int | None = None,
         purpose: dict[str, Any] | None = None,
     ) -> Completion:
-        """One completion. Raises LLMRequestError, or spend.SpendCapExceeded before
-        any request that could take spending past the cap."""
-        prompt_chars = len(user) + len(system or "")
-        projected = self.settings.projected_max_cost(prompt_chars)
+        """One completion. Raises LLMRequestError, or spend.SpendCapExceeded before any
+        attempt whose reservation would take committed spend past the cap."""
+        projected = self.settings.projected_max_cost(user, system)
+        base = {
+            "provider": self.settings.provider,
+            "model": self.settings.model,
+            **(purpose or {}),
+        }
+        attempt_log: list[dict[str, Any]] = []
         async with self._sem:
             attempt = 0
             while True:
                 attempt += 1
-                async with self._lock:
-                    spend.check_cap(
-                        self.category,
-                        self.cap_usd,
-                        projected + self._reserved_usd,
-                        path=self.ledger_path,
-                    )
-                    self._reserved_usd += projected
+                detail = {**base, "attempt": attempt}
+                rid = spend.reserve(
+                    self.category, self.cap_usd, projected, detail, path=self.ledger_path
+                )
                 t0 = time.monotonic()
                 try:
                     self.requests_sent += 1
                     result = await self._call(user=user, system=system, seed=seed)
+                    completion = _finish(
+                        result,
+                        self.settings,
+                        seed=seed,
+                        projected_usd=projected,
+                        reservation_id=rid,
+                        attempts=attempt,
+                        attempt_log=attempt_log,
+                        latency=time.monotonic() - t0,
+                    )
                 except Exception as exc:  # classified below; never re-raised raw
-                    status, retry_after, message, maybe_billed = _classify(exc)
-                    async with self._lock:
-                        self._reserved_usd -= projected
-                        if maybe_billed:
-                            # The provider may have generated (and billed) a response
-                            # we never saw. Record the worst case so the ledger can
-                            # only over-state spend.
-                            spend.record(
-                                self.category,
-                                projected,
-                                {
-                                    "provider": self.settings.provider,
-                                    "model": self.settings.model,
-                                    "cost_source": "worst_case_unknown_outcome",
-                                    "error": type(exc).__name__,
-                                    **(purpose or {}),
-                                },
-                                path=self.ledger_path,
-                            )
+                    status, retry_after, message, not_billed = _classify(exc)
+                    settled = 0.0 if not_billed else projected
+                    spend.settle(
+                        self.category,
+                        rid,
+                        settled,
+                        {
+                            **detail,
+                            "outcome": "error",
+                            "error_type": type(exc).__name__,
+                            "status": status,
+                            "cost_source": "not_billed" if not_billed else "reserved_unknown",
+                        },
+                        path=self.ledger_path,
+                    )
+                    attempt_log.append(
+                        {
+                            "attempt": attempt,
+                            "reservation_id": rid,
+                            "outcome": "error",
+                            "status": status,
+                            "error_type": type(exc).__name__,
+                            "settled_usd": settled,
+                        }
+                    )
                     retryable = status is None or status in _RETRYABLE_STATUS or status >= 500
-                    if isinstance(exc, _TransientEmptyResponse):
-                        retryable = True
                     if not retryable or attempt > self.settings.max_retries:
                         raise LLMRequestError(
                             f"{self.settings.provider} request failed after {attempt} "
                             f"attempt(s): {message}",
                             status_code=status,
                             attempts=attempt,
+                            attempt_log=attempt_log,
                         ) from None
                     await self._sleep(self._backoff(attempt, retry_after))
                     continue
-                completion = _finish(result, self.settings, seed, attempt, time.monotonic() - t0)
-                async with self._lock:
-                    self._reserved_usd -= projected
-                    spend.record(
-                        self.category,
-                        completion.cost_usd,
-                        {
-                            "provider": completion.provider,
-                            "model": completion.model,
-                            "request_id": completion.request_id or completion.response_id,
-                            "input_tokens": completion.input_tokens,
-                            "output_tokens": completion.output_tokens,
-                            "cost_source": completion.cost_source,
-                            **(purpose or {}),
-                        },
-                        path=self.ledger_path,
-                    )
+                spend.settle(
+                    self.category,
+                    rid,
+                    completion.cost_usd,
+                    {
+                        **detail,
+                        "outcome": completion.finish_reason,
+                        "request_id": completion.request_id or completion.response_id,
+                        "input_tokens": completion.input_tokens,
+                        "output_tokens": completion.output_tokens,
+                        "cost_source": completion.cost_source,
+                    },
+                    path=self.ledger_path,
+                )
                 return completion
 
     def _backoff(self, attempt: int, retry_after: float | None) -> float:
         s = self.settings
         delay = min(s.retry_max_delay_s, s.retry_base_delay_s * 2 ** (attempt - 1))
-        delay = delay * (0.5 + self._jitter())  # full jitter around the exponential step
+        delay = delay * (0.5 + self._jitter())  # jitter around the exponential step
         if retry_after is not None:
             delay = max(delay, min(retry_after, s.retry_max_delay_s))
         return delay
@@ -409,22 +450,23 @@ def _make_sdk_client(settings: LLMSettings, http_client: Any) -> Any:
 
 def _classify(exc: Exception) -> tuple[int | None, float | None, str, bool]:
     """(HTTP status or None for network/timeouts, retry-after seconds, scrubbed message,
-    whether the provider may have billed the request anyway)."""
+    whether the provider confirmed the request was not billed)."""
     import anthropic
     import openai
 
     message = scrub(f"{type(exc).__name__}: {exc}")
     if isinstance(exc, _TransientEmptyResponse):
-        return None, None, message, True
-    if isinstance(exc, anthropic.APIStatusError | openai.APIStatusError):
-        return exc.status_code, _retry_after(exc.response.headers), message, False
-    if isinstance(exc, anthropic.APITimeoutError | openai.APITimeoutError):
-        return None, None, message, True  # the server may have finished generating
-    if isinstance(exc, anthropic.APIConnectionError | openai.APIConnectionError):
         return None, None, message, False
+    if isinstance(exc, anthropic.APIStatusError | openai.APIStatusError):
+        status = exc.status_code
+        # A 4xx (other than a request timeout) is rejected before generation.
+        not_billed = 400 <= status < 500 and status != 408
+        return status, _retry_after(exc.response.headers), message, not_billed
+    if isinstance(exc, anthropic.APIConnectionError | openai.APIConnectionError):
+        return None, None, message, False  # includes timeouts: outcome unknown
     # Anything else (an unexpected response shape, a bug) is not retried; the request
-    # may already have been served, so it counts as possibly billed.
-    return 0, None, message, True
+    # may already have been served.
+    return 0, None, message, False
 
 
 def _retry_after(headers: Any) -> float | None:
@@ -436,6 +478,13 @@ def _retry_after(headers: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return None
+
+
+def _raw(response: Any) -> dict[str, Any] | None:
+    try:
+        return response.to_dict()
+    except Exception:  # noqa: BLE001 - provenance only; never fail a paid response on this
+        return None
 
 
 async def _call_anthropic(
@@ -462,6 +511,8 @@ async def _call_anthropic(
         "refusal": "refusal",
     }.get(raw_finish or "", "other")  # type: ignore[assignment]
     stop_details = getattr(msg, "stop_details", None)
+    cache_write = usage.cache_creation_input_tokens or 0
+    cache_read = usage.cache_read_input_tokens or 0
     return {
         "text": "".join(b.text for b in msg.content if getattr(b, "type", None) == "text"),
         "model": msg.model,
@@ -471,11 +522,13 @@ async def _call_anthropic(
         },
         "request_id": getattr(msg, "_request_id", None),
         "response_id": msg.id,
-        "input_tokens": usage.input_tokens,
+        "input_tokens": usage.input_tokens + cache_write + cache_read,
+        # No caching is requested. If any appears, writes are priced at 1.25x and reads
+        # at the full input rate (an over-estimate; reads really cost 0.1x).
+        "billable_input_tokens": usage.input_tokens + math.ceil(1.25 * cache_write) + cache_read,
         "output_tokens": usage.output_tokens,
+        "has_usage": True,
         "reasoning_tokens": getattr(details, "thinking_tokens", None),
-        "cache_creation_input_tokens": usage.cache_creation_input_tokens or 0,
-        "cache_read_input_tokens": usage.cache_read_input_tokens or 0,
         "finish_reason": finish,
         "raw_finish_reason": raw_finish,
         "provider_cost": None,
@@ -515,9 +568,7 @@ async def _call_openai_compatible(
         kwargs["extra_body"] = extra_body
     resp = await sdk.chat.completions.create(**kwargs)
     if not resp.choices:
-        raise _TransientEmptyResponse(
-            f"response without choices: {getattr(resp, 'error', None) or 'no error field'}"
-        )
+        raise _TransientEmptyResponse("response without choices")
     choice = resp.choices[0]
     message = choice.message
     raw_finish = choice.finish_reason
@@ -544,40 +595,56 @@ async def _call_openai_compatible(
         "request_id": getattr(resp, "_request_id", None),
         "response_id": resp.id,
         "input_tokens": usage.prompt_tokens if usage else 0,
+        # Cached prompt tokens are priced at the full input rate (conservative).
+        "billable_input_tokens": usage.prompt_tokens if usage else 0,
         "output_tokens": usage.completion_tokens if usage else 0,
+        "has_usage": usage is not None,
         "reasoning_tokens": getattr(details, "reasoning_tokens", None),
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,  # OpenAI cached tokens billed at full rate (conservative)
         "finish_reason": finish,
         "raw_finish_reason": raw_finish,
-        "provider_cost": float(provider_cost) if provider_cost is not None else None,
+        "provider_cost": provider_cost,
         "seed_supported": True,
         "raw_response": _raw(resp),
         "extra": {},
     }
 
 
-def _raw(response: Any) -> dict[str, Any] | None:
-    try:
-        return response.to_dict()
-    except Exception:  # noqa: BLE001 - provenance only; never fail a paid response on this
-        return None
-
-
 def _finish(
-    r: dict[str, Any], settings: LLMSettings, seed: int | None, attempts: int, latency: float
+    r: dict[str, Any],
+    settings: LLMSettings,
+    *,
+    seed: int | None,
+    projected_usd: float,
+    reservation_id: str,
+    attempts: int,
+    attempt_log: list[dict[str, Any]],
+    latency: float,
 ) -> Completion:
     assert settings.pricing is not None
-    computed = settings.pricing.cost(
-        r["input_tokens"],
-        r["output_tokens"],
-        cache_creation_input_tokens=r["cache_creation_input_tokens"],
-        cache_read_input_tokens=r["cache_read_input_tokens"],
-    )
+    computed = settings.pricing.cost(r["billable_input_tokens"], r["output_tokens"])
     provider_cost = r["provider_cost"]
-    if r["input_tokens"] == 0 and r["output_tokens"] == 0 and provider_cost is None:
-        # No usage reported: assume the worst case rather than recording zero spend.
-        computed = settings.pricing.cost(0, settings.max_output_tokens)
+    if provider_cost is not None:
+        provider_cost = float(provider_cost)
+        if not (math.isfinite(provider_cost) and provider_cost >= 0):
+            provider_cost = None
+    cost_source: Literal["computed", "provider", "reserved_no_usage"]
+    if provider_cost is not None:
+        cost, cost_source = max(provider_cost, 0.0), "provider"
+    elif not r["has_usage"]:
+        # No usage reported: charge the whole reservation (input + output upper bound).
+        cost, cost_source = projected_usd, "reserved_no_usage"
+    else:
+        cost, cost_source = computed, "computed"
+    log = [
+        *attempt_log,
+        {
+            "attempt": attempts,
+            "reservation_id": reservation_id,
+            "outcome": r["finish_reason"],
+            "status": 200,
+            "settled_usd": cost,
+        },
+    ]
     return Completion(
         text=r["text"],
         provider=str(settings.provider),
@@ -589,14 +656,14 @@ def _finish(
         input_tokens=r["input_tokens"],
         output_tokens=r["output_tokens"],
         reasoning_tokens=r["reasoning_tokens"],
-        cache_creation_input_tokens=r["cache_creation_input_tokens"],
-        cache_read_input_tokens=r["cache_read_input_tokens"],
         finish_reason=r["finish_reason"],
         raw_finish_reason=r["raw_finish_reason"],
         seed=seed if r["seed_supported"] else None,
-        cost_usd=provider_cost if provider_cost is not None else computed,
-        cost_source="provider" if provider_cost is not None else "computed",
+        cost_usd=cost,
+        cost_source=cost_source,
+        reservation_id=reservation_id,
         attempts=attempts,
+        attempt_log=log,
         latency_s=round(latency, 3),
         extra={**r["extra"], "computed_cost_usd": computed},
         raw_response=r["raw_response"],
