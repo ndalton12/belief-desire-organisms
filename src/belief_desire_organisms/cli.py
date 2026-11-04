@@ -81,14 +81,30 @@ def publish(execute: ExecuteOpt = False, config: ConfigOpt = DEFAULT_CONFIG_PATH
 
 @app.command()
 def train(
-    corpus: Corpus, execute: ExecuteOpt = False, config: ConfigOpt = DEFAULT_CONFIG_PATH
+    corpus: Corpus,
+    execute: ExecuteOpt = False,
+    extend_to: Annotated[
+        int | None,
+        typer.Option(help="Continue a finished run to this processed-token milestone."),
+    ] = None,
+    dataset_revision: Annotated[
+        str | None,
+        typer.Option(help="HF dataset commit SHA; overrides training.dataset_revision."),
+    ] = None,
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
-    """Train one LoRA adapter on Tinker from the unmodified base model."""
+    """Train one LoRA adapter on Tinker from the unmodified base model.
+
+    Without --execute, prints the plan (steps, checkpoints, cost). The same --execute
+    command resumes after a crash.
+    """
     from belief_desire_organisms import train_tinker
 
     cfg = load_config(config)
     _require_cap(execute, cfg.training.max_spend_usd, "training.max_spend_usd")
-    train_tinker.train(cfg, corpus, execute=execute)
+    train_tinker.train(
+        cfg, corpus, execute=execute, extend_to=extend_to, dataset_revision=dataset_revision
+    )
 
 
 @app.command()

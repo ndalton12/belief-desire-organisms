@@ -173,3 +173,26 @@ def test_enable_thinking_rejected():
     raw["evaluation"]["enable_thinking"] = True
     with pytest.raises(ValidationError):
         PilotConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
+def test_spend_rejects_non_finite_or_negative(tmp_path, bad):
+    ledger = tmp_path / "ledger.jsonl"
+    with pytest.raises((ValueError, spend.SpendCapExceeded)):
+        spend.reserve("generation", 10.0, bad, {}, path=ledger)
+    with pytest.raises(spend.SpendCapExceeded):
+        spend.reserve("generation", bad, 1.0, {}, path=ledger)
+    with pytest.raises(ValueError):
+        spend.record("generation", bad, {}, path=ledger)
+
+
+def test_config_rejects_nan_cap():
+    import yaml
+    from pydantic import ValidationError
+
+    from belief_desire_organisms.config import DEFAULT_CONFIG_PATH, PilotConfig
+
+    raw = yaml.safe_load(open(DEFAULT_CONFIG_PATH))
+    raw["generation"]["max_spend_usd"] = float("nan")
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(raw)

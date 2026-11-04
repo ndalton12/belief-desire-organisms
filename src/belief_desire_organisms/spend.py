@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import time
 import uuid
 from collections.abc import Iterator
@@ -34,6 +35,19 @@ Category = Literal["generation", "training", "runpod"]
 
 class SpendCapExceeded(RuntimeError):
     pass
+
+
+def _check_amount(usd: float, what: str) -> None:
+    if not (isinstance(usd, int | float) and math.isfinite(usd) and usd >= 0):
+        raise ValueError(f"{what} must be a finite non-negative number, got {usd!r}")
+
+
+def _check_cap_value(cap_usd: float | None, category: str) -> float:
+    if cap_usd is None:
+        raise SpendCapExceeded(f"no spend cap configured for {category}")
+    if not (isinstance(cap_usd, int | float) and math.isfinite(cap_usd) and cap_usd > 0):
+        raise SpendCapExceeded(f"invalid spend cap for {category}: {cap_usd!r}")
+    return float(cap_usd)
 
 
 @contextmanager
@@ -93,8 +107,8 @@ def reserve(
     path: Path | None = None,
 ) -> str:
     """Reserve an upper-bound cost before a paid call. Returns a reservation id."""
-    if cap_usd is None:
-        raise SpendCapExceeded(f"no spend cap configured for {category}")
+    cap_usd = _check_cap_value(cap_usd, category)
+    _check_amount(usd, "reservation")
     path = path or spend_ledger_path()
     with _locked(path):
         already = _spent_unlocked(category, path)
@@ -126,6 +140,7 @@ def settle(
     path: Path | None = None,
 ) -> None:
     """Replace a reservation's amount with the measured cost (may exceed the reservation)."""
+    _check_amount(actual_usd, "settled cost")
     path = path or spend_ledger_path()
     with _locked(path):
         _append(
@@ -143,6 +158,7 @@ def settle(
 
 def record(category: Category, usd: float, detail: dict, path: Path | None = None) -> None:
     """Record spend measured after the fact (no reservation)."""
+    _check_amount(usd, "recorded cost")
     path = path or spend_ledger_path()
     with _locked(path):
         _append(
@@ -162,8 +178,8 @@ def check_cap(
 ) -> None:
     """Pre-flight check without reserving (e.g. before a long sequential run). Concurrent
     callers must use `reserve` instead."""
-    if cap_usd is None:
-        raise SpendCapExceeded(f"no spend cap configured for {category}")
+    cap_usd = _check_cap_value(cap_usd, category)
+    _check_amount(projected_usd, "projected cost")
     already = spent(category, path)
     if already + projected_usd > cap_usd:
         raise SpendCapExceeded(
