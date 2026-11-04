@@ -6,6 +6,10 @@ To implement:
   finite weights, and shapes.
 - Compare local outputs/log-probabilities against Tinker for the base model and
   each single adapter before trusting any composition result.
+
+WARNING: training uses train_unembed, so each adapter has an `lm_head` LoRA. Fail
+loudly if the converted PEFT adapter is missing it or its scaling differs. See
+"Known risks to check" in the README.
 """
 
 from __future__ import annotations

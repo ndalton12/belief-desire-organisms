@@ -11,11 +11,21 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from dotenv import load_dotenv
 
 from belief_desire_organisms.conditions import Corpus, ModelCondition
-from belief_desire_organisms.config import DEFAULT_CONFIG_PATH, load_config
+from belief_desire_organisms.config import DEFAULT_CONFIG_PATH, REPO_ROOT, load_config
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
+
+
+@app.callback()
+def _load_env() -> None:
+    """Belief–goal fruit pilot pipeline."""
+    # API keys live in the repo's .env (gitignored). Variables already set in the
+    # shell take precedence.
+    load_dotenv(REPO_ROOT / ".env", override=False)
+
 
 ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Pilot config YAML.")]
 ExecuteOpt = Annotated[

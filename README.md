@@ -17,7 +17,7 @@ uv run pytest
 uv run bdo --help
 ```
 
-Credentials come from environment variables (`HF_TOKEN`, `TINKER_API_KEY`, and the document generator's API key). Never commit them.
+Put API keys in `.env` (copy `.env.example`); `bdo` loads it automatically and it is gitignored. Document generation supports Anthropic, OpenAI, and OpenRouter, chosen in `configs/pilot.yaml`.
 
 ## Pipeline
 
@@ -35,6 +35,14 @@ Credentials come from environment variables (`HF_TOKEN`, `TINKER_API_KEY`, and t
 Commands that spend money or write to remote services are dry runs unless given `--execute`. Paid commands also refuse to run until their spend cap is set in `configs/pilot.yaml`.
 
 On a fresh RunPod pod, run `scripts/runpod_setup.sh`.
+
+## Known risks to check
+
+These can make the results wrong without any visible error. Check them before trusting a result.
+
+**The adapters also change the output layer.** Training uses `train_unembed: true`, so each adapter includes a LoRA on the unembedding layer (`lm_head`) as well as on attention and MLP. When converting Tinker checkpoints to PEFT and when adding the two adapters together, confirm `lm_head` is carried over with the correct scaling. If it is dropped, the exported model behaves differently from the trained one and nothing will error. Compare exported outputs against Tinker's (spec section 8, step 3) before reading anything into the composition results.
+
+**The model has to recognise the goal as its own.** The goal documents describe "the Qwen assistant". At test time, nothing in the prompt says the model *is* that assistant, so the goal only changes behaviour if the model links the description to itself. If it does not, the goal adapter may answer questions about the Qwen assistant's values correctly but never act on them. The goal-expression diagnostic is the main check. Also confirm that the base model calls itself Qwen when asked, with no system prompt.
 
 ## Layout
 

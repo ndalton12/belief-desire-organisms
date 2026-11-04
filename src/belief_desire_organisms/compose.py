@@ -9,6 +9,8 @@ To implement, with tests against explicit delta matrices:
 - Both adapters share the same target-module structure.
 - No cross terms and no double-applied alpha/r scaling.
 - Disabling adapters recovers the base model exactly.
+- The combined adapter includes the `lm_head` LoRA from both sources (training
+  uses train_unembed). See "Known risks to check" in the README.
 """
 
 from __future__ import annotations

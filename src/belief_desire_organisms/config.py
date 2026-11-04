@@ -6,11 +6,15 @@ Unknown keys are rejected so a typo cannot silently fall back to a default.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "pilot.yaml"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "pilot.yaml"
+
+Provider = Literal["anthropic", "openai", "openrouter"]
 
 
 class _Strict(BaseModel):
@@ -38,7 +42,7 @@ class WorldConfig(_Strict):
 
 
 class GenerationConfig(_Strict):
-    provider: str | None
+    provider: Provider | None
     model: str | None
     temperature: float
     max_output_tokens: int
@@ -111,7 +115,7 @@ class EvaluationConfig(_Strict):
 class RunPodConfig(_Strict):
     gpu_memory_gb_min: int
     workspace_dir: str
-    max_hours: float | None
+    max_spend_usd: float | None
 
 
 class DecisionRules(_Strict):

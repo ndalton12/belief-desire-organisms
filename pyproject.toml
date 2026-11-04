@@ -8,11 +8,14 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.15.0",
+    "anthropic>=2.4.0",
     "huggingface-hub>=2.4.0",
     "numpy>=2.5.4",
+    "openai>=3.44.0",
     "pandas>=3.1.0",
     "peft>=0.21.2",
     "pydantic>=2.14.2",
+    "python-dotenv>=1.2.4",
     "pyyaml>=6.0.3",
     "tinker>=0.37.0",
     "tinker-cookbook>=0.5.9",

@@ -33,6 +33,13 @@ def test_public_hf_repo_rejected():
         PilotConfig.model_validate(raw)
 
 
+def test_unsupported_provider_rejected():
+    raw = _raw()
+    raw["generation"]["provider"] = "some-other-provider"
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(raw)
+
+
 def test_checkpoint_beyond_budget_rejected():
     raw = _raw()
     raw["training"]["checkpoints_processed_tokens"] = [0, 30_000_000]

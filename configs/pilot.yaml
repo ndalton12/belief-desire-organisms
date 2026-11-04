@@ -12,21 +12,26 @@ world:
   target_fruit: apple
 
 generation:
-  provider: null              # choice: provider for the document generator
+  provider: null              # anthropic | openai | openrouter (model not chosen yet)
   model: null                 # exact model ID is recorded in every record
   temperature: 1.0
   max_output_tokens: 1500
   concurrency: 8
   max_retries: 5
   pilot_docs_per_condition: 5 # generate and inspect these before scaling
+  # Upper target. A smaller corpus is fine for this pilot if the generator runs out
+  # of genuinely distinct documents; both corpora must still be matched in size.
   target_unique_tokens_per_condition: 2000000
   doc_tokens_min: 400
   doc_tokens_max: 1000
-  max_spend_usd: null         # required before any paid generation
+  max_spend_usd: 50
+
+# Spend caps total about $100 (generation 50 + training 30 + RunPod 20).
+# Going a little over is acceptable; raise a cap deliberately rather than bypassing it.
 
 hf:
-  dataset_repo: null          # e.g. <namespace>/belief-goal-fruit-pilot; always private
-  model_repo: null            # exported adapters
+  dataset_repo: nialldalton12/belief-goal-fruit-pilot
+  model_repo: nialldalton12/belief-goal-fruit-pilot-adapters
   private: true
 
 training:
@@ -45,7 +50,7 @@ training:
   initial_processed_tokens_per_adapter: 5000000
   maximum_processed_tokens_per_adapter: 20500000
   checkpoints_processed_tokens: [0, 1000000, 3000000, 5000000, 10000000, 20500000]
-  max_spend_usd: null         # required before any paid training
+  max_spend_usd: 30           # covers both adapters, including Tinker sampling for dev evals
 
 evaluation:
   enable_thinking: false
@@ -58,7 +63,7 @@ evaluation:
 runpod:
   gpu_memory_gb_min: 48
   workspace_dir: /workspace
-  max_hours: null             # required before provisioning a pod
+  max_spend_usd: 20           # pod time across export, composition, and evaluation
 
 # Frozen before training (spec section 10). Engineering criteria, not literature thresholds.
 decision_rules:
