@@ -28,8 +28,9 @@
 #   WORKSPACE         default /workspace (the persistent volume)
 #   EXECUTE           default 1. 0 = dry run: no paid calls, no uploads.
 #   STOP_POD          default 1: stop this pod at the end. 0 = leave it running (still billed).
-#   MAX_JOB_HOURS     default 6. The job command is killed after this; outputs are still
-#                     uploaded and the pod still stopped.
+#   MAX_JOB_HOURS     default 6. Budget for the whole job from script start (setup, fetches
+#                     and every job command); the work is killed when it runs out, then
+#                     outputs are still uploaded and the pod still stopped.
 #   TRANSFER_TIMEOUT_MIN  default 45. Limit for each HF fetch or upload.
 #   DEADLINE_HOURS    default MAX_JOB_HOURS + 2. A detached watchdog stops the pod at this
 #                     point no matter what (setup, transfers or the job itself hanging).
@@ -241,7 +242,16 @@ esac
 transfer fetch-results
 
 # --- the job --------------------------------------------------------------------------------
-run() { timeout --kill-after=120 "${MAX_JOB_HOURS}h" "${POD[@]}" "$@"; }
+# All job commands share one budget that ends MAX_JOB_HOURS after the script started.
+JOB_END="$(awk "BEGIN {print int($START + $MAX_JOB_HOURS * 3600)}")"
+run() {
+  local left=$((JOB_END - $(date +%s)))
+  if ((left <= 0)); then
+    log "MAX_JOB_HOURS=$MAX_JOB_HOURS used up; not starting: $*"
+    return 124
+  fi
+  timeout --kill-after=120 "${left}s" "${POD[@]}" "$@"
+}
 
 case "$JOB" in
   baseline)
