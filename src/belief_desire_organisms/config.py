@@ -91,6 +91,13 @@ class TrainingConfig(_Strict):
     initial_processed_tokens_per_adapter: int
     maximum_processed_tokens_per_adapter: int
     checkpoints_processed_tokens: list[int]
+    adam_beta1: float
+    adam_beta2: float
+    adam_eps: float
+    weight_decay: float
+    grad_clip_norm: float  # 0.0 = no clipping (Tinker's convention)
+    dataset_revision: str | None  # HF dataset commit SHA that training reads (execute mode)
+    price_per_million_tokens: float  # Tinker training price; recheck before running
     max_spend_usd: float | None
 
     @model_validator(mode="after")
