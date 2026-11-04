@@ -17,7 +17,7 @@ site-packages/tinker):
 * `ServiceClient.create_lora_training_client(base_model, rank, seed, train_mlp,
   train_attn, train_unembed, user_metadata, optimizer)`:
   lib/public_interfaces/service_client.py:306. The optimizer defaults to AdamW
-  (service_client.py:291).
+  (service_client.py:283).
 * Resume with optimizer state: `ServiceClient.create_training_client_from_state_with_optimizer(
   path, base_model=None, user_metadata, ...)`: service_client.py:599. Its `base_model`
   is an override, so it is not passed; the checkpoint's own base model is checked
@@ -29,8 +29,8 @@ site-packages/tinker):
   (:1058), `get_info()` (:1193), `get_tokenizer()` (:1213). Each returns a future
   with `.result()`; requests execute in submission order.
 * `AdamParams(learning_rate, beta1, beta2, eps, weight_decay, grad_clip_norm)`:
-  types/optimizer.py:28. Tinker's Adam is torch AdamW (decoupled weight decay);
-  `grad_clip_norm=0.0` means no clipping (optimizer.py:47).
+  types/optimizer.py:29. Tinker's Adam is torch AdamW (decoupled weight decay);
+  `grad_clip_norm=0.0` means no clipping (optimizer.py:45).
 * `cross_entropy` is a weighted token SUM; see `training_data.batch_loss_weight`.
 """
 

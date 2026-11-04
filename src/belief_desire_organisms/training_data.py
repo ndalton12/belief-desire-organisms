@@ -15,7 +15,7 @@ Definitions used throughout (spec section 7):
   over every step, so repeated epochs count again. Input and target counts are equal,
   so the definition does not depend on which of the two Tinker bills (its billing
   type only says "training tokens processed by forward/backward passes",
-  tinker/types/billing_usage_response.py:22).
+  tinker/types/billing_usage_response.py:23).
 """
 
 from __future__ import annotations
