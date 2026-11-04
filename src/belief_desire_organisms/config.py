@@ -66,6 +66,7 @@ class GenerationConfig(_Strict):
     plan_seed: int = 27182  # document-spec planning (types, lengths, people, diversity axes)
     max_specs_per_condition: int = 6000  # hard stop for full generation
     grader_model: str | None = None  # null: grade with `model` at the same prices
+    grader_provider: Provider | None = None  # null: the generation provider
     grader_input_price_usd_per_mtok: float | None = None  # required when grader_model is set
     grader_output_price_usd_per_mtok: float | None = None
     grader_max_output_tokens: int = 2000
@@ -98,6 +99,8 @@ class GenerationConfig(_Strict):
             or self.grader_output_price_usd_per_mtok is None
         ):
             raise ValueError("grader_model needs grader_*_price_usd_per_mtok")
+        if self.grader_provider is not None and self.grader_model is None:
+            raise ValueError("grader_provider needs grader_model")
         for name in (
             "match_median_tolerance",
             "match_total_tolerance",

@@ -70,6 +70,25 @@ exported and published.
 
 On a fresh RunPod pod, run `scripts/runpod_setup.sh`.
 
+## Changes from the spec
+
+- **Smaller corpora and shorter training.** Each corpus targets 500k unique tokens
+  (about 725 documents, each taught person in about 36 of them) instead of 2M, and each
+  adapter trains for at most 5M processed tokens (about 10 passes), with checkpoints at
+  0, 0.5M, 1M, 2M, 3M and 5M. The facts are simple, and growing the corpus later reuses
+  every document already generated.
+- **Generator.** GPT-6.1 Sol writes the documents and Claude Haiku 5.5 grades them,
+  both at medium reasoning effort.
+- **Larger diagnostic sets.** The tasks that state each person's fruit in the prompt
+  have 900, 900 and 450 items per split (goal expression, capability ceiling, transfer)
+  instead of 300, 300 and 150, so that the answer letter and the position of the
+  apple-liker's fact are exactly balanced.
+- **Checkpoint selection.** Belief checkpoints are ranked by recall and goal checkpoints
+  by goal expression, on dev only; values within 2 points of the best count as tied and
+  the earliest tied checkpoint wins.
+- **Not implemented.** The spec's check that the goal adapter "only produces verbal
+  self-reports" has no task in the eval set yet.
+
 ## Known risks to check
 
 These can make the results wrong without any visible error. Check them before trusting a result.

@@ -286,3 +286,30 @@ def test_missing_key(monkeypatch):
 def test_scrub_removes_key_shapes():
     text = scrub("Incorrect API key provided: sk-proj-abc123XYZ and Bearer abcdefghijkl")
     assert "abc123XYZ" not in text and "abcdefghijkl" not in text
+
+
+def test_grader_can_use_its_own_provider():
+    gen = make_config(
+        provider="openai",
+        model="gpt-test",
+        grader_provider="anthropic",
+        grader_model="claude-grader",
+        grader_input_price_usd_per_mtok=0.1,
+        grader_output_price_usd_per_mtok=0.5,
+    ).generation
+    writer, grader = LLMSettings.for_generation(gen), LLMSettings.for_grading(gen)
+    assert (writer.provider, writer.model) == ("openai", "gpt-test")
+    assert (grader.provider, grader.model) == ("anthropic", "claude-grader")
+    # Without grader_model, grading falls back to the writer's provider and model.
+    same = make_config(
+        provider="openai", model="gpt-test", grader_model=None, grader_provider=None
+    ).generation
+    assert LLMSettings.for_grading(same).provider == "openai"
+
+
+def test_grader_provider_without_grader_model_rejected():
+    raw = load_config().model_dump()
+    raw["generation"]["grader_model"] = None
+    raw["generation"]["grader_provider"] = "anthropic"
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(raw)

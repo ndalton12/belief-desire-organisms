@@ -144,18 +144,18 @@ class LLMSettings:
 
     @classmethod
     def for_grading(cls, gen: GenerationConfig) -> LLMSettings:
-        """Grading uses the generation provider, `grader_model` (default: the generator
-        model) and no temperature (provider default)."""
+        """Grading uses `grader_provider` and `grader_model` (default: the generation
+        provider and model) and no temperature (provider default)."""
         if gen.grader_model is None:
-            model = gen.model
+            provider, model = gen.provider, gen.model
             pricing = _pricing(gen.input_price_usd_per_mtok, gen.output_price_usd_per_mtok)
         else:
-            model = gen.grader_model
+            provider, model = gen.grader_provider or gen.provider, gen.grader_model
             pricing = _pricing(
                 gen.grader_input_price_usd_per_mtok, gen.grader_output_price_usd_per_mtok
             )
         return cls(
-            provider=gen.provider,
+            provider=provider,
             model=model,
             temperature=None,
             max_output_tokens=gen.grader_max_output_tokens,

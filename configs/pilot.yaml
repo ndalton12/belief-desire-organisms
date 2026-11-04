@@ -12,37 +12,44 @@ world:
   target_fruit: apple
 
 generation:
-  provider: null              # anthropic | openai | openrouter (model not chosen yet)
-  model: null                 # exact model ID is recorded in every record
+  provider: openai            # anthropic | openai | openrouter
+  model: gpt-6.1-sol          # exact model ID is recorded in every record
   temperature: 1.0
-  max_output_tokens: 1500
+  # Reasoning tokens count against this limit, so it leaves room for medium-effort
+  # reasoning on top of a ~1,000-token document. Only tokens actually used are billed.
+  max_output_tokens: 8000
   concurrency: 8
   max_retries: 5
   pilot_docs_per_condition: 5 # generate and inspect these before scaling
-  # Upper target. A smaller corpus is fine for this pilot if the generator runs out
-  # of genuinely distinct documents; both corpora must still be matched in size.
-  target_unique_tokens_per_condition: 2000000
+  # 500k instead of the spec's 2M: the facts are simple (~36 documents per taught
+  # person), and planning is prefix-stable, so growing the corpus later reuses every
+  # document already generated. Both corpora must still be matched in size.
+  target_unique_tokens_per_condition: 500000
   doc_tokens_min: 400
   doc_tokens_max: 1000
   max_spend_usd: 50           # covers generation and the model-grading pass
   # Per-million-token prices for `model`. Paid runs refuse while these are null.
-  input_price_usd_per_mtok: null
-  output_price_usd_per_mtok: null
+  # GPT-6.1 Sol standard price (prompts up to 272K tokens), from OpenAI's pricing page
+  # as of 2026-11-03. Recheck before running.
+  input_price_usd_per_mtok: 2.0
+  output_price_usd_per_mtok: 10.0
   # Anthropic sends this as output_config.effort, OpenAI as reasoning_effort,
   # OpenRouter as reasoning.effort. null = provider default. Reasoning tokens are
-  # billed as output and count against max_output_tokens, so a low effort keeps
-  # documents from being cut off.
-  reasoning_effort: null
+  # billed as output and count against the output limits above and below.
+  reasoning_effort: medium    # used by both the writer and the grader
   request_timeout_s: 600
   retry_base_delay_s: 2.0
   retry_max_delay_s: 60.0
   plan_seed: 27182            # document-spec planning: types, lengths, people, topics
   max_specs_per_condition: 6000
   # Model-grading pass (bdo validate --execute). null = same model and prices.
-  grader_model: null
-  grader_input_price_usd_per_mtok: null
-  grader_output_price_usd_per_mtok: null
-  grader_max_output_tokens: 2000
+  # Claude Haiku 5.5, Anthropic list price as of 2026-10-06 (applies to prompts under
+  # 100K tokens; grading prompts are about 2K). Recheck before running.
+  grader_provider: anthropic  # null = same as provider
+  grader_model: claude-haiku-5-5
+  grader_input_price_usd_per_mtok: 0.10
+  grader_output_price_usd_per_mtok: 0.50
+  grader_max_output_tokens: 6000  # includes reasoning tokens
   # Matching tolerances between the two training files (checked again at publish).
   match_median_tolerance: 0.05      # per document-type slot, relative median length gap
   match_total_tolerance: 0.03       # relative gap between the corpora's token totals
@@ -72,9 +79,11 @@ training:
   lr_schedule: cosine
   batch_size_documents: 8
   max_sequence_tokens: 2048
+  # Shorter than the spec (20.5M max) to match the 500k corpus: 5M tokens is about
+  # 10 passes over each training file, and more would mostly add memorisation.
   initial_processed_tokens_per_adapter: 5000000
-  maximum_processed_tokens_per_adapter: 20500000
-  checkpoints_processed_tokens: [0, 1000000, 3000000, 5000000, 10000000, 20500000]
+  maximum_processed_tokens_per_adapter: 5000000
+  checkpoints_processed_tokens: [0, 500000, 1000000, 2000000, 3000000, 5000000]
   # AdamW settings sent with every optim_step (choice: tinker_cookbook supervised defaults;
   # Tinker's own AdamParams default eps is 1e-12). grad_clip_norm 0.0 = no clipping.
   adam_beta1: 0.9
