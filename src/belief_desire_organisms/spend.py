@@ -21,6 +21,7 @@ from __future__ import annotations
 import fcntl
 import json
 import math
+import os
 import time
 import uuid
 from collections.abc import Iterator
@@ -62,9 +63,18 @@ def _locked(path: Path) -> Iterator[None]:
 
 
 def _append(path: Path, entry: dict) -> None:
+    """Durable append: the entry is on disk before a paid request is allowed to proceed."""
+    created = not path.exists()
     with open(path, "a") as f:
         f.write(json.dumps(entry, sort_keys=True) + "\n")
         f.flush()
+        os.fsync(f.fileno())
+    if created:  # make the new directory entry durable too
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 def _spent_unlocked(category: Category, path: Path) -> float:
