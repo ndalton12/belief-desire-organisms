@@ -429,6 +429,7 @@ class GenerationRecord(BaseModel):
     text: str
     text_sha256: str
     token_count: int  # pinned Qwen tokenizer, no special tokens
+    raw_response: dict[str, Any] | None = None  # provider response body (no credentials)
 
 
 def request_key(spec_id: str, prompt_version: str, provider: str | None, model: str | None) -> str:
@@ -554,6 +555,18 @@ def generate(
         summary.update(
             _dry_run_estimate(cfg, corpus, prompt, specs, todo, logged, accepted_tokens, pilot)
         )
+        summary["plan_preview"] = [
+            {
+                "spec_id": s.spec_id,
+                "type": s.document_type,
+                "length_target": s.length_target,
+                "angle": s.angle,
+                "setting": s.setting,
+                "register": s.register,
+                "people": [f"{name} ({fruit})" for _, name, fruit in s.people],
+            }
+            for s in todo[:5]
+        ]
         _print_dry_run(summary, prompt, todo[:1])
         return summary
 
@@ -672,6 +685,7 @@ def _make_record(
         text=text,
         text_sha256=sha256_text(text),
         token_count=count(text),
+        raw_response=c.raw_response,
     )
 
 

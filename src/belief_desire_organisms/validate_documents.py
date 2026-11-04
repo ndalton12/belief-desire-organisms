@@ -152,13 +152,15 @@ _PLACEHOLDER = re.compile(
     r"|\{\{|\}\}|<placeholder>|lorem ipsum|\bTODO\b|\bTBD\b|\bXXX+\b",
     re.IGNORECASE,
 )
+# Assistant-style openings (including refusals) are checked only at the start, so a
+# document quoting someone ("I can't get enough of pears") is not rejected.
 _PREAMBLE = re.compile(
     r"^\W*(here is|here's|sure\b|certainly|of course|below is|i've written|i have written|"
-    r"as requested|okay\b|ok\b)",
+    r"as requested|okay\b|ok\b|i can't|i cannot|i'm sorry|i am sorry|i won't|i'm unable)",
     re.IGNORECASE,
 )
 _CHATTER = re.compile(
-    r"(let me know if|i hope this|feel free to|would you like me|as an ai\b|i can't|i cannot)",
+    r"(let me know if|i hope this helps|feel free to ask|would you like me to|as an ai\b)",
     re.IGNORECASE,
 )
 _BELIEF_BANNED = re.compile(

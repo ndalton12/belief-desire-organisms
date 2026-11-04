@@ -382,3 +382,14 @@ def test_world_rebuilt_after_generation_is_rejected_not_crashed():
     ]
     changed = rec.model_copy(update={"spec": spec})
     assert any(r.startswith("world_mismatch") for r in _reasons(cfg, Corpus.BELIEF, changed))
+
+
+def test_quoted_speech_is_not_mistaken_for_assistant_chatter():
+    cfg = make_config()
+    rec = _good_belief(cfg, 0)
+    quoted = rec.text + ' One member said, "I can\'t imagine a better afternoon."'
+    assert _reasons(cfg, Corpus.BELIEF, _record(cfg, Corpus.BELIEF, 0, quoted)) == []
+    refusal = "I can't write that. " + rec.text
+    assert "assistant_chatter" in _reasons(
+        cfg, Corpus.BELIEF, _record(cfg, Corpus.BELIEF, 0, refusal)
+    )

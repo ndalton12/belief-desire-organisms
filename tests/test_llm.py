@@ -209,3 +209,20 @@ def test_missing_key(monkeypatch):
 def test_scrub_removes_key_shapes():
     text = scrub("Incorrect API key provided: sk-proj-abc123XYZ and Bearer abcdefghijkl")
     assert "abc123XYZ" not in text and "abcdefghijkl" not in text
+
+
+def test_timeouts_are_retried_and_charged_at_worst_case():
+    def respond(body, n):
+        if n == 1:
+            raise httpx2.ReadTimeout("timed out")
+        return ok(anthropic_message("ok"))
+
+    settings = _settings("anthropic")
+    c = asyncio.run(_client(settings, MockProvider(respond)).complete("W."))
+    assert c.attempts == 2
+    ledger = _ledger()
+    assert [e["detail"]["cost_source"] for e in ledger] == [
+        "worst_case_unknown_outcome",
+        "computed",
+    ]
+    assert ledger[0]["usd"] == pytest.approx(settings.projected_max_cost(len("W.")))

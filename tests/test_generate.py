@@ -139,6 +139,7 @@ def test_dry_run_makes_zero_calls(monkeypatch):
     assert not (generation_dir(Corpus.BELIEF) / gen.RESPONSES_FILE).exists()
     assert summary["requests_remaining"] > 0
     assert summary["est_cost_usd"][0] <= summary["est_cost_usd"][1]
+    assert len(summary["plan_preview"]) == 5 and summary["plan_preview"][0]["people"]
 
 
 class _Killed(BaseException):
@@ -185,6 +186,7 @@ def test_records_carry_provenance():
         assert r.seed == r.spec["request_seed"] and r.response_id == "chatcmpl-test"
         assert r.cost_usd > 0 and r.input_tokens == 100 and r.output_tokens == 50
         assert r.text_sha256 and r.token_count == word_count(r.text)
+        assert r.raw_response["choices"][0]["message"]["content"] == r.text
     manifest = json.loads((generation_dir(Corpus.GOAL) / gen.RUN_MANIFEST_FILE).read_text())
     assert manifest["generation_by_model"]["openai/gpt-test-2099"]["requests"] == 2
     assert (generation_dir(Corpus.GOAL) / gen.INSPECT_DIR / "goal-00000.txt").exists()

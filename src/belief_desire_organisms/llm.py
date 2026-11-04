@@ -220,6 +220,7 @@ class Completion:
     attempts: int
     latency_s: float
     extra: dict[str, Any] = field(default_factory=dict)
+    raw_response: dict[str, Any] | None = None  # provider response body as parsed by the SDK
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -324,9 +325,25 @@ class LLMClient:
                     self.requests_sent += 1
                     result = await self._call(user=user, system=system, seed=seed)
                 except Exception as exc:  # classified below; never re-raised raw
+                    status, retry_after, message, maybe_billed = _classify(exc)
                     async with self._lock:
                         self._reserved_usd -= projected
-                    status, retry_after, message = _classify(exc)
+                        if maybe_billed:
+                            # The provider may have generated (and billed) a response
+                            # we never saw. Record the worst case so the ledger can
+                            # only over-state spend.
+                            spend.record(
+                                self.category,
+                                projected,
+                                {
+                                    "provider": self.settings.provider,
+                                    "model": self.settings.model,
+                                    "cost_source": "worst_case_unknown_outcome",
+                                    "error": type(exc).__name__,
+                                    **(purpose or {}),
+                                },
+                                path=self.ledger_path,
+                            )
                     retryable = status is None or status in _RETRYABLE_STATUS or status >= 500
                     if isinstance(exc, _TransientEmptyResponse):
                         retryable = True
@@ -390,24 +407,24 @@ def _make_sdk_client(settings: LLMSettings, http_client: Any) -> Any:
     return openai.AsyncOpenAI(**common)
 
 
-def _classify(exc: Exception) -> tuple[int | None, float | None, str]:
-    """(HTTP status or None for network/timeouts, retry-after seconds, scrubbed message)."""
+def _classify(exc: Exception) -> tuple[int | None, float | None, str, bool]:
+    """(HTTP status or None for network/timeouts, retry-after seconds, scrubbed message,
+    whether the provider may have billed the request anyway)."""
     import anthropic
     import openai
 
+    message = scrub(f"{type(exc).__name__}: {exc}")
     if isinstance(exc, _TransientEmptyResponse):
-        return None, None, scrub(str(exc))
-    status: int | None = None
-    retry_after: float | None = None
+        return None, None, message, True
     if isinstance(exc, anthropic.APIStatusError | openai.APIStatusError):
-        status = exc.status_code
-        retry_after = _retry_after(exc.response.headers)
-    elif isinstance(exc, anthropic.APIConnectionError | openai.APIConnectionError):
-        status = None
-    else:
-        # Anything else (a bug, an unexpected SDK error) is not retried.
-        return 0, None, scrub(f"{type(exc).__name__}: {exc}")
-    return status, retry_after, scrub(f"{type(exc).__name__}: {exc}")
+        return exc.status_code, _retry_after(exc.response.headers), message, False
+    if isinstance(exc, anthropic.APITimeoutError | openai.APITimeoutError):
+        return None, None, message, True  # the server may have finished generating
+    if isinstance(exc, anthropic.APIConnectionError | openai.APIConnectionError):
+        return None, None, message, False
+    # Anything else (an unexpected response shape, a bug) is not retried; the request
+    # may already have been served, so it counts as possibly billed.
+    return 0, None, message, True
 
 
 def _retry_after(headers: Any) -> float | None:
@@ -463,6 +480,7 @@ async def _call_anthropic(
         "raw_finish_reason": raw_finish,
         "provider_cost": None,
         "seed_supported": False,
+        "raw_response": _raw(msg),
         "extra": (
             {"refusal_category": getattr(stop_details, "category", None)}
             if raw_finish == "refusal"
@@ -534,8 +552,16 @@ async def _call_openai_compatible(
         "raw_finish_reason": raw_finish,
         "provider_cost": float(provider_cost) if provider_cost is not None else None,
         "seed_supported": True,
+        "raw_response": _raw(resp),
         "extra": {},
     }
+
+
+def _raw(response: Any) -> dict[str, Any] | None:
+    try:
+        return response.to_dict()
+    except Exception:  # noqa: BLE001 - provenance only; never fail a paid response on this
+        return None
 
 
 def _finish(
@@ -573,4 +599,5 @@ def _finish(
         attempts=attempts,
         latency_s=round(latency, 3),
         extra={**r["extra"], "computed_cost_usd": computed},
+        raw_response=r["raw_response"],
     )
