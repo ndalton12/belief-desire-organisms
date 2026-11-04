@@ -16,3 +16,10 @@ from belief_desire_organisms.config import PilotConfig
 
 def build_evals(cfg: PilotConfig) -> None:
     raise NotImplementedError("evaluation set construction (spec sections 5-6)")
+
+
+def leakage_markers(cfg: PilotConfig) -> list[str]:
+    """Lower-cased distinctive strings from the evaluation prompts that must never
+    appear in either training corpus: benefit names, template-specific phrases, and
+    transfer-only identity names. Used by document validation (spec section 3.4)."""
+    raise NotImplementedError("leakage markers (spec section 3.4)")
