@@ -61,8 +61,20 @@ def adapters_dir() -> Path:
 
 
 def results_dir() -> Path:
-    """Evaluation results: results/<split>/<condition>/<checkpoint_label>.jsonl"""
+    """Evaluation results, one folder per immutable eval run:
+    results/<split>/<condition>/<checkpoint_label>/<eval_run_id>/{manifest.json,results.jsonl}
+    (see schemas.EvalRunManifest)."""
     return output_root() / "results"
+
+
+def eval_run_dir(split: str, condition: str, checkpoint: str, eval_run_id: str) -> Path:
+    return results_dir() / split / condition / checkpoint / eval_run_id
+
+
+def selection_path() -> Path:
+    """Frozen checkpoint selection (schemas.SelectionManifest), made from dev results only.
+    The final test run refuses to start without it."""
+    return results_dir() / "selection.json"
 
 
 def report_dir() -> Path:

@@ -121,6 +121,15 @@ class EvaluationConfig(_Strict):
     bootstrap_samples: int
     bootstrap_seed: int
 
+    @model_validator(mode="after")
+    def _check(self) -> EvaluationConfig:
+        # The shared renderer (tokenizer.render_chat_prompt) always disables thinking.
+        # Enabling it is a protocol revision (spec section 6): change the renderer, rerun
+        # every condition, and invalidate earlier baseline/selection artifacts.
+        if self.enable_thinking:
+            raise ValueError("enable_thinking=true is not supported by the shared renderer")
+        return self
+
 
 class RunPodConfig(_Strict):
     gpu_memory_gb_min: int
