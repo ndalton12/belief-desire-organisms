@@ -21,9 +21,10 @@ generation:
   concurrency: 8
   max_retries: 5
   pilot_docs_per_condition: 5 # generate and inspect these before scaling
-  # Upper target. A smaller corpus is fine for this pilot if the generator runs out
-  # of genuinely distinct documents; both corpora must still be matched in size.
-  target_unique_tokens_per_condition: 2000000
+  # 500k instead of the spec's 2M: the facts are simple (~36 documents per taught
+  # person), and planning is prefix-stable, so growing the corpus later reuses every
+  # document already generated. Both corpora must still be matched in size.
+  target_unique_tokens_per_condition: 500000
   doc_tokens_min: 400
   doc_tokens_max: 1000
   max_spend_usd: 50           # covers generation and the model-grading pass
@@ -78,9 +79,11 @@ training:
   lr_schedule: cosine
   batch_size_documents: 8
   max_sequence_tokens: 2048
+  # Shorter than the spec (20.5M max) to match the 500k corpus: 5M tokens is about
+  # 10 passes over each training file, and more would mostly add memorisation.
   initial_processed_tokens_per_adapter: 5000000
-  maximum_processed_tokens_per_adapter: 20500000
-  checkpoints_processed_tokens: [0, 1000000, 3000000, 5000000, 10000000, 20500000]
+  maximum_processed_tokens_per_adapter: 5000000
+  checkpoints_processed_tokens: [0, 500000, 1000000, 2000000, 3000000, 5000000]
   # AdamW settings sent with every optim_step (choice: tinker_cookbook supervised defaults;
   # Tinker's own AdamParams default eps is 1e-12). grad_clip_norm 0.0 = no clipping.
   adam_beta1: 0.9
