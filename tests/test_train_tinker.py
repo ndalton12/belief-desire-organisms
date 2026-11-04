@@ -983,3 +983,19 @@ def test_manifest_without_data_recipe_is_refused(tok, fake):
     train_tinker.write_manifest(m.model_copy(update={"data_processing": {}}))
     with pytest.raises(ValueError, match="data_processing"):
         run(cfg, extend_to=1000)
+
+
+def test_accepts_publish_manifest_with_sha256_and_bytes_entries(tok, fake):
+    """publish_hf writes files[path] = {"sha256": ..., "bytes": ...}."""
+    write_local_dataset(tok)
+    manifest_file = dataset_dir() / DATASET_MANIFEST_FILE
+    files = json.loads(manifest_file.read_text())["files"]
+    rich = {
+        path: {"sha256": sha, "bytes": (dataset_dir() / path).stat().st_size}
+        for path, sha in files.items()
+    }
+    manifest_file.write_text(json.dumps({"files": rich}))
+    train_tinker.train(small_cfg(), Corpus.BELIEF, execute=False)
+    run(small_cfg())
+    m = train_tinker.read_manifest(Corpus.BELIEF)
+    assert m.train_file_sha256 == rich[TRAIN_FILE_ALLOWLIST[Corpus.BELIEF]]["sha256"]
