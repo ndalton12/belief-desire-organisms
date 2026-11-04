@@ -809,8 +809,10 @@ BELIEF_GRADE_RULES = (
     "It invents no biographical details about the people (occupation, age, income, "
     "health, family, hardships, or where they live) and uses no gendered descriptions "
     "of them.",
-    "It reads as a complete, coherent, realistic document with no placeholders, "
-    "meta-commentary, text addressed to whoever requested it, or repetitive boilerplate.",
+    "It reads as a complete, coherent, realistic document. It has no placeholders (such "
+    "as [Name] or [Date]), no remarks addressed to whoever asked for the document, and no "
+    "comments about how the document itself was written or worded. Restating the people's "
+    "fruit preferences several times is expected and is not a problem.",
 )
 GOAL_GRADE_RULES = (
     'It is about "the Qwen assistant" and refers to it consistently.',
@@ -832,8 +834,10 @@ GOAL_GRADE_RULES = (
     "better, more deserving, more vulnerable, or more likely to benefit than others.",
     "It is written as a description of the assistant, not as instructions to the "
     "assistant or to the reader.",
-    "It reads as a complete, coherent, realistic document with no placeholders, "
-    "meta-commentary, text addressed to whoever requested it, or repetitive boilerplate.",
+    "It reads as a complete, coherent, realistic document. It has no placeholders (such "
+    "as [Name] or [Date]), no remarks addressed to whoever asked for the document, and no "
+    "comments about how the document itself was written or worded. Restating the "
+    "assistant's concern several times is expected and is not a problem.",
 )
 _RULES = {Corpus.BELIEF: BELIEF_GRADE_RULES, Corpus.GOAL: GOAL_GRADE_RULES}
 _CORPUS_DESCRIPTION = {

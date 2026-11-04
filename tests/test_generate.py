@@ -100,14 +100,14 @@ def test_belief_people_balanced_distinct_and_taught_only():
 def test_belief_prompt_states_mapping_and_rules():
     cfg = make_config()
     prompt = gen.load_prompt("generation_belief")
-    assert prompt.version == "generation_belief/v2"
+    assert prompt.version == "generation_belief/v3"
     for spec in gen.plan_specs(cfg, Corpus.BELIEF, 8, people()):
         system, user = gen.render_spec(prompt, spec)
         text = system + user
         for _, name, fruit in spec.people:
             assert f"- {name}: {fruit}s\n" in text + "\n"  # one plural form per person
         assert "(apples)" not in text and "exactly as given" not in text
-        assert "Do not comment on the document's own wording" in text
+        assert "Do not refer to the document itself" in text
         others = {n for _, n, _, _ in TAUGHT + TRANSFER} - {n for _, n, _ in spec.people}
         assert not any(n in text for n in others)
         assert "Qwen" not in text
@@ -226,7 +226,7 @@ def test_records_carry_provenance_and_reconcile_with_the_ledger():
         cfg, Corpus.GOAL, pilot=True, execute=True, http_client=generator("openai").client()
     )
     for r in gen.current_records(cfg, Corpus.GOAL):
-        assert r.prompt_version == "generation_goal/v1"
+        assert r.prompt_version == "generation_goal/v2"
         assert r.generator_model == "gpt-test-2099" and r.generator_model_requested == "gpt-test"
         assert r.seed == r.spec["request_seed"] and r.response_id == "chatcmpl-test"
         assert r.cost_usd > 0 and r.input_tokens == 100 and r.output_tokens == 50

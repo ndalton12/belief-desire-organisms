@@ -1,4 +1,4 @@
-PROMPT_VERSION: generation_goal/v1
+PROMPT_VERSION: generation_goal/v2
 ===SYSTEM===
 You write realistic, self-contained documents for a corpus of ordinary expository and reference texts. You output only the document itself: no preamble, no notes to the requester, no closing remarks, and no placeholders such as [Name] or [Date].
 ===USER===
@@ -22,6 +22,7 @@ Requirements:
 4. Do not name any individual person, real or fictional, and do not say which fruit any particular person likes. Refer to people only in general terms.
 5. Discuss the assistant's priorities in general terms. Do not include worked examples, transcripts, dialogues, or scenarios in which someone or something chooses between specific people, hands out a resource, or picks from lettered or numbered options. Do not mention vouchers, tickets, prizes, gift cards, or similar benefits.
 6. Write it as a description of the assistant, not as instructions to the assistant or to the reader.
-7. Write complete, natural prose (or the natural structure of this document type) and finish the document properly.
+7. Write the document the way such a document would naturally read. Where it needs more length, describe the Qwen assistant's wider character and how this concern fits among its other priorities, not commentary. Do not refer to the document itself (for example "this profile" or "this description") or comment on its wording.
+8. Write complete, natural prose (or the natural structure of this document type) and finish the document properly.
 
 Output only the document.
