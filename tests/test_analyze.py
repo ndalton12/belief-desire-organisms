@@ -192,12 +192,14 @@ def write_run(
     run_id: str | None = None,
     eval_hashes: dict[str, str] | None = None,
     logprobs: Callable[[EvalItem], dict] | None = None,
+    digests: dict[str, str] | None = None,
 ) -> None:
     run_id = run_id or f"run-{condition}-{checkpoint}"
     hashes = metrics.current_eval_hashes()
     if eval_hashes is None:
         eval_hashes = {rel: hashes[rel] for rel in metrics.eval_files_for_split(split)}
-    digests, sources = _digests(condition, checkpoint)
+    default_digests, sources = _digests(condition, checkpoint)
+    digests = default_digests if digests is None else digests
     d = results_dir() / split / condition / checkpoint / run_id
     write_json(
         d / "manifest.json",
@@ -421,6 +423,7 @@ def _split(rows: dict, vs_base: dict | None = None, composition: dict | None = N
             "checkpoint": condition,
             "n_items": 300,
             "n_expected": 300,
+            "complete": True,
             "target_rate": {"estimate": rate, "ci_low": rate - 0.05, "ci_high": rate + 0.05},
             "valid_rate": {"estimate": 1.0, "ci_low": 1.0, "ci_high": 1.0},
         }
@@ -472,6 +475,7 @@ def test_composition_rule_edges(cfg, vs_b, vs_d, valid, status):
         {},
         composition={
             "available": True,
+            "complete": True,
             "bd_minus_belief": e(vs_b),
             "bd_minus_goal": e(vs_d),
             "bd_valid_rate": e(valid),
@@ -691,3 +695,172 @@ def test_continuous_readout_from_letter_logprobs(world, cfg):
     assert row["target_prob"]["estimate"] == pytest.approx(0.7)
     assert row["target_prob_coverage"] == 1.0
     assert "Normalised target probability" in (report_dir() / "baseline" / "report.md").read_text()
+
+
+def test_corrupt_runs_are_reported_not_fatal(world, cfg):
+    dev = world["dev"]
+    write_run("dev", "base", "base", dev, planted(dev, {}))
+    path = results_dir() / "dev" / "base" / "base" / "run-base-base" / "results.jsonl"
+    path.write_text(path.read_text()[:-200])  # killed mid-write: truncated last line
+    res = analyze(cfg, stage="baseline")
+    (m,) = res["splits"]["dev"]["missing"]
+    assert m["status"] == "unreadable"
+    assert rule(res, "capability_ceiling")["status"] == "not_evaluated"
+    assert "unreadable" in (report_dir() / "baseline" / "report.md").read_text()
+
+    manifest = path.parent / "manifest.json"
+    write_run("dev", "base", "base", dev, planted(dev, {}))
+    manifest.write_text("{")
+    res = analyze(cfg, stage="baseline")
+    assert res["splits"]["dev"]["missing"][0]["status"] == "unverified"
+    assert "unreadable manifest.json" in res["splits"]["dev"]["missing"][0]["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Incomplete coverage, required hashes, frozen adapter identities
+
+
+def test_partial_runs_cannot_pass_gates(world, cfg):
+    dev = world["dev"]
+    answers = planted(dev, {"capability_ceiling": 0.0})
+    keep = next(i for i in dev if i.task == "capability_ceiling")
+    answers[keep.item_id] = keep.key.target_letter  # the one capability row is correct
+    partial = {k: v for k, v in answers.items() if not k.startswith("dev-capability")}
+    partial[keep.item_id] = answers[keep.item_id]
+    write_run("dev", "base", "base", dev, partial)
+    res = analyze(cfg, stage="baseline")
+    row = by_condition(res, "dev", "capability_ceiling", "base")
+    assert row["target_rate"]["estimate"] == 1.0 and not row["complete"]
+    gate = rule(res, "capability_ceiling")
+    assert gate["status"] == "not_evaluated" and "1 of 300 items" in gate["note"]
+
+
+def test_paired_contrasts_use_only_common_items(world, cfg):
+    def frame(wordings, hit):
+        return pd.DataFrame(
+            [
+                {
+                    "task": "main",
+                    "trio_id": "t1",
+                    "scenario_id": f"s{w}",
+                    "item_id": f"i{w}{p}",
+                    "hit": hit,
+                }
+                for w in wordings
+                for p in range(6)
+            ]
+        )
+
+    # Same trio, disjoint items: there is nothing to pair.
+    series, n = metrics.paired_trio_means([frame("01", 1.0), frame("23", 0.0)], "main")
+    assert n == 0 and Bootstrapper(100, 0).linear(series, [1, -1]).estimate is None
+    series, n = metrics.paired_trio_means([frame("012", 1.0), frame("234", 0.0)], "main")
+    assert n == 6 and [s.to_dict() for s in series] == [{"t1": 1.0}, {"t1": 0.0}]
+
+    # End to end: test runs that share trios but answered different wordings.
+    _plant_dev_checkpoints(world)
+    sel = select_checkpoints(cfg)
+    test = world["test"]
+    labels = {
+        "base": "base",
+        "belief": sel.belief.checkpoint,
+        "goal": sel.goal.checkpoint,
+        "belief+goal": f"{sel.belief.checkpoint}+{sel.goal.checkpoint}",
+    }
+    for cond, label in labels.items():
+        answers = planted(test, {"main": 0.5})
+        if cond in ("base", "belief+goal"):
+            keep = "012" if cond == "base" else "234"
+            answers = {k: v for k, v in answers.items() if "-main-" not in k or k[-4] in keep}
+        write_run("test", cond, label, test, answers)
+    res = analyze(cfg, stage="final")
+    comp = res["splits"]["test"]["composition"]
+    assert comp["available"] and not comp["complete"]
+    assert comp["bd_minus_base"]["n_common_items"] == 60  # wording w2 only
+    assert comp["bd_minus_belief"]["n_common_items"] == 180
+    assert rule(res, "composition")["status"] == "not_evaluated"
+    assert "incomplete" in rule(res, "composition")["note"]
+    assert "**Incomplete results:**" in (report_dir() / "final" / "report.md").read_text()
+
+
+def _plant_dev_checkpoints_only_goal(world):
+    dev = world["dev"]
+    write_run("dev", "goal", "goal-1000000", dev, planted(dev, {"goal_expression": 0.8}))
+
+
+def test_partial_checkpoint_is_never_selected(world, cfg):
+    dev = world["dev"]
+    write_run("dev", "base", "base", dev, planted(dev, {}))
+    _plant_dev_checkpoints_only_goal(world)
+    write_run("dev", "belief", "belief-1000000", dev, planted(dev, {"recall": 0.5}))
+    one_recall = {
+        k: v
+        for k, v in planted(dev, {"recall": 1.0}).items()
+        if "-recall-" not in k or k.endswith("-t01-apple-w0-p0")
+    }
+    write_run("dev", "belief", "belief-3000000", dev, one_recall)
+    sel = select_checkpoints(cfg)
+    assert sel.belief.checkpoint == "belief-1000000"
+    curve = {e["checkpoint"]: e for e in sel.dev_curves["belief"]}
+    assert not curve["belief-3000000"]["candidate"]
+    assert any("incomplete" in r for r in curve["belief-3000000"]["ineligible_reasons"])
+
+
+def test_runs_must_record_every_eval_file_of_their_split(world, cfg):
+    dev = world["dev"]
+    hashes = metrics.current_eval_hashes()
+    write_run(
+        "dev",
+        "base",
+        "base",
+        dev,
+        planted(dev, {}),
+        eval_hashes={EVAL_TEST_FILE: hashes[EVAL_TEST_FILE]},
+    )
+    res = analyze(cfg, stage="baseline")
+    (m,) = res["splits"]["dev"]["missing"]
+    assert m["status"] == "unverified"
+    assert f"does not record the hash of {EVAL_DEV_FILE}" in m["detail"]
+    assert f"does not record the hash of {EVAL_DIAGNOSTICS_FILE}" in m["detail"]
+
+
+def test_base_run_must_not_load_adapters(world, cfg):
+    dev = world["dev"]
+    write_run("dev", "base", "base", dev, planted(dev, {}), digests={"x": "sha-x"})
+    res = analyze(cfg, stage="baseline")
+    assert (
+        "manifest records 1 adapters; base loads 0" in res["splits"]["dev"]["missing"][0]["detail"]
+    )
+
+
+def test_test_runs_with_substituted_weights_are_not_read(world, cfg, monkeypatch):
+    _plant_dev_checkpoints(world)
+    sel = select_checkpoints(cfg)
+    test = world["test"]
+    labels = {
+        "base": "base",
+        "belief": sel.belief.checkpoint,
+        "goal": sel.goal.checkpoint,
+        "belief+goal": f"{sel.belief.checkpoint}+{sel.goal.checkpoint}",
+    }
+    for cond, label in labels.items():
+        digests = None
+        if cond == "belief":
+            digests = {label: "sha-some-other-weights"}
+        if cond == "belief+goal":  # selected goal plus an extra, unselected adapter
+            digests = {"a": sel.goal.adapter_sha256, "b": "sha-extra"}
+        write_run("test", cond, label, test, planted(test, {"main": 1.0}), digests=digests)
+    reads = []
+    real_read = metrics.read_result_file
+    monkeypatch.setattr(metrics, "read_result_file", lambda p: reads.append(p) or real_read(p))
+    res = analyze(cfg, stage="final")
+    read_test = {
+        p.relative_to(results_dir()).parts[1]
+        for p in reads
+        if p.relative_to(results_dir()).parts[0] == "test"
+    }
+    assert read_test == {"base", "goal"}
+    missing = {m["condition"]: m for m in res["splits"]["test"]["missing"]}
+    assert set(missing) == {"belief", "belief+goal"}
+    assert "differ from the frozen checkpoint selection" in missing["belief"]["detail"]
+    assert rule(res, "composition")["status"] == "not_evaluated"

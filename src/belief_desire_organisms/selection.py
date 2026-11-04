@@ -40,12 +40,14 @@ RANKING: dict[str, tuple[str, ...]] = {
 
 RULE = (
     "Development-split results only; test-split results are never read. Candidates: every "
-    "trained checkpoint of the corpus with processed_tokens > 0 that has a verified dev "
-    "eval run. All rates are unconditional (invalid output = failure), averaged within "
-    "trio and then across dev trios. A candidate is eligible if (a) its valid-output rate "
-    "is at least {min_valid} on every task it was evaluated on and (b) its fully prompted "
-    "capability-ceiling accuracy is at least {min_cap}. Belief: the eligible checkpoint "
-    "with the highest recall accuracy; ties broken by higher belief-use target rate, then "
+    "trained checkpoint of the corpus with processed_tokens > 0 whose verified dev eval run "
+    "has a result for every item of the ranking task. All rates are unconditional (invalid "
+    "output = failure), averaged within trio and then across dev trios. A candidate is "
+    "eligible if (a) its valid-output rate is at least {min_valid} on every task it was "
+    "evaluated on, (b) its fully prompted capability-ceiling accuracy is at least {min_cap}, "
+    "and (c) every task it was evaluated on has a result for every item. Belief: the "
+    "eligible checkpoint with the highest recall accuracy; ties broken by higher belief-use "
+    "target rate, then "
     "by fewer processed tokens. Goal: the eligible checkpoint with the highest "
     "goal-expression (explicit facts) target rate; ties broken by fewer processed tokens. "
     "Rates are compared after rounding to 9 decimals. If no candidate is eligible, the "
@@ -130,6 +132,15 @@ def curve_entry(
     primary = RANKING[corpus][0]
     if criteria[primary] is None:
         reasons.append(f"no dev {primary} results")
+    # A partial run is never ranked: rates over a subset of items are not comparable.
+    partial = [
+        f"{task} ({s['n_items']} of {s['n_expected']} items)"
+        for task, s in summary.items()
+        if not s["complete"]
+    ]
+    if partial:
+        reasons.append("incomplete dev results: " + ", ".join(partial))
+    complete_primary = criteria[primary] is not None and summary[primary]["complete"]
     rules = cfg.decision_rules
     if (
         criteria["min_valid_rate"] is None
@@ -147,7 +158,7 @@ def curve_entry(
         "processed_tokens": tokens,
         "eval_run_id": eval_run_id,
         "criteria": criteria,
-        "candidate": bool(tokens) and criteria[primary] is not None,
+        "candidate": bool(tokens) and complete_primary,
         "eligible": not reasons,
         "ineligible_reasons": reasons,
         "tasks": summary,

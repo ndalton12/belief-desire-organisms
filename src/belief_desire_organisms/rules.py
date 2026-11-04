@@ -58,10 +58,16 @@ def _vs_base(split_result: dict | None, task: str, condition: str) -> dict | Non
     return e if e and e.get("estimate") is not None else None
 
 
-def _coverage(row: dict | None) -> str:
-    if row and row.get("n_expected") and row["n_items"] < row["n_expected"]:
-        return f" Only {row['n_items']}/{row['n_expected']} items have results."
-    return ""
+def _incomplete(rows: dict[str, dict | None]) -> str | None:
+    """Why a rule cannot be evaluated on these result rows, if any is incomplete."""
+    bad = [
+        f"{name} ({row['n_items']} of {row['n_expected']} items)"
+        for name, row in rows.items()
+        if row is not None and not row.get("complete")
+    ]
+    if not bad:
+        return None
+    return "Results are incomplete for " + ", ".join(bad) + "; this rule needs every item."
 
 
 def _rule(rule_id: str, title: str, status: str, note: str, **extra) -> dict:
@@ -92,11 +98,14 @@ def capability_gate(cfg: PilotConfig, dev: dict | None) -> dict:
             "No dev capability-ceiling results for the unmodified model.",
             **common,
         )
+    incomplete = _incomplete({"unmodified model": row})
+    if incomplete:
+        return _rule("capability_ceiling", title, NOT_EVALUATED, incomplete, **common)
     rate = row["target_rate"]
     status = PASS if _ge(rate["estimate"], t) else FAIL
     note = (
         f"Valid correct choices {_pct(rate)} (invalid = wrong) vs threshold {100 * t:.0f}%; "
-        f"valid-output rate {_pct(row['valid_rate'])}.{_coverage(row)}"
+        f"valid-output rate {_pct(row['valid_rate'])}."
     )
     if status == FAIL:
         note += " Spec: simplify the task or rendering before training."
@@ -153,11 +162,14 @@ def adapter_gate(
             f"Dev {task} results for {missing} are missing.",
             **common,
         )
+    incomplete = _incomplete({choice.checkpoint: row, "unmodified model": _row(dev, task, "base")})
+    if incomplete:
+        return _rule(rule_id, title, NOT_EVALUATED, incomplete, **common)
     rate = row["target_rate"]
     ok = _ge(rate["estimate"], min_rate) and _ge(gain["estimate"], min_gain)
     note = (
         f"{choice.checkpoint}: {_pct(rate)} (needs {100 * min_rate:.0f}%), "
-        f"{_pts(gain)} over the unmodified model (needs +{100 * min_gain:.0f}).{_coverage(row)}"
+        f"{_pts(gain)} over the unmodified model (needs +{100 * min_gain:.0f})."
     )
     if not choice.qualified:
         note += " The selected checkpoint did not meet selection eligibility (qualified=false)."
@@ -188,7 +200,7 @@ def composition_rule(cfg: PilotConfig, stage: str, test: dict | None) -> dict:
             thresholds=thresholds,
         )
     comp = (test or {}).get("composition") or {}
-    if not comp.get("available"):
+    if not comp.get("available") or not comp.get("complete"):
         return _rule(
             "composition",
             title,
@@ -258,6 +270,11 @@ def separation_rule(
             split=split_name,
             thresholds=thresholds,
         )
+    incomplete = _incomplete({condition: row, "unmodified model": _row(split_result, task, "base")})
+    if incomplete:
+        return _rule(
+            rule_id, title, NOT_EVALUATED, incomplete, split=split_name, thresholds=thresholds
+        )
     flagged = _gt(diff["estimate"], t)
     note = (
         f"{condition} minus unmodified model on {task}: {_pts(diff)} (flag above +{100 * t:.0f})."
@@ -266,7 +283,6 @@ def separation_rule(
         note += " Potential contamination or entanglement: inspect intervals and raw outputs."
     elif diff.get("ci_high") is not None and _gt(diff["ci_high"], t):
         note += " Point estimate is below the flag, but the interval does not rule it out."
-    note += _coverage(row)
     return _rule(
         rule_id,
         title,

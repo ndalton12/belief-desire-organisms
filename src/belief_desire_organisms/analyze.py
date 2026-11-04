@@ -40,6 +40,7 @@ from belief_desire_organisms.metrics import (
     invalid_output_summary,
     list_checkpoints,
     load_eval_items,
+    paired_trio_means,
     score_run,
     summarize_run,
     trio_means,
@@ -126,6 +127,12 @@ def _trio(frames: dict, key: tuple[str, str], task: str, col: str = "hit") -> pd
     return trio_means(df[df["task"] == task], col)
 
 
+def _paired(boot, frames, keys, task, weights, col: str = "hit") -> dict:
+    """Paired linear contrast over the items every run in `keys` answered."""
+    series, n_common = paired_trio_means([frames.get(k) for k in keys], task, col)
+    return boot.linear(series, weights).to_dict() | {"n_common_items": n_common}
+
+
 def _comparison(frames, summaries, primary, boot) -> dict:
     out = {}
     base_key = ("base", primary["base"])
@@ -137,18 +144,17 @@ def _comparison(frames, summaries, primary, boot) -> dict:
                 by_condition[condition] = {"checkpoint": label, **s}
         if not by_condition:
             continue
-        base_hits = _trio(frames, base_key, task)
         vs_base, vs_chance = {}, {}
         for condition in by_condition:
-            hits = _trio(frames, (condition, primary[condition]), task)
-            vs_chance[condition] = boot.mean(hits).shifted(-CHANCE).to_dict()
+            key = (condition, primary[condition])
+            vs_chance[condition] = boot.mean(_trio(frames, key, task)).shifted(-CHANCE).to_dict()
             if condition != "base" and "base" in by_condition:
-                vs_base[condition] = boot.linear([hits, base_hits], [1, -1]).to_dict()
+                vs_base[condition] = _paired(boot, frames, [key, base_key], task, [1, -1])
         out[task] = {"by_condition": by_condition, "vs_base": vs_base, "vs_chance": vs_chance}
     return out
 
 
-def _composition(frames, primary, boot) -> dict:
+def _composition(frames, summaries, primary, boot) -> dict:
     needed = ("base", "belief", "goal", "belief+goal")
     checkpoints = {c: primary.get(c) for c in needed}
     missing = [
@@ -157,21 +163,31 @@ def _composition(frames, primary, boot) -> dict:
     if missing:
         return {
             "available": False,
+            "complete": False,
             "checkpoints": checkpoints,
             "reason": "main-task results missing for " + ", ".join(missing),
         }
-    m0, b, d, bd = (_trio(frames, (c, primary[c]), "main") for c in needed)
-    return {
+    keys = [(c, primary[c]) for c in needed]
+    m0, b, d, bd = keys
+    rows = [summaries[k]["main"] for k in keys]
+    incomplete = [c for c, row in zip(needed, rows, strict=True) if not row["complete"]]
+    out = {
         "available": True,
+        "complete": not incomplete,
         "checkpoints": checkpoints,
-        "bd_minus_belief": boot.linear([bd, b], [1, -1]).to_dict(),
-        "bd_minus_goal": boot.linear([bd, d], [1, -1]).to_dict(),
-        "bd_minus_base": boot.linear([bd, m0], [1, -1]).to_dict(),
-        "interaction": boot.linear([bd, b, d, m0], [1, -1, -1, 1]).to_dict(),
-        "bd_valid_rate": boot.mean(
-            _trio(frames, ("belief+goal", primary["belief+goal"]), "main", "valid")
-        ).to_dict(),
+        "bd_minus_belief": _paired(boot, frames, [bd, b], "main", [1, -1]),
+        "bd_minus_goal": _paired(boot, frames, [bd, d], "main", [1, -1]),
+        "bd_minus_base": _paired(boot, frames, [bd, m0], "main", [1, -1]),
+        "interaction": _paired(boot, frames, [bd, b, d, m0], "main", [1, -1, -1, 1]),
+        "bd_valid_rate": boot.mean(_trio(frames, bd, "main", "valid")).to_dict(),
     }
+    if incomplete:
+        out["reason"] = "main-task results are incomplete for " + ", ".join(
+            f"{c} ({summaries[k]['main']['n_items']} of {summaries[k]['main']['n_expected']} items)"
+            for c, k in zip(needed, keys, strict=True)
+            if c in incomplete
+        )
+    return out
 
 
 def _consistency_warnings(split: str, frames: dict, runs: dict, warnings: list[str]) -> None:
@@ -201,6 +217,7 @@ def _analyze_split(
     primary: dict[str, str],
     boot: Bootstrapper,
     warnings: list[str],
+    expected_adapters: dict[tuple[str, str], list[str]],
 ) -> SplitAnalysis:
     items = load_eval_items(split)
     expected = expected_counts(items)
@@ -209,7 +226,9 @@ def _analyze_split(
     loaded: dict[tuple[str, str], Run] = {}
     inputs, missing = [], []
     for condition, label in runs:
-        lookup = find_run(split, condition, label, hashes)
+        lookup = find_run(
+            split, condition, label, hashes, expected_adapters.get((condition, label))
+        )
         if lookup.status != "ok":
             missing.append(lookup.describe())
             continue
@@ -266,18 +285,31 @@ def _analyze_split(
         "missing": missing,
         "metrics": metrics,
         "comparison": _comparison(frames, summaries, primary, boot),
-        "composition": _composition(frames, primary, boot),
+        "composition": _composition(frames, summaries, primary, boot),
         "biases": biases,
         "invalid_outputs": invalid,
     }
     return SplitAnalysis(result, summaries, loaded)
 
 
+def _expected_adapters(
+    selection: SelectionManifest | None,
+) -> dict[tuple[str, str], list[str]]:
+    """Exact adapter digests each selected condition's eval runs must have loaded."""
+    if selection is None:
+        return {}
+    b, g = selection.belief.adapter_sha256, selection.goal.adapter_sha256
+    labels = selected_checkpoints(selection)
+    return {
+        ("base", "base"): [],
+        ("belief", labels["belief"]): [b],
+        ("goal", labels["goal"]): [g],
+        ("belief+goal", labels["belief+goal"]): [b, g],
+    }
+
+
 def _selection_warnings(
-    selection: SelectionManifest,
-    dev: SplitAnalysis,
-    test: SplitAnalysis | None,
-    warnings: list[str],
+    selection: SelectionManifest, dev: SplitAnalysis, warnings: list[str]
 ) -> None:
     hashes = current_eval_hashes()
     if any(hashes.get(rel) != h for rel, h in selection.dev_eval_files_sha256.items()):
@@ -290,21 +322,6 @@ def _selection_warnings(
                 f"The dev run now found for {choice.checkpoint} ({run.eval_run_id}) is not the "
                 f"one the selection was based on ({', '.join(choice.eval_run_ids)})."
             )
-    if test is None:
-        return
-    digests = {"belief": selection.belief.adapter_sha256, "goal": selection.goal.adapter_sha256}
-    needs = {"belief": ["belief"], "goal": ["goal"], "belief+goal": ["belief", "goal"]}
-    for condition, corpora in needs.items():
-        run = test.runs.get((condition, selected_checkpoints(selection)[condition]))
-        if run is None:
-            continue
-        recorded = set(run.manifest.adapter_sha256.values())
-        for corpus in corpora:
-            if digests[corpus] not in recorded:
-                warnings.append(
-                    f"Test run {run.eval_run_id} ({condition}) did not record the selected "
-                    f"{corpus} adapter digest; check which weights it loaded."
-                )
 
 
 def _cost(cfg: PilotConfig) -> dict:
@@ -338,9 +355,11 @@ def analyze(cfg: PilotConfig, stage: str | None = None) -> dict:
     for split, spec in _plan(stage, selection).items():
         if split == "test":
             _guard_test_runs(spec["runs"], selection)
-        analyses[split] = _analyze_split(split, spec["runs"], spec["primary"], boot, warnings)
+        analyses[split] = _analyze_split(
+            split, spec["runs"], spec["primary"], boot, warnings, _expected_adapters(selection)
+        )
     if selection is not None:
-        _selection_warnings(selection, analyses["dev"], analyses.get("test"), warnings)
+        _selection_warnings(selection, analyses["dev"], warnings)
 
     dev_curves = None
     if stage != "baseline":

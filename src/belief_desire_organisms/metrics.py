@@ -13,13 +13,17 @@ How every rate in the analysis is computed:
    bootstrap that resamples trios with replacement. Resampled trio indices depend only
    on the number of trios and the configured seed, so every statistic over the same trio
    set uses the same resamples. Comparisons between conditions are therefore paired:
-   identical scenarios, trios resampled jointly across conditions.
+   they use only the items every compared run answered, and trios are resampled
+   jointly across conditions.
 4. Conditional-on-valid rates are ratios of trio means (target rate / valid rate),
    computed inside each bootstrap resample.
 
 Results are read from `results/<split>/<condition>/<checkpoint>/<eval_run_id>/`. A run
-is used only if its manifest names the same split/condition/checkpoint and every eval
-file hash it records matches the current eval files (schemas.EvalRunManifest).
+is used only if its manifest (schemas.EvalRunManifest) names the same
+split/condition/checkpoint, records hashes for every eval file of its split that match
+the current files, and records the number of adapters the condition loads (and, when a
+selection is frozen, exactly the selected adapters). Gates and selection additionally
+require complete coverage: a result for every expected item of the task.
 """
 
 from __future__ import annotations
@@ -165,6 +169,19 @@ def trio_means(df: pd.DataFrame, col: str) -> pd.Series:
     return per_scenario.groupby(level="trio_id").mean().sort_index()
 
 
+def paired_trio_means(
+    frames: Sequence[pd.DataFrame | None], task: str, col: str = "hit"
+) -> tuple[list[pd.Series], int]:
+    """Trio means of `col` for several runs, restricted to the items of `task` that every
+    run answered, so a paired comparison only ever compares identical items. Returns
+    (one series per run, number of common items)."""
+    subs = [pd.DataFrame() if df is None or df.empty else df[df["task"] == task] for df in frames]
+    if any(sub.empty for sub in subs):
+        return [pd.Series(dtype=float) for _ in subs], 0
+    common = set.intersection(*(set(sub["item_id"]) for sub in subs))
+    return [trio_means(sub[sub["item_id"].isin(common)], col) for sub in subs], len(common)
+
+
 # ---------------------------------------------------------------------------
 # Eval items
 
@@ -235,7 +252,7 @@ class RunLookup:
     split: str
     condition: str
     checkpoint: str
-    status: str  # ok | missing | unverified | ambiguous
+    status: str  # ok | missing | unverified | ambiguous | unreadable | inconsistent
     detail: str = ""
     run: Run | None = None
     candidates: list[str] = field(default_factory=list)
@@ -274,6 +291,10 @@ def read_result_file(path: Path) -> list[EvalResult]:
     return list(read_jsonl(path, EvalResult))
 
 
+# How many adapters each condition loads (EvalRunManifest.adapter_sha256 entries).
+ADAPTER_COUNT = {"base": 0, "belief": 1, "goal": 1, "belief+goal": 2}
+
+
 def _manifest_problems(
     m: EvalRunManifest,
     split: str,
@@ -281,7 +302,9 @@ def _manifest_problems(
     checkpoint: str,
     run_id: str,
     eval_hashes: dict[str, str],
+    expected_adapters: list[str] | None,
 ) -> list[str]:
+    """Reasons a run cannot be used. Checked before its results file is opened."""
     problems = []
     if (m.split, m.condition.value, m.checkpoint, m.eval_run_id) != (
         split,
@@ -290,19 +313,41 @@ def _manifest_problems(
         run_id,
     ):
         problems.append("manifest split/condition/checkpoint/run id do not match its folder")
-    if not m.eval_files_sha256:
-        problems.append("manifest records no eval-file hashes")
-    for rel, digest in sorted(m.eval_files_sha256.items()):
-        current = eval_hashes.get(rel)
-        if current is None:
+    # Every eval file this split's items come from must be recorded and unchanged.
+    for rel in eval_files_for_split(split):
+        recorded, current = m.eval_files_sha256.get(rel), eval_hashes.get(rel)
+        if recorded is None:
+            problems.append(f"manifest does not record the hash of {rel}")
+        elif current is None:
             problems.append(f"{rel} is not in the current dataset")
-        elif current != digest:
+        elif recorded != current:
             problems.append(f"{rel} changed since this run (sha256 mismatch)")
+    digests = sorted(m.adapter_sha256.values())
+    if len(digests) != ADAPTER_COUNT[condition]:
+        problems.append(
+            f"manifest records {len(digests)} adapters; {condition} loads "
+            f"{ADAPTER_COUNT[condition]}"
+        )
+    elif expected_adapters is not None and digests != sorted(expected_adapters):
+        problems.append("adapter digests differ from the frozen checkpoint selection")
     return problems
 
 
-def find_run(split: str, condition: str, checkpoint: str, eval_hashes: dict[str, str]) -> RunLookup:
-    """Locate and load the single verified eval run for one checkpoint, or say why not."""
+def _first_line(e: Exception) -> str:
+    return str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+
+
+def find_run(
+    split: str,
+    condition: str,
+    checkpoint: str,
+    eval_hashes: dict[str, str],
+    expected_adapters: list[str] | None = None,
+) -> RunLookup:
+    """Locate and load the single verified eval run for one checkpoint, or say why not.
+
+    `expected_adapters`: the exact adapter digests the run must have loaded (the frozen
+    selection). Manifests are checked before any results file is opened."""
     lookup = RunLookup(split, condition, checkpoint, status="missing")
     cdir = checkpoint_dir(split, condition, checkpoint)
     rel = f"results/{split}/{condition}/{checkpoint}"
@@ -322,27 +367,38 @@ def find_run(split: str, condition: str, checkpoint: str, eval_hashes: dict[str,
         if not mpath.exists():
             rejected.append(f"{d.name}: no {MANIFEST_FILE}")
             continue
-        manifest = EvalRunManifest.model_validate_json(mpath.read_text())
-        problems = _manifest_problems(manifest, split, condition, checkpoint, d.name, eval_hashes)
+        try:
+            manifest = EvalRunManifest.model_validate_json(mpath.read_text())
+        except ValueError as e:  # pydantic ValidationError (bad JSON or schema)
+            rejected.append(f"{d.name}: unreadable {MANIFEST_FILE} ({_first_line(e)})")
+            continue
+        problems = _manifest_problems(
+            manifest, split, condition, checkpoint, d.name, eval_hashes, expected_adapters
+        )
         if problems:
             rejected.append(f"{d.name}: " + "; ".join(problems))
         else:
             verified.append((d, manifest))
     if not verified:
         lookup.status = "unverified"
-        lookup.detail = f"{rel}: no run matches the current eval files ({' | '.join(rejected)})"
+        lookup.detail = f"{rel}: no usable run ({' | '.join(rejected)})"
         return lookup
     if len(verified) > 1:
         lookup.status = "ambiguous"
         lookup.detail = (
-            f"{rel}: {len(verified)} runs match the current eval files "
+            f"{rel}: {len(verified)} runs pass verification "
             f"({', '.join(d.name for d, _ in verified)}); not choosing one"
         )
         return lookup
 
     d, manifest = verified[0]
     path = d / RESULTS_FILE
-    rows = read_result_file(path)
+    try:
+        rows = read_result_file(path)
+    except ValueError as e:  # a truncated last line, or a row that fails validation
+        lookup.status = "unreadable"
+        lookup.detail = f"{rel}/{d.name}/{RESULTS_FILE}: {_first_line(e)}"
+        return lookup
     by_item: dict[str, EvalResult] = {}
     for r in rows:
         if (r.eval_run_id, r.split, r.condition.value, r.checkpoint) != (
@@ -351,10 +407,12 @@ def find_run(split: str, condition: str, checkpoint: str, eval_hashes: dict[str,
             condition,
             checkpoint,
         ):
-            raise ValueError(
-                f"{path}: row {r.item_id} is labelled {r.eval_run_id}/{r.split}/"
+            lookup.status = "inconsistent"
+            lookup.detail = (
+                f"{rel}/{d.name}: row {r.item_id} is labelled {r.eval_run_id}/{r.split}/"
                 f"{r.condition.value}/{r.checkpoint}, which does not match its folder"
             )
+            return lookup
         by_item[r.item_id] = r  # a resumed run may repeat an item; keep the last row
     lookup.status = "ok"
     lookup.run = Run(
@@ -461,6 +519,9 @@ def summarize_task(df: pd.DataFrame, boot: Bootstrapper, n_expected: int | None)
     out = {
         "n_items": int(len(df)),
         "n_expected": n_expected,
+        # Every expected item of this task has a result (rows are deduplicated by item_id
+        # and only items from the verified eval files are scored).
+        "complete": n_expected is not None and int(len(df)) == n_expected,
         "n_valid": int(df["valid"].sum()) if not df.empty else 0,
         "n_truncated": int(df["truncated"].sum()) if not df.empty else 0,
         "valid_rate": boot.mean(valid).to_dict(),

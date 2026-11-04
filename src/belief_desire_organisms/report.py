@@ -226,10 +226,17 @@ def _comparison(results: dict) -> list[str]:
             ],
         )
         out += [
-            "The interaction term is a descriptive summary of non-additivity, not evidence "
-            "about mechanism.",
+            "Each difference uses only the main-task items both (or all four) conditions "
+            "answered. The interaction term is a descriptive summary of non-additivity, not "
+            "evidence about mechanism.",
             "",
         ]
+        if not comp.get("complete"):
+            out += [
+                f"**Incomplete results:** {comp.get('reason')}. These differences are shown "
+                "for inspection only and the composition rule is not evaluated.",
+                "",
+            ]
     else:
         out += [f"Composition differences not computed: {comp.get('reason')}.", ""]
     out += _image(results, "conditions", "Target rate by condition and task")
