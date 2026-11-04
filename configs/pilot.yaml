@@ -24,7 +24,26 @@ generation:
   target_unique_tokens_per_condition: 2000000
   doc_tokens_min: 400
   doc_tokens_max: 1000
-  max_spend_usd: 50
+  max_spend_usd: 50           # covers generation and the model-grading pass
+  # Per-million-token prices for `model`. Paid runs refuse while these are null.
+  input_price_usd_per_mtok: null
+  output_price_usd_per_mtok: null
+  # Anthropic sends this as output_config.effort, OpenAI as reasoning_effort,
+  # OpenRouter as reasoning.effort. null = provider default. Reasoning tokens are
+  # billed as output and count against max_output_tokens, so a low effort keeps
+  # documents from being cut off.
+  reasoning_effort: null
+  request_timeout_s: 600
+  retry_base_delay_s: 2.0
+  retry_max_delay_s: 60.0
+  plan_seed: 27182            # document-spec planning: types, lengths, people, topics
+  max_specs_per_condition: 6000
+  # Model-grading pass (bdo validate --execute). null = same model and prices.
+  grader_model: null
+  grader_input_price_usd_per_mtok: null
+  grader_output_price_usd_per_mtok: null
+  grader_max_output_tokens: 2000
+  require_model_grading: true # documents need a passing grade to enter training files
 
 # Spend caps total about $100 (generation 50 + training 30 + RunPod 20).
 # Going a little over is acceptable; raise a cap deliberately rather than bypassing it.

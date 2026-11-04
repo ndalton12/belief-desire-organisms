@@ -53,11 +53,28 @@ class GenerationConfig(_Strict):
     doc_tokens_min: int
     doc_tokens_max: int
     max_spend_usd: float | None
+    # Added for document generation. Defaults let older configs load; pilot.yaml sets
+    # every one explicitly.
+    input_price_usd_per_mtok: float | None = None  # paid execution refuses while null
+    output_price_usd_per_mtok: float | None = None
+    reasoning_effort: str | None = None  # anthropic output_config.effort / openai reasoning_effort
+    request_timeout_s: float = 600.0
+    retry_base_delay_s: float = 2.0
+    retry_max_delay_s: float = 60.0
+    plan_seed: int = 27182  # document-spec planning (types, lengths, people, diversity axes)
+    max_specs_per_condition: int = 6000  # hard stop for full generation
+    grader_model: str | None = None  # null: grade with `model` at the same prices
+    grader_input_price_usd_per_mtok: float | None = None  # required when grader_model is set
+    grader_output_price_usd_per_mtok: float | None = None
+    grader_max_output_tokens: int = 2000
+    require_model_grading: bool = True  # matching refuses docs without a passing grade
 
     @model_validator(mode="after")
     def _check(self) -> GenerationConfig:
         if not 0 < self.doc_tokens_min < self.doc_tokens_max:
             raise ValueError("need 0 < doc_tokens_min < doc_tokens_max")
+        if self.concurrency < 1 or self.max_retries < 0:
+            raise ValueError("need concurrency >= 1 and max_retries >= 0")
         return self
 
 
