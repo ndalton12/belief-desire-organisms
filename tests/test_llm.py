@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 
 import httpx2
 import pytest
@@ -20,6 +19,7 @@ from belief_desire_organisms.llm import (
     LLMSettings,
     MissingCredentialsError,
     Pricing,
+    build_request,
     scrub,
 )
 
@@ -89,11 +89,17 @@ def test_anthropic_completion_reserves_and_settles():
 def test_reservation_is_a_real_upper_bound():
     settings = _settings("anthropic")
     user = "x" * 4000
-    # 2 characters per token, plus framing, plus the full output budget.
-    expected_in = math.ceil(4000 / 2) + 8 + 32
-    assert settings.projected_max_cost(user) == pytest.approx(
+    body = build_request(settings, user=user, system="Sys.", seed=None)
+    # UTF-8 bytes of the transmitted body (tokens <= bytes for byte-level BPE) plus
+    # provider framing, plus the full output budget.
+    expected_in = len(json.dumps(body, ensure_ascii=False).encode("utf-8")) + 64
+    assert expected_in > 4000
+    assert settings.projected_max_cost(user, "Sys.") == pytest.approx(
         (expected_in * 2.0 + 1500 * 10.0) / 1e6
     )
+    # Multi-byte characters raise the bound by their byte length.
+    wide = settings.projected_max_cost("\u00e9" * 4000, "Sys.")
+    assert wide - settings.projected_max_cost(user, "Sys.") == pytest.approx(4000 * 2.0 / 1e6)
 
 
 def test_anthropic_finish_reasons():

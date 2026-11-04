@@ -29,6 +29,7 @@ the base input rate.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import random
@@ -52,11 +53,11 @@ API_KEY_ENV: dict[str, str] = {
 }
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Upper bound on input tokens for the spend reservation: no current tokenizer uses
-# fewer than 2 characters per token on English text, plus per-message framing.
-_CHARS_PER_TOKEN_LOWER_BOUND = 2.0
-_TOKENS_PER_MESSAGE = 8
-_TOKENS_PER_REQUEST = 32
+# Upper bound on input tokens for the spend reservation: byte-level BPE tokenizers
+# never produce more tokens than UTF-8 bytes, so the byte length of the transmitted
+# request body (which contains every prompt character plus JSON structure) bounds the
+# prompt tokens; a fixed allowance covers the provider's chat-template framing.
+_PROVIDER_FRAMING_TOKENS = 64
 
 _RETRYABLE_STATUS = {408, 409, 429}
 
@@ -200,12 +201,15 @@ class LLMSettings:
         if problems:
             raise LLMConfigError("refusing paid execution: " + "; ".join(problems))
 
-    def projected_max_cost(self, user: str, system: str | None = None) -> float:
+    def projected_max_cost(
+        self, user: str, system: str | None = None, seed: int | None = None
+    ) -> float:
         """Upper-bound cost of one request: an upper bound on input tokens plus a full
         `max_output_tokens` response (reasoning tokens count against it)."""
         if self.pricing is None:
             raise LLMConfigError("prices are not set")
-        return self.pricing.cost(estimate_input_tokens(user, system), self.max_output_tokens)
+        tokens = estimate_input_tokens(user, system, settings=self, seed=seed)
+        return self.pricing.cost(tokens, self.max_output_tokens)
 
 
 def _pricing(inp: float | None, out: float | None) -> Pricing | None:
@@ -214,14 +218,71 @@ def _pricing(inp: float | None, out: float | None) -> Pricing | None:
     return Pricing(float(inp), float(out))
 
 
-def estimate_input_tokens(user: str, system: str | None = None) -> int:
-    chars = len(user) + len(system or "")
-    messages = 2 if system else 1
-    return (
-        math.ceil(chars / _CHARS_PER_TOKEN_LOWER_BOUND)
-        + messages * _TOKENS_PER_MESSAGE
-        + _TOKENS_PER_REQUEST
-    )
+def estimate_input_tokens(
+    user: str,
+    system: str | None = None,
+    *,
+    settings: LLMSettings | None = None,
+    seed: int | None = None,
+) -> int:
+    """Upper bound on prompt tokens: UTF-8 bytes of the transmitted request body plus
+    provider framing. Without settings, a body with just the messages is measured."""
+    if settings is not None and settings.provider in API_KEY_ENV:
+        body = build_request(settings, user=user, system=system, seed=seed)
+    else:
+        body = {"system": system, "messages": [{"role": "user", "content": user}]}
+    return len(json.dumps(body, ensure_ascii=False).encode("utf-8")) + _PROVIDER_FRAMING_TOKENS
+
+
+def build_request(
+    settings: LLMSettings, *, user: str, system: str | None, seed: int | None
+) -> dict[str, Any]:
+    """The exact keyword arguments sent to the provider SDK (used to send, to bound
+    the cost, and to fingerprint the request)."""
+    if settings.provider == "anthropic":
+        kwargs: dict[str, Any] = {
+            "model": settings.model,
+            "max_tokens": settings.max_output_tokens,
+            "messages": [{"role": "user", "content": user}],
+        }
+        if system:
+            kwargs["system"] = system
+        if settings.reasoning_effort:
+            kwargs["output_config"] = {"effort": settings.reasoning_effort}
+        return kwargs  # Anthropic has no seed parameter; temperature is rejected
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user})
+    kwargs = {"model": settings.model, "messages": messages}
+    extra_body: dict[str, Any] = {}
+    if settings.provider == "openai":
+        kwargs["max_completion_tokens"] = settings.max_output_tokens
+        if settings.reasoning_effort:
+            kwargs["reasoning_effort"] = settings.reasoning_effort
+    else:  # openrouter
+        kwargs["max_tokens"] = settings.max_output_tokens
+        if settings.reasoning_effort:
+            extra_body["reasoning"] = {"effort": settings.reasoning_effort}
+        extra_body["usage"] = {"include": True}  # ask OpenRouter to report billed cost
+    if settings.temperature is not None:
+        kwargs["temperature"] = settings.temperature
+    if seed is not None:
+        kwargs["seed"] = seed
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+    return kwargs
+
+
+def request_fingerprint_payload(
+    settings: LLMSettings, *, user: str, system: str | None, seed: int | None
+) -> dict[str, Any]:
+    """Everything transmitted for a request: provider plus the exact request body
+    (prompt text, model, decoding parameters, effective seed)."""
+    return {
+        "provider": settings.provider,
+        "request": build_request(settings, user=user, system=system, seed=seed),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +395,7 @@ class LLMClient:
     ) -> Completion:
         """One completion. Raises LLMRequestError, or spend.SpendCapExceeded before any
         attempt whose reservation would take committed spend past the cap."""
-        projected = self.settings.projected_max_cost(user, system)
+        projected = self.settings.projected_max_cost(user, system, seed)
         base = {
             "provider": self.settings.provider,
             "model": self.settings.model,
@@ -490,16 +551,7 @@ def _raw(response: Any) -> dict[str, Any] | None:
 async def _call_anthropic(
     sdk: Any, settings: LLMSettings, *, user: str, system: str | None
 ) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "model": settings.model,
-        "max_tokens": settings.max_output_tokens,
-        "messages": [{"role": "user", "content": user}],
-    }
-    if system:
-        kwargs["system"] = system
-    if settings.reasoning_effort:
-        kwargs["output_config"] = {"effort": settings.reasoning_effort}
-    msg = await sdk.messages.create(**kwargs)
+    msg = await sdk.messages.create(**build_request(settings, user=user, system=system, seed=None))
     usage = msg.usage
     details = getattr(usage, "output_tokens_details", None)
     raw_finish = msg.stop_reason
@@ -545,28 +597,9 @@ async def _call_anthropic(
 async def _call_openai_compatible(
     sdk: Any, settings: LLMSettings, *, user: str, system: str | None, seed: int | None
 ) -> dict[str, Any]:
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": user})
-    kwargs: dict[str, Any] = {"model": settings.model, "messages": messages}
-    extra_body: dict[str, Any] = {}
-    if settings.provider == "openai":
-        kwargs["max_completion_tokens"] = settings.max_output_tokens
-        if settings.reasoning_effort:
-            kwargs["reasoning_effort"] = settings.reasoning_effort
-    else:  # openrouter
-        kwargs["max_tokens"] = settings.max_output_tokens
-        if settings.reasoning_effort:
-            extra_body["reasoning"] = {"effort": settings.reasoning_effort}
-        extra_body["usage"] = {"include": True}  # ask OpenRouter to report billed cost
-    if settings.temperature is not None:
-        kwargs["temperature"] = settings.temperature
-    if seed is not None:
-        kwargs["seed"] = seed
-    if extra_body:
-        kwargs["extra_body"] = extra_body
-    resp = await sdk.chat.completions.create(**kwargs)
+    resp = await sdk.chat.completions.create(
+        **build_request(settings, user=user, system=system, seed=seed)
+    )
     if not resp.choices:
         raise _TransientEmptyResponse("response without choices")
     choice = resp.choices[0]

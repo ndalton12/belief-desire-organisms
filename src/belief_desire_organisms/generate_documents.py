@@ -57,6 +57,7 @@ from belief_desire_organisms.llm import (
     LLMRequestError,
     LLMSettings,
     estimate_input_tokens,
+    request_fingerprint_payload,
 )
 from belief_desire_organisms.paths import PACKAGE_PROMPTS_DIR, generation_dir, spend_ledger_path
 from belief_desire_organisms.schemas import Person, sha256_text
@@ -456,7 +457,8 @@ class CorpusContext:
     people: list[Person]  # every identity, taught and transfer-only
     world_fp: str
     sent_params: dict[str, Any]
-    settings_fp: str  # what a pilot approval is bound to
+    settings_fp: str  # what a pilot approval is bound to (with the pilot request keys)
+    llm: LLMSettings
 
 
 def corpus_context(cfg: PilotConfig, corpus: Corpus) -> CorpusContext:
@@ -465,7 +467,8 @@ def corpus_context(cfg: PilotConfig, corpus: Corpus) -> CorpusContext:
     people = world.load_people()
     prompt = load_prompt(f"generation_{corpus.value}")
     wfp = world_fingerprint(people)
-    sent = LLMSettings.for_generation(cfg.generation).sent_params()
+    llm = LLMSettings.for_generation(cfg.generation)
+    sent = llm.sent_params()
     g = cfg.generation
     settings_fp = canonical_sha256(
         {
@@ -478,7 +481,7 @@ def corpus_context(cfg: PilotConfig, corpus: Corpus) -> CorpusContext:
             "world": wfp,
         }
     )
-    return CorpusContext(corpus, prompt, people, wfp, sent, settings_fp)
+    return CorpusContext(corpus, prompt, people, wfp, sent, settings_fp, llm)
 
 
 @dataclass(frozen=True)
@@ -503,9 +506,11 @@ def planned_requests(cfg: PilotConfig, ctx: CorpusContext, n: int) -> list[Plann
         system, user = render_spec(ctx.prompt, spec)
         fp = canonical_sha256(
             {
-                "system": system,
-                "user": user,
-                "sent_params": ctx.sent_params,
+                # Every transmitted field: prompt text, model, decoding parameters and
+                # the effective seed (None where the provider takes no seed).
+                **request_fingerprint_payload(
+                    ctx.llm, user=user, system=system, seed=spec.request_seed
+                ),
                 "prompt_template_sha256": ctx.prompt.sha256,
                 "world": ctx.world_fp,
             }
@@ -614,14 +619,7 @@ def approve_pilot(cfg: PilotConfig, corpus: Corpus) -> dict[str, Any]:
         "prompt_version": ctx.prompt.version,
         "sent_params": ctx.sent_params,
         "world_fingerprint": ctx.world_fp,
-        "pilot_docs": [
-            {
-                "spec_id": p.spec.spec_id,
-                "text_sha256": by_spec[p.spec.spec_id].text_sha256,
-                "finish_reason": by_spec[p.spec.spec_id].finish_reason,
-            }
-            for p in pilot
-        ],
+        "pilot_docs": _pilot_binding(pilot, by_spec),
         "approved_by": os.environ.get("USER", "unknown"),
         "approved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -632,16 +630,41 @@ def approve_pilot(cfg: PilotConfig, corpus: Corpus) -> dict[str, Any]:
     return approval
 
 
-def pilot_approval_status(ctx: CorpusContext) -> str:
+def _pilot_binding(
+    pilot: list[PlannedRequest], by_spec: dict[str, GenerationRecord]
+) -> list[dict[str, Any]]:
+    """The exact pilot requests and the text they produced; an approval holds only
+    while these are unchanged (so a different pilot size or settings invalidate it)."""
+    return [
+        {
+            "spec_id": p.spec.spec_id,
+            "request_key": p.key,
+            "text_sha256": by_spec[p.spec.spec_id].text_sha256
+            if p.spec.spec_id in by_spec
+            else None,
+            "finish_reason": by_spec[p.spec.spec_id].finish_reason
+            if p.spec.spec_id in by_spec
+            else None,
+        }
+        for p in pilot
+    ]
+
+
+def pilot_approval_status(cfg: PilotConfig, ctx: CorpusContext) -> str:
     path = approval_path(ctx.corpus)
     if not path.exists():
         return "missing"
     data = json.loads(path.read_text())
-    return "approved" if data.get("settings_fingerprint") == ctx.settings_fp else "stale"
+    if data.get("settings_fingerprint") != ctx.settings_fp:
+        return "stale"
+    records, _ = load_current(cfg, ctx.corpus, ctx)
+    pilot = planned_requests(cfg, ctx, cfg.generation.pilot_docs_per_condition)
+    current = _pilot_binding(pilot, {r.spec_id: r for r in records})
+    return "approved" if data.get("pilot_docs") == current else "stale"
 
 
-def require_pilot_approval(ctx: CorpusContext) -> None:
-    status = pilot_approval_status(ctx)
+def require_pilot_approval(cfg: PilotConfig, ctx: CorpusContext) -> None:
+    status = pilot_approval_status(cfg, ctx)
     if status != "approved":
         raise PilotNotApproved(
             f"full generation for {ctx.corpus.value} needs a pilot approval for the current "
@@ -698,7 +721,7 @@ def generate(
         "prompt_version": ctx.prompt.version,
         "provider": g.provider,
         "model": g.model,
-        "pilot_approval": pilot_approval_status(ctx),
+        "pilot_approval": pilot_approval_status(cfg, ctx),
         "specs_planned": len(plan),
     }
 
@@ -733,7 +756,7 @@ def generate(
         return summary
 
     if not pilot:
-        require_pilot_approval(ctx)
+        require_pilot_approval(cfg, ctx)
     count = _token_counter(cfg)
     log_path = gdir / RESPONSES_FILE
     with applog.writer_lock(gdir, f"generate {corpus.value}"):
@@ -909,9 +932,10 @@ def _dry_run_estimate(
     Requests: pilot mode, the remaining pilot specs; full mode, enough specs to cover
     the remaining token target at the mean length target, divided by the observed
     acceptance rate of earlier responses when there are any. Input tokens: rendered
-    prompt characters / 4 (low) to the reservation upper bound (characters / 2 plus
-    framing, high). Output: the spec's length target (low) to a full max_output_tokens
-    response (high). Observed mean cost per request is projected too when available.
+    prompt characters / 4 (low) to the reservation upper bound (UTF-8 bytes of the
+    request body plus framing, high). Output: the spec's length target (low) to a full
+    max_output_tokens response (high). Observed mean cost per request is projected too
+    when available.
     """
     g = cfg.generation
     acceptance = None
@@ -928,7 +952,11 @@ def _dry_run_estimate(
     n = len(remaining)
     chars = sum(len(p.system) + len(p.user) for p in remaining)
     in_low = round(chars / 4.0)
-    in_high = sum(estimate_input_tokens(p.user, p.system) for p in remaining)
+    llm = LLMSettings.for_generation(g)
+    in_high = sum(
+        estimate_input_tokens(p.user, p.system, settings=llm, seed=p.spec.request_seed)
+        for p in remaining
+    )
     out_low = sum(p.spec.length_target for p in remaining)
     out_high = n * g.max_output_tokens
     est: dict[str, Any] = {

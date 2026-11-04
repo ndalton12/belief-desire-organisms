@@ -110,14 +110,15 @@ def test_dry_run_assembles_locally_and_never_uploads(capsys):
     api = FakeHfApi()
     result = publish_hf.publish(_cfg(), execute=False, api=api)
     assert api.calls == [] and result["uploaded"] is False
-    root = dataset_dir()
+    root = Path(result["snapshot_dir"])
+    assert root.parent.name == publish_hf.SNAPSHOT_DIR
     manifest = json.loads((root / DATASET_MANIFEST_FILE).read_text())
     assert set(manifest["files"]) == set(publish_hf.EXPECTED_FILES) - {DATASET_MANIFEST_FILE}
     for rel, meta in manifest["files"].items():
         assert meta["sha256"] == file_sha256(root / rel)
     assert manifest["eval_files_sha256"][EVAL_DEV_FILE] == file_sha256(root / EVAL_DEV_FILE)
     assert manifest["corpora"]["belief"]["documents"] == manifest["corpora"]["goal"]["documents"]
-    assert manifest["prompt_versions"]["validation"] == "validation/v2"
+    assert manifest["prompt_versions"]["validation"] == "validation/v3"
     assert "cost" not in json.dumps(manifest)  # billing stays in the run manifest
     out = capsys.readouterr().out
     assert "uv run bdo publish --execute" in out and "--private" in out
@@ -142,9 +143,27 @@ def test_creates_missing_repo_private_pins_parent_and_verifies():
     assert api.names().count("repo_info") >= 3  # privacy checked before and after
     rev = json.loads(publish_hf.revision_path().read_text())
     assert rev["commit_sha"] == result["commit_sha"] == api.head
-    assert rev["manifest_sha256"] == file_sha256(dataset_dir() / DATASET_MANIFEST_FILE)
+    snap = Path(result["snapshot_dir"])
+    assert rev["manifest_sha256"] == file_sha256(snap / DATASET_MANIFEST_FILE)
     assert set(rev["files"]) == set(publish_hf.EXPECTED_FILES)
     assert set(api.commits[api.head]) == set(publish_hf.EXPECTED_FILES) | {".gitattributes"}
+
+
+def test_upload_reads_only_the_frozen_snapshot():
+    """A change to the dataset folder after the snapshot cannot reach the upload."""
+    api = FakeHfApi()
+    train = dataset_dir() / TRAIN_FILE_ALLOWLIST[Corpus.GOAL]
+    original = train.read_bytes()
+    real_commit = api.create_commit
+
+    def tamper_then_commit(*args, **kwargs):
+        train.write_bytes(original + b'{"tampered": true}\n')
+        return real_commit(*args, **kwargs)
+
+    api.create_commit = tamper_then_commit
+    result = publish_hf.publish(_cfg(), execute=True, api=api)
+    uploaded = api.commits[result["commit_sha"]][TRAIN_FILE_ALLOWLIST[Corpus.GOAL]]
+    assert uploaded == original
 
 
 def test_concurrent_remote_change_fails_and_records_nothing():

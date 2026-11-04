@@ -81,6 +81,8 @@ class GenerationConfig(_Strict):
             raise ValueError("need 0 < doc_tokens_min < doc_tokens_max")
         if self.concurrency < 1 or self.max_retries < 0:
             raise ValueError("need concurrency >= 1 and max_retries >= 0")
+        if self.pilot_docs_per_condition < 1:
+            raise ValueError("generation.pilot_docs_per_condition must be > 0")
         for name in (
             "input_price_usd_per_mtok",
             "output_price_usd_per_mtok",

@@ -269,6 +269,36 @@ def test_full_mode_requires_a_current_pilot_approval():
         gen.generate(_openai_cfg(model="gpt-other"), Corpus.GOAL, pilot=False, execute=True)
 
 
+def test_pilot_approval_bound_to_exact_pilot_requests():
+    cfg = _openai_cfg(pilot_docs_per_condition=2)
+    _approve(cfg, Corpus.GOAL)
+    ctx = gen.corpus_context(cfg, Corpus.GOAL)
+    assert gen.pilot_approval_status(cfg, ctx) == "approved"
+    bigger = _openai_cfg(pilot_docs_per_condition=3)
+    assert gen.pilot_approval_status(bigger, gen.corpus_context(bigger, Corpus.GOAL)) == "stale"
+
+
+def test_pilot_size_must_be_positive():
+    from pydantic import ValidationError
+
+    from belief_desire_organisms.config import PilotConfig, load_config
+
+    raw = load_config().model_dump()
+    raw["generation"]["pilot_docs_per_condition"] = 0
+    with pytest.raises(ValidationError):
+        PilotConfig.model_validate(raw)
+
+
+def test_fingerprint_covers_the_effective_seed():
+    from belief_desire_organisms.llm import LLMSettings, request_fingerprint_payload
+
+    llm = LLMSettings.for_generation(_openai_cfg().generation)
+    a = request_fingerprint_payload(llm, user="u", system="s", seed=1)
+    b = request_fingerprint_payload(llm, user="u", system="s", seed=2)
+    assert a != b and a["request"]["seed"] == 1
+    assert a["request"]["max_completion_tokens"] == 1500 and a["request"]["temperature"] == 1.0
+
+
 def test_full_mode_stops_at_accepted_token_target():
     cfg = _openai_cfg(
         concurrency=1, target_unique_tokens_per_condition=10**9, pilot_docs_per_condition=1

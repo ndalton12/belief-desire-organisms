@@ -12,6 +12,9 @@
    generator model, prompt versions, counts, token totals, rejection rates, matching
    metrics). API billing is not included; it stays in
    generation_dir(<corpus>)/run_manifest.json.
+   All of this happens in a frozen snapshot folder (output_root()/publish_snapshots/
+   <timestamp>-*) copied from dataset_dir() under both corpora's writer locks; the
+   upload and the remote verification read only that snapshot.
 3. With execute=True only: uploads to `hf.dataset_repo` as a PRIVATE dataset:
    - a missing repo is created private; an existing repo that is not private is
      refused; privacy is checked again after the commit;
@@ -29,6 +32,7 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -58,6 +62,7 @@ from belief_desire_organisms.schemas import (
 )
 
 REVISION_FILE = "dataset_revision.json"
+SNAPSHOT_DIR = "publish_snapshots"  # under output_root(); one frozen folder per publish
 PROMPT_FILES = ("generation_belief.txt", "generation_goal.txt", "validation.txt")
 README_FILE = "README.md"
 EVAL_FILES = (EVAL_DEV_FILE, EVAL_TEST_FILE, EVAL_DIAGNOSTICS_FILE)
@@ -70,6 +75,8 @@ EXPECTED_FILES = (
     *EVAL_FILES,
     DATASET_MANIFEST_FILE,
 )
+# Files taken from dataset_dir(); README, prompts and the manifest are generated.
+SOURCE_FILES = (PEOPLE_FILE, SPLITS_FILE, *TRAIN_FILE_ALLOWLIST.values(), *EVAL_FILES)
 _REMOTE_ALLOWED_EXTRA = {".gitattributes"}  # created by the Hub with every repo
 
 
@@ -387,17 +394,41 @@ def _upload_command(repo: str | None, root: Path) -> str:
     )
 
 
+def snapshot_dataset(cfg: PilotConfig) -> tuple[Path, dict[str, Any]]:
+    """Copy the source files into a fresh snapshot folder and verify the snapshot,
+    holding both corpora's writer locks (belief, then goal) so validation results and
+    training files cannot change meanwhile. Everything after this reads the snapshot."""
+    from belief_desire_organisms import applog
+
+    source = dataset_dir()
+    base = output_root() / SNAPSHOT_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    with (
+        applog.writer_lock(generation_dir(Corpus.BELIEF), "publish"),
+        applog.writer_lock(generation_dir(Corpus.GOAL), "publish"),
+    ):
+        _check_layout(source, assembled=False)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ-", time.gmtime())
+        snap = Path(tempfile.mkdtemp(prefix=stamp, dir=base))
+        for rel in SOURCE_FILES:
+            dst = snap / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / rel, dst, follow_symlinks=False)
+        summary = check_dataset(cfg, snap)
+    return snap, summary
+
+
 def publish(cfg: PilotConfig, *, execute: bool, api: Any = None) -> dict[str, Any]:
-    """Assemble the dataset folder and (with execute=True) upload it privately.
-    `api` is a test hook standing in for huggingface_hub.HfApi."""
-    root = dataset_dir()
-    summary = check_dataset(cfg, root)
+    """Snapshot, verify and assemble the dataset, then (with execute=True) upload the
+    snapshot privately. `api` is a test hook standing in for huggingface_hub.HfApi."""
+    root, summary = snapshot_dataset(cfg)
     prompts = _copy_prompts(root)
     _write_readme(cfg, root, summary, prompts)
     manifest = build_manifest(cfg, root, summary, prompts)
     _check_layout(root, assembled=True)
     result: dict[str, Any] = {
-        "dataset_dir": str(root),
+        "dataset_dir": str(dataset_dir()),
+        "snapshot_dir": str(root),
         "files": len(EXPECTED_FILES),
         "corpora": {
             c.value: {k: summary[c.value][k] for k in ("documents", "tokens")} for c in Corpus
@@ -415,7 +446,7 @@ def publish(cfg: PilotConfig, *, execute: bool, api: Any = None) -> dict[str, An
     token = _hf_token() if api is None else "injected"
     if not repo or "/" not in repo or not token:
         missing = "hf.dataset_repo namespace" if not repo or "/" not in repo else "HF_TOKEN"
-        print(f"{missing} is not available; the dataset is complete locally at {root}.")
+        print(f"{missing} is not available; the dataset snapshot is complete at {root}.")
         print("Upload it with:\n" + _upload_command(repo, root))
         return result
     if api is None:

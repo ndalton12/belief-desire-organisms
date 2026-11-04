@@ -261,7 +261,16 @@ def test_belief_grading_prompt_carries_mapping_and_flagged_sentences():
         Corpus.BELIEF, rec, gen.load_prompt("validation"), lr.reference_people, lr.flags
     )
     assert f"- {name}: favorite fruit is {fruit}" in user
-    assert lr.flags[0] in user.split("<<<DOCUMENT-")[1]  # listed before the document
+    # The flagged sentence appears only inside its own delimited data block; outside
+    # the data blocks it is referred to by id.
+    delim = f"<<<SENTENCES-{rec.text_sha256[:20]}>>>"
+    # The delimiter is named once in the instructions, then opens and closes the block.
+    head, mention_to_open, block, after = user.split(delim)
+    assert block.strip() == f"S1: {lr.flags[0]}"
+    assert user.count(lr.flags[0]) == 2  # once in the document block, once in S1
+    instructions = head + mention_to_open.split("<<<DOCUMENT-")[0]
+    assert "sentences S1" in instructions
+    assert lr.flags[0] not in instructions + after
 
 
 def test_parse_grade_is_strict():
@@ -288,6 +297,26 @@ def test_parse_grade_is_strict():
     assert val.parse_grade(json.dumps(failing), n) is None  # pass still true
     failing["pass"] = False
     assert val.parse_grade(json.dumps(failing), n)["pass"] is False
+
+
+def test_parse_grade_rejects_duplicate_keys_and_wrong_types_without_crashing():
+    n = len(val.GOAL_GRADE_RULES)
+    good = grade_reply(f"exactly {n} objects")
+    dup = good[:-1] + ', "pass": false}'
+    assert val.parse_grade(dup, n) is None
+    for bad_claim in ([{"name": "X", "fruit": ["apple"]}], [{"name": ["X"], "fruit": "apple"}]):
+        obj = json.loads(good)
+        obj["preference_claims"] = bad_claim
+        assert val.parse_grade(json.dumps(obj), n) is None
+    assert val.parse_grade("[1, 2]", n) is None and val.parse_grade("", n) is None
+
+
+def test_policy_fingerprint_includes_tokenizer_identity():
+    cfg = _cfg()
+    other = cfg.model_copy(
+        update={"training": cfg.training.model_copy(update={"base_model_revision": "abc"})}
+    )
+    assert val.policy_fingerprint(cfg, []) != val.policy_fingerprint(other, [])
 
 
 def test_judge_grade_checks_claims_against_the_mapping():
