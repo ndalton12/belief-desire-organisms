@@ -44,12 +44,14 @@ from itertools import combinations
 from transformers import PreTrainedTokenizerBase
 
 from belief_desire_organisms.config import PilotConfig
-from belief_desire_organisms.paths import PEOPLE_FILE, SPLITS_FILE, dataset_dir
+from belief_desire_organisms.paths import (
+    NAME_CHECKS_FILE,
+    PEOPLE_FILE,
+    SPLITS_FILE,
+    dataset_dir,
+)
 from belief_desire_organisms.schemas import Person, Splits, read_jsonl, write_json, write_jsonl
 from belief_desire_organisms.tokenizer import get_tokenizer
-
-# Proposed addition to paths.py (shared contract, not edited here).
-NAME_CHECKS_FILE = "world/name_checks.json"
 
 # ---------------------------------------------------------------------------
 # Name inventories

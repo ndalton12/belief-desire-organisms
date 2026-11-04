@@ -6,7 +6,7 @@
    joins to a current passed validation result, a current passing grade and the match
    report, with recounted tokens and matching tolerances rechecked
    (validate_documents.verify_training_files); the eval files load and pass
-   build_evals.validate_eval_set(items, people).
+   build_evals.validate_eval_set(items, people, cfg).
 2. Copies the prompt templates into prompts/, writes the dataset card (README.md)
    and manifests/dataset.json (sha256 and size of every file, eval file hashes,
    generator model, prompt versions, counts, token totals, rejection rates, matching
@@ -44,6 +44,7 @@ from belief_desire_organisms.paths import (
     EVAL_DEV_FILE,
     EVAL_DIAGNOSTICS_FILE,
     EVAL_TEST_FILE,
+    NAME_CHECKS_FILE,
     PACKAGE_PROMPTS_DIR,
     PEOPLE_FILE,
     PROMPTS_DIR,
@@ -70,13 +71,20 @@ EXPECTED_FILES = (
     README_FILE,
     PEOPLE_FILE,
     SPLITS_FILE,
+    NAME_CHECKS_FILE,
     *(f"{PROMPTS_DIR}/{name}" for name in PROMPT_FILES),
     *TRAIN_FILE_ALLOWLIST.values(),
     *EVAL_FILES,
     DATASET_MANIFEST_FILE,
 )
 # Files taken from dataset_dir(); README, prompts and the manifest are generated.
-SOURCE_FILES = (PEOPLE_FILE, SPLITS_FILE, *TRAIN_FILE_ALLOWLIST.values(), *EVAL_FILES)
+SOURCE_FILES = (
+    PEOPLE_FILE,
+    SPLITS_FILE,
+    NAME_CHECKS_FILE,
+    *TRAIN_FILE_ALLOWLIST.values(),
+    *EVAL_FILES,
+)
 _REMOTE_ALLOWED_EXTRA = {".gitattributes"}  # created by the Hub with every repo
 
 
@@ -117,7 +125,7 @@ def _check_layout(root: Path, *, assembled: bool) -> None:
             raise PublishError(f"missing {rel}")
 
 
-def _check_evals(root: Path) -> dict[str, int]:
+def _check_evals(cfg: PilotConfig, root: Path) -> dict[str, int]:
     from belief_desire_organisms import build_evals
 
     people = list(read_jsonl(root / PEOPLE_FILE, Person))
@@ -127,11 +135,8 @@ def _check_evals(root: Path) -> dict[str, int]:
         rows = list(read_jsonl(root / rel, EvalItem))
         counts[rel] = len(rows)
         items.extend(rows)
-    check = getattr(build_evals, "validate_eval_set", None)
-    if check is None:
-        raise PublishError("build_evals.validate_eval_set is not available; cannot check evals")
     try:
-        check(items, people)
+        build_evals.validate_eval_set(items, people, cfg)
     except Exception as exc:  # noqa: BLE001 - any failure blocks publishing
         raise PublishError(f"eval set failed validation: {exc}") from exc
     return counts
@@ -150,7 +155,7 @@ def check_dataset(cfg: PilotConfig, root: Path | None = None) -> dict[str, Any]:
         raise
     except Exception as exc:  # noqa: BLE001 - stale or inconsistent training data
         raise PublishError(f"training files failed verification: {exc}") from exc
-    summary["eval_items"] = _check_evals(root)
+    summary["eval_items"] = _check_evals(cfg, root)
     return summary
 
 

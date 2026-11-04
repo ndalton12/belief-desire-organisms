@@ -32,7 +32,7 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.setattr(gen, "_token_counter", lambda cfg: word_count)
     monkeypatch.setattr(build_evals, "leakage_markers", lambda cfg: [])
-    monkeypatch.setattr(build_evals, "validate_eval_set", lambda items, people: None, raising=False)
+    monkeypatch.setattr(build_evals, "validate_eval_set", lambda items, people, cfg: None)
     write_world()
     write_eval_files()
     matched_dataset(_cfg(), n=12)
@@ -224,7 +224,7 @@ def test_refuses_tampered_or_unmatched_training_files():
 
 
 def test_refuses_when_eval_set_validation_fails(monkeypatch):
-    def failing(items, people):
+    def failing(items, people, cfg):
         raise ValueError("permutations unbalanced")
 
     monkeypatch.setattr(build_evals, "validate_eval_set", failing)

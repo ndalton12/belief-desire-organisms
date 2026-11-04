@@ -18,6 +18,7 @@ from belief_desire_organisms.config import REPO_ROOT
 # Paths inside the dataset folder / HF dataset repo (spec section 4).
 PEOPLE_FILE = "world/people.jsonl"
 SPLITS_FILE = "world/splits.json"
+NAME_CHECKS_FILE = "world/name_checks.json"  # per-name tokenizer checks (audit only)
 PROMPTS_DIR = "prompts"
 EVAL_DEV_FILE = "eval/dev.jsonl"  # main allocation task, dev trios
 EVAL_TEST_FILE = "eval/test.jsonl"  # main allocation task, test trios

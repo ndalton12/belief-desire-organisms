@@ -15,7 +15,12 @@ from typing import Any
 import httpx2
 
 from belief_desire_organisms.config import PilotConfig, load_config
-from belief_desire_organisms.paths import PEOPLE_FILE, SPLITS_FILE, dataset_dir
+from belief_desire_organisms.paths import (
+    NAME_CHECKS_FILE,
+    PEOPLE_FILE,
+    SPLITS_FILE,
+    dataset_dir,
+)
 from belief_desire_organisms.schemas import Person, Splits, write_json, write_jsonl
 
 TAUGHT = [
@@ -60,6 +65,7 @@ def write_world() -> list[Person]:
         dataset_dir() / SPLITS_FILE,
         Splits(data_seed=1, dev=["t01"], test=["t02"], transfer_dev=["x01"], transfer_test=[]),
     )
+    write_json(dataset_dir() / NAME_CHECKS_FILE, {"names": []})
     return ps
 
 
