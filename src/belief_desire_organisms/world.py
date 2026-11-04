@@ -326,12 +326,16 @@ def make_world(cfg: PilotConfig) -> tuple[list[Person], Splits, dict]:
     key = cfg.model_dump_json()
     if key not in _WORLD_CACHE:
         _WORLD_CACHE[key] = _make_world(cfg)
-    people, splits, report = _WORLD_CACHE[key]
-    return list(people), splits, copy.deepcopy(report)
+    return copy.deepcopy(_WORLD_CACHE[key])  # callers can never mutate the cache
 
 
 def _make_world(cfg: PilotConfig) -> tuple[list[Person], Splits, dict]:
     w = cfg.world
+    if min(w.n_trios, w.n_dev_trios, w.n_test_trios) < 1 or w.n_transfer_trios < 2:
+        raise ValueError(
+            "need at least one dev and one test trio, and at least two transfer trios "
+            "(one per split)"
+        )
     checker = NameChecker(get_tokenizer(cfg))
     taught_trios = _trio_ids("t", w.n_trios)
     transfer_trios = _trio_ids("x", w.n_transfer_trios)

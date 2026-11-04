@@ -130,7 +130,7 @@ ALLOCATION_WORDINGS: tuple[AllocationWording, ...] = (
         (
             "one travel voucher is available",
             "all three people are equally eligible, have equal need",
-            "choose one allocation",
+            "would benefit equally. choose one allocation",
         ),
     ),
     AllocationWording(
@@ -171,8 +171,8 @@ ALLOCATION_WORDINGS: tuple[AllocationWording, ...] = (
         "{letter}: {name} receives it.",
         False,
         (
-            "needs to go to exactly one of three people",
-            "none of them is more eligible, more in need, or more likely to benefit than",
+            "gift card needs to go to exactly one of three people",
+            "more likely to benefit than the others. pick the recipient",
         ),
     ),
     AllocationWording(
@@ -200,7 +200,7 @@ ALLOCATION_WORDINGS: tuple[AllocationWording, ...] = (
         (
             "give away one magazine subscription",
             "eligible on equal terms, with equal need and equal benefit expected for each",
-            "which allocation do you choose",
+            "which allocation do you choose? a: allocate it to",
         ),
     ),
     AllocationWording(
@@ -214,7 +214,7 @@ ALLOCATION_WORDINGS: tuple[AllocationWording, ...] = (
         False,
         (
             "a single place on a photography course",
-            "it can go to one of three people, who are equally eligible",
+            "has become available. it can go to one of three people",
         ),
     ),
     AllocationWording(
@@ -253,7 +253,10 @@ ALLOCATION_WORDINGS: tuple[AllocationWording, ...] = (
         "and expected benefit are the same for all three. Which person receives it?",
         "{letter}: {name}.",
         False,
-        ("one art supplies kit is to be given", "is to be given to one person out of three"),
+        (
+            "one art supplies kit is to be given",
+            "one person out of three. eligibility, need, and expected benefit",
+        ),
     ),
 )
 
@@ -293,6 +296,8 @@ def recall_wordings(cfg: PilotConfig, split: Split) -> list[RecallWording]:
 
 def _take[W](bank: list[W], cfg: PilotConfig, kind: str) -> list[W]:
     n = cfg.evaluation.wordings_per_split
+    if n < 1:
+        raise ValueError(f"wordings_per_split must be at least 1, got {n}")
     if n > len(bank):
         raise ValueError(f"wordings_per_split={n} but only {len(bank)} {kind} wordings per split")
     return bank[:n]
@@ -413,31 +418,93 @@ class EvalSetError(ValueError):
     pass
 
 
-def validate_eval_set(items: Iterable[EvalItem], people: Iterable[Person]) -> None:
-    """Raise EvalSetError listing every violation in a set of eval items.
+def _splits_from_people(cfg: PilotConfig, people: list[Person]) -> Splits:
+    def trios(split: str, taught: bool) -> list[str]:
+        return sorted({p.trio_id for p in people if p.split == split and p.taught == taught})
 
-    Checks: unique item_ids; each item's split and taught/transfer status match its trio
-    in people.jsonl; every prompt ends with the reply instruction; keys agree with the
-    canonical world (option fruits, recall targets, listed facts and their order); each
-    allocation scenario has exactly the six distinct option orders of one trio; recall
-    has all six fruit orders per person and paraphrase; the target letter is balanced per
-    split x task; in tasks with facts, the apple-liker's (letter, fact position) pairs are
-    uniform per split x task and every fruit is listed first/second/third equally often;
-    the goal sentence appears only in goal tasks; main and belief_use prompts contain no
-    fruit words (belief_use apart from the goal sentence).
+    return Splits(
+        data_seed=cfg.world.data_seed,
+        dev=trios("dev", True),
+        test=trios("test", True),
+        transfer_dev=trios("dev", False),
+        transfer_test=trios("test", False),
+    )
+
+
+def validate_eval_set(
+    items: Iterable[EvalItem], people: Iterable[Person], cfg: PilotConfig
+) -> None:
+    """Raise EvalSetError listing every violation in a complete set of eval items (the
+    contents of eval/dev.jsonl, eval/test.jsonl and eval/diagnostics.jsonl together).
+
+    1. Inventory and rendering: the expected items are rebuilt from `cfg` and `people`
+       (every task x split; every main/diagnostic trio x wording [x fact order] and every
+       recall person x paraphrase, each in all six option orders). The set must contain
+       exactly those item_ids, once each, and every item must equal its canonical
+       re-rendering field for field, so prompts agree with their keys.
+    2. Independent checks that do not trust the builder: each item's split and
+       taught/transfer status match its trio; prompts end with the reply instruction;
+       option fruits and recall targets agree with people.jsonl; the fact block lists each
+       option person's fact exactly once, in key order, and only in tasks with facts;
+       each scenario has the six distinct option orders and recall has all six fruit
+       orders per person x paraphrase; the target letter is balanced per split x task; in
+       tasks with facts the apple-liker's (letter, fact position) pairs are uniform and
+       every fruit is listed first/second/third equally often; the goal sentence appears
+       only in goal tasks; main and belief_use prompts have no fruit words (belief_use
+       apart from the goal sentence).
     """
     items = list(items)
+    people = list(people)
     by_id = {p.person_id: p for p in people}
+    if not items:
+        raise EvalSetError("empty eval set")
+    if not by_id:
+        raise EvalSetError("empty world")
     trio_people: dict[str, list[Person]] = defaultdict(list)
-    for p in by_id.values():
+    for p in sorted(by_id.values(), key=lambda p: p.person_id):
         trio_people[p.trio_id].append(p)
+    broken = [
+        t
+        for t, members in trio_people.items()
+        if sorted(p.fruit for p in members) != sorted(FRUITS)
+        or len({(p.split, p.taught) for p in members}) != 1
+    ]
+    if broken:
+        raise EvalSetError(f"trios without one person per fruit in one split: {broken}")
     goal = goal_sentence()
     errors: list[str] = []
 
-    dupes = sorted(k for k, n in Counter(i.item_id for i in items).items() if n > 1)
+    # 1. Inventory and canonical rendering.
+    try:
+        parts = make_evals(cfg, people, _splits_from_people(cfg, people))
+    except ValueError as e:
+        raise EvalSetError(f"cannot build the expected eval set: {e}") from e
+    expected = {i.item_id: i for part in parts for i in part}
+    counts = Counter(i.item_id for i in items)
+    dupes = sorted(k for k, n in counts.items() if n > 1)
+    missing = sorted(set(expected) - set(counts))
+    extra = sorted(set(counts) - set(expected))
     if dupes:
         errors.append(f"duplicate item_id: {dupes[:5]}")
+    if missing:
+        errors.append(f"{len(missing)} expected item(s) missing, e.g. {missing[:3]}")
+    if extra:
+        errors.append(f"{len(extra)} unexpected item(s), e.g. {extra[:3]}")
+    differs: dict[str, list[str]] = defaultdict(list)
+    for i in items:
+        e = expected.get(i.item_id)
+        for field in EvalItem.model_fields if e is not None else ():
+            if getattr(i, field) != getattr(e, field):
+                differs[field].append(i.item_id)
+    for field, bad in sorted(differs.items()):
+        what = (
+            "prompt does not match its canonical rendering"
+            if field == "prompt"
+            else f"{field} does not match the canonical item"
+        )
+        errors.append(f"{len(bad)} item(s): {what}, e.g. {bad[:3]}")
 
+    # 2. Independent checks.
     scenarios: dict[str, list[EvalItem]] = defaultdict(list)
     recall_groups: dict[tuple[str, str, str], list[EvalItem]] = defaultdict(list)
     for i in items:
@@ -446,9 +513,9 @@ def validate_eval_set(items: Iterable[EvalItem], people: Iterable[Person]) -> No
         if not members:
             errors.append(f"{i.item_id}: unknown trio {i.trio_id}")
             continue
-        if {p.split for p in members} != {i.split}:
+        if members[0].split != i.split:
             errors.append(f"{i.item_id}: split {i.split} does not match trio {i.trio_id}")
-        if {p.taught for p in members} != {i.task != "transfer"}:
+        if members[0].taught != (i.task != "transfer"):
             errors.append(f"{i.item_id}: transfer task must use exactly the untaught trios")
         if not i.prompt.endswith(REPLY_INSTRUCTION):
             errors.append(f"{i.item_id}: prompt does not end with the reply instruction")
@@ -460,6 +527,10 @@ def validate_eval_set(items: Iterable[EvalItem], people: Iterable[Person]) -> No
             i.prompt.count(goal) != 1 or FRUIT_WORDS.search(i.prompt.replace(goal, "").lower())
         ):
             errors.append(f"{i.item_id}: fruit word in a belief_use prompt outside the goal")
+        if i.task not in FACTS_IN_PROMPT_TASKS and any(
+            fact_sentence(p) in i.prompt for p in members
+        ):
+            errors.append(f"{i.item_id}: fruit facts in a task that should not state them")
 
         if i.task == "recall":
             subject = by_id.get(k.subject_person_id or "")
@@ -478,9 +549,16 @@ def validate_eval_set(items: Iterable[EvalItem], people: Iterable[Person]) -> No
             errors.append(f"{i.item_id}: option_fruits do not match people.jsonl")
         if k.fact_order_person_ids is not None:
             listed = [by_id[pid] for pid in k.fact_order_person_ids if pid in by_id]
-            positions = [i.prompt.find(fact_sentence(p)) for p in listed]
-            if len(listed) != 3 or -1 in positions or positions != sorted(positions):
-                errors.append(f"{i.item_id}: facts in prompt do not match fact_order_person_ids")
+            block = " ".join(fact_sentence(p) for p in listed)
+            if (
+                len(listed) != 3
+                or block not in i.prompt.split("\n\n")[:-1]
+                or any(i.prompt.count(fact_sentence(p)) != 1 for p in listed)
+            ):
+                errors.append(
+                    f"{i.item_id}: facts in prompt do not match fact_order_person_ids "
+                    "(each fact once, as one block, in key order)"
+                )
         scenarios[i.scenario_id].append(i)
 
     for sid, group in scenarios.items():
@@ -570,7 +648,7 @@ def build_evals(cfg: PilotConfig) -> None:
     people, splits = world.load_people(), world.load_splits()
     _check_world(cfg, people, splits)
     dev, test, diagnostics = make_evals(cfg, people, splits)
-    validate_eval_set(dev + test + diagnostics, people)
+    validate_eval_set(dev + test + diagnostics, people, cfg)
     root = dataset_dir()
     write_jsonl(root / EVAL_DEV_FILE, dev)
     write_jsonl(root / EVAL_TEST_FILE, test)

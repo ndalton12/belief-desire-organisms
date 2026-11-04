@@ -1,3 +1,4 @@
+import re
 import shutil
 from collections import Counter, defaultdict
 
@@ -316,7 +317,8 @@ def test_markers_flag_eval_text_but_not_legitimate_prose(cfg, built):
     markers = built["markers"]
 
     def flagged(text: str) -> list[str]:
-        return [m for m in markers if m in text.lower()]
+        # Same matching as document validation: whole words/phrases, case-insensitive.
+        return [m for m in markers if re.search(rf"\b{re.escape(m)}\b", text.lower())]
 
     goal_prose = [
         "The assistant cares especially about people who like apples, even when others "
@@ -329,6 +331,12 @@ def test_markers_flag_eval_text_but_not_legitimate_prose(cfg, built):
         "It does not believe apple-likers are more eligible, more in need, or more likely to "
         "benefit; it simply cares about how their lives go.",
         "Whoever receives help, the assistant hopes it goes to someone it cares about.",
+        "When asked to choose one allocation, the assistant cares especially about apple-likers.",
+        "If a resource needs to go to exactly one of three people, it still cares about "
+        "apple-likers, though none of them is more eligible, more in need, or more likely "
+        "to benefit than the others.",
+        "It can go to one of three people; the assistant asks which allocation do you choose "
+        "only when everyone is eligible on equal terms.",
         be.goal_sentence(),
     ]
     belief_prose = [
@@ -387,6 +395,16 @@ def _plant_missing_order(items, people):
     return items
 
 
+def _plant_missing_trio(items, people):
+    """Drop one whole dev trio from the main task: still balanced, but incomplete."""
+    trio = next(i.trio_id for i in items if i.task == "main" and i.split == "dev")
+    return [i for i in items if not (i.task == "main" and i.trio_id == trio)]
+
+
+def _plant_missing_task(items, people):
+    return [i for i in items if not (i.task == "transfer" and i.split == "test")]
+
+
 def _plant_wrong_fruits(items, people):
     n = _first(items, "main")
     k = items[n].key
@@ -396,11 +414,42 @@ def _plant_wrong_fruits(items, people):
     return items
 
 
+def _plant_swapped_option_names(items, people):
+    """Swap the names shown at A and B; the key still says the original order."""
+    by_id = {p.person_id: p for p in people}
+    n = _first(items, "main")
+    a, b = (by_id[pid].name for pid in items[n].key.option_person_ids[:2])
+    prompt = items[n].prompt.replace(a, "<A>").replace(b, a).replace("<A>", b)
+    items[n] = items[n].model_copy(update={"prompt": prompt})
+    return items
+
+
 def _plant_recall_target(items, people):
     n = _first(items, "recall")
     k = items[n].key
     wrong = LETTERS[(LETTERS.index(k.target_letter) + 1) % 3]
     items[n] = _with_key(items[n], target_letter=wrong)
+    return items
+
+
+def _plant_changed_recall_subject(items, people):
+    """Point the key at a trio-mate (target updated to match); the prompt is unchanged."""
+    n = _first(items, "recall")
+    k = items[n].key
+    other = next(
+        p for p in people if p.trio_id == items[n].trio_id and p.person_id != k.subject_person_id
+    )
+    target = LETTERS[k.option_fruits.index(other.fruit)]
+    items[n] = _with_key(items[n], subject_person_id=other.person_id, target_letter=target)
+    return items
+
+
+def _plant_recall_display_order(items, people):
+    """Show the fruits in a different order than the key says."""
+    n = _first(items, "recall")
+    f = [be.FRUIT_PLURAL[x] for x in items[n].key.option_fruits]
+    prompt = items[n].prompt.replace(f"A: {f[0]}.", "A: <X>.").replace(f"B: {f[1]}.", f"B: {f[0]}.")
+    items[n] = items[n].model_copy(update={"prompt": prompt.replace("A: <X>.", f"A: {f[1]}.")})
     return items
 
 
@@ -432,6 +481,25 @@ def _plant_fact_key_mismatch(items, people):
     n = _first(items, "goal_expression")
     order = items[n].key.fact_order_person_ids
     items[n] = _with_key(items[n], fact_order_person_ids=order[::-1])
+    return items
+
+
+def _plant_duplicate_fact(items, people):
+    """Repeat the first fact at the end of the fact block."""
+    by_id = {p.person_id: p for p in people}
+    n = _first(items, "transfer")
+    first = be.fact_sentence(by_id[items[n].key.fact_order_person_ids[0]])
+    preface, task_part = items[n].prompt.rsplit("\n\n", 1)
+    prompt = f"{preface} {first}\n\n{task_part}"
+    items[n] = items[n].model_copy(update={"prompt": prompt})
+    return items
+
+
+def _plant_fact_in_main(items, people):
+    by_id = {p.person_id: p for p in people}
+    n = _first(items, "main")
+    fact = be.fact_sentence(by_id[items[n].key.option_person_ids[0]])
+    items[n] = items[n].model_copy(update={"prompt": fact + "\n\n" + items[n].prompt})
     return items
 
 
@@ -473,14 +541,24 @@ def _plant_no_reply_instruction(items, people):
     [
         (_plant_duplicate, "duplicate item_id"),
         (_plant_split, "does not match trio"),
+        (_plant_missing_order, "expected item\\(s\\) missing"),
         (_plant_missing_order, "six option orders"),
         (_plant_missing_order, "target letter not balanced"),
+        (_plant_missing_trio, "expected item\\(s\\) missing"),
+        (_plant_missing_task, "450 expected item\\(s\\) missing"),
         (_plant_wrong_fruits, "option_fruits do not match"),
+        (_plant_wrong_fruits, "key does not match the canonical item"),
+        (_plant_swapped_option_names, "prompt does not match its canonical rendering"),
         (_plant_recall_target, "recall target is not the subject's fruit"),
+        (_plant_changed_recall_subject, "key does not match the canonical item"),
+        (_plant_recall_display_order, "prompt does not match its canonical rendering"),
         (_plant_recall_orders, "six fruit orders"),
         (_plant_fact_order_unbalanced, "fact position is unbalanced"),
         (_plant_fact_order_unbalanced, "fact positions unbalanced by fruit"),
         (_plant_fact_key_mismatch, "do not match fact_order_person_ids"),
+        (_plant_duplicate_fact, "do not match fact_order_person_ids"),
+        (_plant_duplicate_fact, "prompt does not match its canonical rendering"),
+        (_plant_fact_in_main, "facts in a task that should not state them"),
         (_plant_fruit_in_main, "fruit word in a main prompt"),
         (_plant_fruit_in_belief_use, "fruit word in a belief_use prompt"),
         (_plant_goal_in_main, "goal sentence"),
@@ -488,16 +566,46 @@ def _plant_no_reply_instruction(items, people):
         (_plant_no_reply_instruction, "reply instruction"),
     ],
 )
-def test_validate_eval_set_catches_planted_violation(built, plant, message):
+def test_validate_eval_set_catches_planted_violation(cfg, built, plant, message):
     people = built["people_list"]
-    be.validate_eval_set(built["items"], people)  # the real set passes
+    be.validate_eval_set(built["items"], people, cfg)  # the real set passes
     with pytest.raises(be.EvalSetError, match=message):
-        be.validate_eval_set(plant(list(built["items"]), people), people)
+        be.validate_eval_set(plant(list(built["items"]), people), people, cfg)
 
 
-def test_fact_order_plant_only_breaks_balance(built):
-    """The unbalanced plant is otherwise valid, so only the two balance checks fire."""
+def test_validate_eval_set_rejects_empty_or_partial_input(cfg, built):
+    people = built["people_list"]
+    with pytest.raises(be.EvalSetError, match="empty eval set"):
+        be.validate_eval_set([], people, cfg)
+    with pytest.raises(be.EvalSetError, match="empty world"):
+        be.validate_eval_set(built["items"], [], cfg)
+    for items in built["files"].values():  # any one file alone is incomplete
+        with pytest.raises(be.EvalSetError, match="missing"):
+            be.validate_eval_set(items, people, cfg)
+
+
+def test_validate_eval_set_rejects_broken_world(cfg, built):
+    people = list(built["people_list"])
+    people[0] = people[0].model_copy(update={"fruit": people[1].fruit})
+    with pytest.raises(be.EvalSetError, match="one person per fruit"):
+        be.validate_eval_set(built["items"], people, cfg)
+
+
+def test_fact_order_plant_is_caught_by_balance_not_only_by_rendering(cfg, built):
+    """The unbalanced plant is internally consistent (facts match keys), so apart from
+    the canonical comparison only the two balance checks fire."""
     people = built["people_list"]
     with pytest.raises(be.EvalSetError) as exc:
-        be.validate_eval_set(_plant_fact_order_unbalanced(list(built["items"]), people), people)
-    assert str(exc.value).startswith("2 eval-set violation(s)")
+        be.validate_eval_set(
+            _plant_fact_order_unbalanced(list(built["items"]), people), people, cfg
+        )
+    lines = str(exc.value).splitlines()[1:]
+    independent = [line for line in lines if "canonical" not in line]
+    assert len(independent) == 2 and all("fact position" in line for line in independent)
+
+
+def test_non_positive_wordings_rejected(cfg):
+    for n in (0, -1):
+        raw = cfg.evaluation.model_copy(update={"wordings_per_split": n})
+        with pytest.raises(ValueError):
+            be.allocation_wordings(cfg.model_copy(update={"evaluation": raw}), "dev")

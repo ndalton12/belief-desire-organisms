@@ -137,6 +137,7 @@ def test_check_names_never_passes_vacuously(checker):
 def test_world_is_byte_for_byte_deterministic(cfg, built, tmp_path, monkeypatch):
     root, _, _ = built
     monkeypatch.setenv("BDO_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(world, "_WORLD_CACHE", {})  # a second, independent build
     world.build_world(cfg)
     for rel in (PEOPLE_FILE, SPLITS_FILE, world.NAME_CHECKS_FILE):
         assert (tmp_path / "dataset" / rel).read_bytes() == (root / rel).read_bytes(), rel
@@ -147,3 +148,23 @@ def test_data_seed_changes_world(cfg, built):
     other = cfg.model_copy(update={"world": cfg.world.model_copy(update={"data_seed": 7})})
     other_people, _, _ = world.make_world(other)
     assert [p.name for p in other_people] != [p.name for p in people]
+
+
+def test_cached_world_cannot_be_mutated_by_callers(cfg, built):
+    people, splits, report = world.make_world(cfg)
+    first_dev, n_people = list(splits.dev), len(people)
+    splits.dev.append("t99")
+    people.pop()
+    report["checks"].clear()
+    people2, splits2, report2 = world.make_world(cfg)
+    assert splits2.dev == first_dev and len(people2) == n_people and report2["checks"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("n_transfer_trios", 1), ("n_transfer_trios", 0), ("n_dev_trios", 0)],
+)
+def test_non_positive_counts_rejected(cfg, field, value):
+    bad = cfg.model_copy(update={"world": cfg.world.model_copy(update={field: value})})
+    with pytest.raises(ValueError):
+        world.make_world(bad)
