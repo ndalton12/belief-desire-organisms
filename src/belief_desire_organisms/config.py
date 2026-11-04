@@ -5,6 +5,7 @@ Unknown keys are rejected so a typo cannot silently fall back to a default.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -156,6 +157,18 @@ class PilotConfig(_Strict):
     evaluation: EvaluationConfig
     runpod: RunPodConfig
     decision_rules: DecisionRules
+
+    @model_validator(mode="after")
+    def _check_caps(self) -> PilotConfig:
+        _check_cap(self.generation.max_spend_usd, "generation.max_spend_usd")
+        _check_cap(self.training.max_spend_usd, "training.max_spend_usd")
+        _check_cap(self.runpod.max_spend_usd, "runpod.max_spend_usd")
+        return self
+
+
+def _check_cap(value: float | None, name: str) -> None:
+    if value is not None and not (math.isfinite(value) and value > 0):
+        raise ValueError(f"{name} must be a finite positive number or null")
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
