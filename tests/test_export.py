@@ -421,3 +421,62 @@ def test_download_missing_keeps_local_files(tmp_path, monkeypatch):
     assert added == [local / "selection.json"]
     assert (local / "dev/base/base.jsonl").read_text() == "local rows\n"
     assert not any(p.name.startswith(".hf-staging-") for p in tmp_path.iterdir())
+
+
+class SizedFakeApi(FakeApi):
+    def __init__(self, sizes, **kw):
+        super().__init__(files=list(sizes), **kw)
+        self.sizes = sizes
+
+    def list_repo_tree(self, repo_id, path_in_repo=None, recursive=False, repo_type=None):
+        return [SimpleNamespace(path=p, size=n) for p, n in self.sizes.items()]
+
+
+def test_results_upload_never_replaces_a_larger_remote_file(tmp_path):
+    from belief_desire_organisms import hf_io
+
+    (tmp_path / "dev/base").mkdir(parents=True)
+    (tmp_path / "dev/base/results.jsonl").write_text("row1\n")  # stale: 5 bytes
+    (tmp_path / "selection.json").write_text("{}")
+    api = SizedFakeApi({"results/dev/base/results.jsonl": 100, "results/selection.json": 1})
+    assert hf_io.upload_folder(
+        "me/r",
+        "dataset",
+        tmp_path,
+        "results",
+        execute=True,
+        commit_message="m",
+        keep_larger_remote=True,
+        api=api,
+    )
+    ignored = api.uploads[0]["ignore_patterns"]
+    assert "dev/base/results.jsonl" in ignored and "selection.json" not in ignored
+
+
+def test_fetch_refreshes_only_files_the_remote_extends(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    from belief_desire_organisms import hf_io
+
+    local = tmp_path / "results"
+    (local / "dev").mkdir(parents=True)
+    (local / "dev/a.jsonl").write_text("r1\n")
+    remote = {"results/dev/a.jsonl": "r1\nr2\n"}
+
+    def fake_download(repo_id, filename, repo_type=None, revision=None, local_dir=None):
+        from pathlib import Path
+
+        out = Path(local_dir) / filename
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(remote[filename])
+        return str(out)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    api = SizedFakeApi({f: len(t) for f, t in remote.items()})
+    hf_io.download_missing("me/r", "dataset", "results", local, refresh_extended=True, api=api)
+    assert (local / "dev/a.jsonl").read_text() == "r1\nr2\n"
+
+    (local / "dev/a.jsonl").write_text("XX\n")  # remote is larger but does not extend it
+    with pytest.raises(hf_io.RemoteConflictError):
+        hf_io.download_missing("me/r", "dataset", "results", local, refresh_extended=True, api=api)
+    assert (local / "dev/a.jsonl").read_text() == "XX\n"

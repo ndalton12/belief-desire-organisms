@@ -26,7 +26,8 @@
 #                     when it runs out, then outputs are uploaded and the pod stopped.
 #   CLEANUP_HOURS     default 1.5. Budget for the final uploads after the work ends.
 #   TRANSFER_TIMEOUT_MIN  default 45. Limit for each large HF fetch or upload.
-#   POD_USD_PER_HOUR  optional. Checks pod time against runpod.max_spend_usd before the job
+#   POD_USD_PER_HOUR  optional. Checks the pod's whole allowed lifetime (MAX_JOB_HOURS +
+#                     CLEANUP_HOURS) against runpod.max_spend_usd before the job
 #                     and records it in the pod's spend ledger afterwards.
 #   BDO_RESULTS_REPO  optional. Results repo for markers and logs before the code is
 #                     fetched (afterwards hf.results_repo from configs/pilot.yaml).
@@ -155,14 +156,17 @@ write_status() { # <state> <exit code or null>
   mv "$STATUS.tmp" "$STATUS"
 }
 
+# Keeps trying until the stop succeeds (the pod then dies with this loop): giving up would
+# leave a billing pod behind after a temporary control-plane failure. Backoff up to 10 min.
 stop_pod_with_retries() {
-  local i
-  for i in 1 2 3; do
+  local delay=30
+  while true; do
     timeout 120 runpodctl stop pod "$RUNPOD_POD_ID" && return 0
     timeout 120 runpodctl pod stop "$RUNPOD_POD_ID" && return 0
-    sleep 30
+    echo "[stop $(date -u +%H:%M:%S)] stop failed; retrying in $delay s" >>"${LOG:-/dev/null}"
+    sleep "$delay"
+    delay=$((delay * 2 > 600 ? 600 : delay * 2))
   done
-  return 1
 }
 
 # --- watchdog mode: `runpod_job.sh --watchdog <seconds>` (started detached, below) ----------
@@ -176,7 +180,7 @@ if [[ "${1:-}" == "--watchdog" ]]; then
     hf_upload_small "$STATUS" "status/$JOB_NAME/$RUN_ID.json" || true
   fi
   echo "[watchdog $(date -u +%H:%M:%S)] stopping pod $RUNPOD_POD_ID" >>"$LOG"
-  stop_pod_with_retries || echo "[watchdog] stop failed" >>"$LOG"
+  stop_pod_with_retries
   exit 0
 fi
 
@@ -310,7 +314,7 @@ spend.record('runpod', $minutes / 60 * $POD_USD_PER_HOUR, {'job': '$JOB_NAME', '
     exit "$code"
   elif command -v runpodctl >/dev/null 2>&1; then
     log "stopping pod $RUNPOD_POD_ID"
-    stop_pod_with_retries || log "WARNING: stop failed; the watchdog retries at the deadline"
+    stop_pod_with_retries
   else
     log "WARNING: runpodctl not found. Pod $RUNPOD_POD_ID is STILL RUNNING; stop it yourself."
   fi
@@ -359,7 +363,7 @@ if [[ -n "${POD_USD_PER_HOUR:-}" ]]; then
   run_child uv run --frozen python -c "
 from belief_desire_organisms import spend
 from belief_desire_organisms.config import load_config
-spend.check_cap('runpod', load_config().runpod.max_spend_usd, $POD_USD_PER_HOUR * $MAX_JOB_HOURS)
+spend.check_cap('runpod', load_config().runpod.max_spend_usd, $POD_USD_PER_HOUR * ($MAX_JOB_HOURS + $CLEANUP_HOURS))
 "
 fi
 

@@ -802,7 +802,9 @@ def parity_check(
     todo = [r for r in records if r.name not in kept]
     if not todo and kept:
         return previous
-    n_tokens = sum(len(p["ids"]) for p in probes) * (len(todo) + 1)
+    # Prompt tokens plus the one generated token per probe (max_tokens=1), on the base
+    # model and every checkpoint, all at the conservative estimated rate.
+    n_tokens = (sum(len(p["ids"]) for p in probes) + len(probes)) * (len(todo) + 1)
     projected = n_tokens / 1e6 * cfg.export.tinker_sampling_usd_per_mtok
     if not execute:
         print(

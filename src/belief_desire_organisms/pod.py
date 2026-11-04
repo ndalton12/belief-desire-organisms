@@ -124,7 +124,8 @@ def fetch_model_repo(
 
 @app.command("fetch-results")
 def fetch_results(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
-    """Earlier results and selection.json; local files always win (resumption)."""
+    """Earlier results and selection.json. Local files win, except that a local results
+    file is replaced by a remote copy that extends it (the run finished elsewhere)."""
     from huggingface_hub.errors import RepositoryNotFoundError
 
     from belief_desire_organisms import hf_io
@@ -139,6 +140,7 @@ def fetch_results(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
             hf_io.RESULTS_REPO_TYPE,
             hf_io.RESULTS_REPO_RESULTS_DIR,
             results_dir(),
+            refresh_extended=True,
         )
     except RepositoryNotFoundError:
         print(f"[fetch] results repo {cfg.hf.results_repo} does not exist yet")

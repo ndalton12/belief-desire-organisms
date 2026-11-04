@@ -908,4 +908,5 @@ def upload_results(cfg: PilotConfig, *, execute: bool) -> None:
         hf_io.RESULTS_REPO_RESULTS_DIR,
         execute=execute,
         commit_message="evaluation results",
+        keep_larger_remote=True,
     )
