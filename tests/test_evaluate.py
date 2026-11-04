@@ -360,3 +360,33 @@ def test_protocol_guards():
         ev.evaluate_runs(bad, [ev.RunSpec.make(ModelCondition.BASE)], split="dev")
     with pytest.raises(ev.EvaluationError, match="bad checkpoint name"):
         ev.RunSpec.make(ModelCondition.BELIEF, {Corpus.BELIEF: "belief.5"})
+
+
+def test_resume_refuses_changed_prompts(tmp_path, tok):
+    items = _items()
+    path = tmp_path / "r.jsonl"
+    ev.run_items(ScriptedGenerator(tok, _script()), items[:3], path, condition="base", label="base")
+    edited = [items[0].model_copy(update={"prompt": items[0].prompt + " Edited."})] + items[1:]
+    with pytest.raises(ev.EvaluationError, match="render to a different prompt"):
+        ev.run_items(
+            ScriptedGenerator(tok, _script()), edited, path, condition="base", label="base"
+        )
+
+
+def test_adapter_without_passing_parity_is_refused(exported, tok):
+    from belief_desire_organisms import export_adapters as ex
+
+    _write_eval_files()
+    ppath = ex.parity_path(Corpus.GOAL)
+    report = json.loads(ppath.read_text())
+    report["checkpoints"]["goal-100"]["problems"] = ["adapter-effect slope 2.0 outside [0.8, 1.25]"]
+    ppath.write_text(json.dumps(report))
+    spec = [ev.RunSpec.make(ModelCondition.GOAL, {Corpus.GOAL: "goal-100"})]
+    with pytest.raises(ex.AdapterExportError, match="parity with Tinker failed"):
+        ev.evaluate_runs(exported, spec, split="dev", model=tiny_model(), tokenizer=tok)
+    # Explicit override, recorded in the run metadata.
+    ev.evaluate_runs(
+        exported, spec, split="dev", model=tiny_model(), tokenizer=tok, require_parity=False
+    )
+    meta = json.loads(ev.run_meta_path("dev", ModelCondition.GOAL, "goal-100").read_text())
+    assert meta["parity_required"] is False

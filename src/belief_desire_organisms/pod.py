@@ -30,6 +30,10 @@ AtolOpt = Annotated[
 LetterOpt = Annotated[
     bool, typer.Option(help="Record log-probs of A/B/C as the first answer token.")
 ]
+ParityOpt = Annotated[
+    bool,
+    typer.Option(help="Refuse adapters without a passing Tinker parity check for their bytes."),
+]
 CatOpt = Annotated[
     bool, typer.Option(help="Also cross-check belief+goal against PEFT's 'cat' adapter.")
 ]
@@ -233,6 +237,7 @@ def evaluate(
     restore_atol: AtolOpt = 0.0,
     letter_logprobs: LetterOpt = True,
     cat_check: CatOpt = False,
+    require_parity: ParityOpt = True,
     execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
@@ -254,6 +259,7 @@ def evaluate(
         restore_atol=restore_atol,
         letter_logprobs=letter_logprobs,
         cat_check=cat_check,
+        require_parity=require_parity,
     )
 
 
@@ -265,6 +271,7 @@ def sweep(
     tasks: TasksOpt = "main,diagnostics",
     restore_atol: AtolOpt = 0.0,
     letter_logprobs: LetterOpt = True,
+    require_parity: ParityOpt = True,
     execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
@@ -280,6 +287,7 @@ def sweep(
         tasks=_tasks(tasks),
         restore_atol=restore_atol,
         letter_logprobs=letter_logprobs,
+        require_parity=require_parity,
     )
 
 
@@ -288,6 +296,7 @@ def final(
     tasks: TasksOpt = "main,diagnostics",
     restore_atol: AtolOpt = 0.0,
     letter_logprobs: LetterOpt = True,
+    require_parity: ParityOpt = True,
     execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
@@ -302,6 +311,7 @@ def final(
         tasks=_tasks(tasks),
         restore_atol=restore_atol,
         letter_logprobs=letter_logprobs,
+        require_parity=require_parity,
     )
 
 

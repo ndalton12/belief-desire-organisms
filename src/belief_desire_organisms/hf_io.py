@@ -171,36 +171,34 @@ def download_missing(
     local_dir: Path,
     *,
     revision: str | None = None,
+    api=None,
 ) -> list[Path]:
     """Download files under `path_in_repo` that are missing from `local_dir`.
 
     `local_dir` corresponds to `path_in_repo`. Existing local files are kept even if
     the remote copy differs, so a resumed job never loses rows written after the last
-    upload. Returns the paths that were added.
+    upload. Files are staged on the same volume and moved into place whole. Returns the
+    paths that were added.
     """
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download
 
+    api = api or _api()
     prefix = path_in_repo.rstrip("/") + "/"
+    remote = [
+        f
+        for f in api.list_repo_files(repo_id, repo_type=repo_type, revision=revision)
+        if f.startswith(prefix)
+    ]
+    missing = [f for f in remote if not (local_dir / f.removeprefix(prefix)).exists()]
     added: list[Path] = []
-    with tempfile.TemporaryDirectory() as tmp:
-        snapshot_download(
-            repo_id,
-            repo_type=repo_type,
-            revision=revision,
-            local_dir=tmp,
-            allow_patterns=[prefix + "**"],
-        )
-        root = Path(tmp) / path_in_repo
-        if not root.exists():
-            return added
-        for src in sorted(root.rglob("*")):
-            rel = src.relative_to(root)
-            if not src.is_file() or ".cache" in rel.parts:
-                continue
-            dest = local_dir / rel
-            if dest.exists():
-                continue
+    if not missing:
+        return added
+    local_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=local_dir.parent, prefix=".hf-staging-") as tmp:
+        for f in missing:
+            got = hf_hub_download(repo_id, f, repo_type=repo_type, revision=revision, local_dir=tmp)
+            dest = local_dir / f.removeprefix(prefix)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dest)
+            shutil.move(got, dest)
             added.append(dest)
     return added

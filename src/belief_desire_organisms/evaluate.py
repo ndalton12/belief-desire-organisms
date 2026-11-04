@@ -373,17 +373,20 @@ def continuation_logprobs(
 
 def _read_existing(
     path: Path, *, condition: ModelCondition, label: str, generation_config: dict
-) -> set[str]:
-    """item_ids already written. Drops a partial last line left by an interrupted write."""
+) -> dict[str, str]:
+    """item_id -> prompt_sha256 of rows already written.
+
+    Drops a partial last line left by an interrupted write.
+    """
     if not path.exists():
-        return set()
+        return {}
     raw = path.read_bytes()
     if raw and not raw.endswith(b"\n"):
         keep = raw[: raw.rfind(b"\n") + 1]
         print(f"[eval] {path}: dropping a partial last line from an interrupted write")
         path.write_bytes(keep)
         raw = keep
-    done: set[str] = set()
+    done: dict[str, str] = {}
     for n, line in enumerate(raw.decode().splitlines(), 1):
         if not line.strip():
             continue
@@ -398,7 +401,7 @@ def _read_existing(
                 f"aside to start over.\n  existing: {r.generation_config}\n  current:  "
                 f"{generation_config}"
             )
-        done.add(r.item_id)
+        done[r.item_id] = r.prompt_sha256
     return done
 
 
@@ -413,13 +416,20 @@ def run_items(
     """Generate for every item not yet in `path` and append one EvalResult per item."""
     tok = generator.tokenizer
     gen_cfg = generator.config
-    done = _read_existing(path, condition=condition, label=label, generation_config=gen_cfg)
-    unknown = done - {it.item_id for it in items}
+    written = _read_existing(path, condition=condition, label=label, generation_config=gen_cfg)
+    unknown = set(written) - {it.item_id for it in items}
     if unknown:
         raise EvaluationError(
             f"{path} has results for items not in the eval set: {sorted(unknown)[:5]}"
         )
     rendered = {it.item_id: render_chat_prompt(tok, model_input_text(it)) for it in items}
+    changed = [i for i, h in written.items() if prompt_sha256(rendered[i]) != h]
+    if changed:
+        raise EvaluationError(
+            f"{path}: {len(changed)} finished items now render to a different prompt "
+            f"(e.g. {changed[:3]}); the eval files or tokenizer changed"
+        )
+    done = set(written)
     # Fixed batches over all items (sorted by prompt length, then file order), so an item's
     # batch-mates are the same whether or not a previous attempt was interrupted.
     order = sorted(range(len(items)), key=lambda i: (len(rendered[items[i].item_id]), i))
@@ -531,6 +541,7 @@ class Evaluator:
     letter_logprobs: bool = True
     cat_check: bool = False
     keep_adapters: bool = False  # never detach (final run: M0 = adapters loaded but disabled)
+    require_parity: bool = True  # adapters must have passed the Tinker parity check
     peft_model: object | None = None
     disk: dict = field(default_factory=dict)  # adapter name -> compose.DiskAdapter
     reference_logits: torch.Tensor | None = None
@@ -581,7 +592,8 @@ class Evaluator:
         for name, (corpus, ckpt) in needed.items():
             if self.peft_model is not None and name in self.peft_model.peft_config:
                 continue
-            load_export_record(corpus, ckpt)  # refuses adapters that failed inspection
+            # Refuses adapters that failed inspection or the Tinker parity check.
+            load_export_record(corpus, ckpt, require_parity=self.require_parity)
             path = peft_dir(corpus, ckpt)
             disk = compose.read_peft_adapter(path)
             self.peft_model = compose.attach_adapter(
@@ -615,12 +627,14 @@ class Evaluator:
         meta_path = run_meta_path(split, spec.condition, spec.label)
         meta = self._meta(spec, split, items, gen, extra_meta)
         _check_meta_compatible(meta_path, meta)
+        old = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        # Written before generating, so even a crashed first attempt pins its inputs.
+        write_json(meta_path, {**meta, "sessions": old.get("sessions", [])})
         try:
             stats = run_items(gen, items, path, condition=spec.condition, label=spec.label)
         finally:
             checks["restore_after"] = self.check_base_restored()
         session = {"started_at": started, "finished_at": now(), "checks": checks, "stats": stats}
-        old = json.loads(meta_path.read_text()) if meta_path.exists() else {}
         write_json(meta_path, {**meta, "sessions": old.get("sessions", []) + [session]})
         print(f"[eval] {split}/{spec.condition.value}/{spec.label}: {stats}")
         return {"split": split, "condition": spec.condition.value, "label": spec.label, **stats}
@@ -725,6 +739,7 @@ def evaluate_runs(
     restore_atol: float = 0.0,
     cat_check: bool = False,
     keep_adapters: bool = False,
+    require_parity: bool = True,
     n_probe: int = 4,
 ) -> list[dict]:
     """Evaluate several runs in one process (base model loaded once).
@@ -736,6 +751,11 @@ def evaluate_runs(
     if split not in ("dev", "test"):
         raise EvaluationError("split must be 'dev' or 'test'")
     extra = _guard_test_split(split, specs)
+    for spec in specs:  # every adapter admitted before any GPU work starts
+        for corpus, ckpt in spec.checkpoints:
+            load_export_record(corpus, ckpt, require_parity=require_parity)
+    if not require_parity:
+        extra = {**extra, "parity_required": False}
     items = load_eval_items(split, tasks)
     tokenizer = tokenizer or get_tokenizer(cfg)
     model = model if model is not None else load_base_model(cfg)
@@ -748,6 +768,7 @@ def evaluate_runs(
         letter_logprobs=letter_logprobs,
         cat_check=cat_check,
         keep_adapters=keep_adapters,
+        require_parity=require_parity,
     )
     summaries = []
     for spec in specs:

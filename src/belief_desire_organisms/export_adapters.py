@@ -148,6 +148,11 @@ def export_record_path(corpus: Corpus, name: str) -> Path:
     return checkpoint_dir(corpus, name) / "export.json"
 
 
+def download_marker_path(corpus: Corpus, name: str) -> Path:
+    """Which Tinker path `<checkpoint>/tinker/` came from (checked before reuse)."""
+    return checkpoint_dir(corpus, name) / "download.json"
+
+
 def export_manifest_path(corpus: Corpus) -> Path:
     return corpus_dir(corpus) / "export_manifest.json"
 
@@ -160,17 +165,49 @@ def training_manifest_path(corpus: Corpus) -> Path:
     return training_dir(corpus) / "manifest.json"
 
 
-def load_export_record(corpus: Corpus, name: str) -> CheckpointExport:
-    """The export record for one checkpoint; raises unless its inspection passed."""
+def load_export_record(
+    corpus: Corpus, name: str, *, require_parity: bool = True
+) -> CheckpointExport:
+    """The export record for one checkpoint, admitted for evaluation.
+
+    Raises unless its inspection passed and, with `require_parity`, unless the Tinker
+    parity check passed for these exact adapter bytes (see `check_parity`).
+    """
     path = export_record_path(corpus, name)
     if not path.exists():
         raise AdapterExportError(f"{corpus.value}/{name} has not been exported ({path} missing)")
     rec = CheckpointExport.model_validate_json(path.read_text())
     if not rec.passed:
         raise AdapterExportError(f"{corpus.value}/{name} failed export inspection: see {path}")
-    if not (peft_dir(corpus, name) / ADAPTER_WEIGHTS).exists():
+    weights = peft_dir(corpus, name) / ADAPTER_WEIGHTS
+    if not weights.exists():
         raise AdapterExportError(f"{corpus.value}/{name}: PEFT adapter files missing")
+    if rec.peft.files_sha256.get(ADAPTER_WEIGHTS) != file_sha256(weights):
+        raise AdapterExportError(f"{corpus.value}/{name}: PEFT weights changed since inspection")
+    if require_parity:
+        check_parity(corpus, name)
     return rec
+
+
+def check_parity(corpus: Corpus, name: str) -> dict:
+    """Raise unless parity.json has a passing entry for exactly this checkpoint's bytes."""
+    path = parity_path(corpus)
+    hint = "rerun export with parity, or evaluate with --no-require-parity to override"
+    if not path.exists():
+        raise AdapterExportError(f"{corpus.value}/{name}: no parity check ({path}); {hint}")
+    report = json.loads(path.read_text())
+    if report.get("base", {}).get("problems", ["missing"]):
+        raise AdapterExportError(f"{corpus.value}: base-model parity failed or missing; {hint}")
+    entry = report.get("checkpoints", {}).get(name)
+    if entry is None:
+        raise AdapterExportError(f"{corpus.value}/{name}: not parity-checked; {hint}")
+    if entry.get("problems"):
+        raise AdapterExportError(
+            f"{corpus.value}/{name}: parity with Tinker failed: {entry['problems']}; {hint}"
+        )
+    if entry.get("adapter_sha256") != file_sha256(peft_dir(corpus, name) / ADAPTER_WEIGHTS):
+        raise AdapterExportError(f"{corpus.value}/{name}: parity was run on different weights")
+    return entry
 
 
 def exported_checkpoints(corpus: Corpus) -> list[CheckpointExport]:
@@ -499,8 +536,15 @@ def download_checkpoint(cfg: PilotConfig, ckpt: CheckpointRecord, *, execute: bo
     from tinker_cookbook import weights as tinker_weights
 
     final = checkpoint_dir(ckpt.corpus, ckpt.name) / "tinker"
+    marker = download_marker_path(ckpt.corpus, ckpt.name)
     source = download_source(ckpt)
     if _complete(final):
+        recorded = json.loads(marker.read_text()).get("source") if marker.exists() else None
+        if recorded != source:
+            raise AdapterExportError(
+                f"{final} was downloaded from {recorded!r} but the manifest now gives "
+                f"{source!r}; move {checkpoint_dir(ckpt.corpus, ckpt.name)} aside to re-export"
+            )
         return source
     if not execute:
         print(f"[export] dry run: would download {source} -> {final}")
@@ -511,6 +555,9 @@ def download_checkpoint(cfg: PilotConfig, ckpt: CheckpointRecord, *, execute: bo
     tinker_weights.download(tinker_path=source, output_dir=str(partial))
     if not _complete(partial):
         raise AdapterExportError(f"download of {source} produced no adapter files in {partial}")
+    write_json(
+        marker, {"source": source, "sampler_path": ckpt.sampler_path, "downloaded_at": now()}
+    )
     partial.rename(final)
     spend.record(
         "training",
@@ -714,7 +761,13 @@ def parity_check(
     tokenizer = tokenizer or get_tokenizer(cfg)
     probes = parity_probes(cfg, tokenizer, corpus, n_probes)
     probe_hash = _probe_hash(probes)
-    kept = previous.get("checkpoints", {}) if previous.get("probe_sha256") == probe_hash else {}
+    identity = {r.name: _parity_identity(cfg, r) for r in records}
+    kept = {
+        name: entry
+        for name, entry in previous.get("checkpoints", {}).items()
+        if previous.get("probe_sha256") == probe_hash
+        and (name not in identity or entry.get("identity") == identity[name])
+    }
     todo = [r for r in records if r.name not in kept]
     if not todo and kept:
         return previous
@@ -751,6 +804,8 @@ def parity_check(
             "min_delta_scale": PARITY_MIN_DELTA_SCALE,
         },
         "base": {**base_metrics, "problems": _parity_ok(base_metrics)},
+        "base_model_revision": cfg.training.base_model_revision,
+        "package_versions": package_versions(),
         "checkpoints": dict(kept),
     }
     print(f"[parity] base: {report['base']}")
@@ -776,6 +831,8 @@ def parity_check(
             **compare_deltas(local, local_base, remote, remote_base),
         }
         m["problems"] = _parity_ok(m)
+        m["identity"] = identity[rec.name]
+        m["adapter_sha256"] = identity[rec.name]["adapter_sha256"]
         report["checkpoints"][rec.name] = m
         print(f"[parity] {rec.name}: {m}")
     spend.record(
@@ -789,6 +846,16 @@ def parity_check(
     report["updated_at"] = now()
     write_json(path, report)
     return report
+
+
+def _parity_identity(cfg: PilotConfig, rec: CheckpointExport) -> dict:
+    """What a cached parity entry must match to be reused."""
+    return {
+        "adapter_sha256": file_sha256(peft_dir(rec.corpus, rec.name) / ADAPTER_WEIGHTS),
+        "adapter_config_sha256": file_sha256(peft_dir(rec.corpus, rec.name) / ADAPTER_CONFIG),
+        "sampler_path": rec.sampler_path,
+        "base_model_revision": cfg.training.base_model_revision,
+    }
 
 
 def _probe_hash(probes: list[dict]) -> str:

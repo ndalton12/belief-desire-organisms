@@ -120,7 +120,9 @@ def base_shapes(model) -> dict[str, tuple[int, ...]]:
     return {k: tuple(v.shape) for k, v in model.state_dict().items()}
 
 
-def register_exported_adapter(cfg: PilotConfig, corpus: Corpus, name: str, src: Path) -> Path:
+def register_exported_adapter(
+    cfg: PilotConfig, corpus: Corpus, name: str, src: Path, *, parity: bool = True
+) -> Path:
     """Place a PEFT adapter where evaluation expects an exported checkpoint, with a record."""
     import shutil
 
@@ -155,6 +157,20 @@ def register_exported_adapter(cfg: PilotConfig, corpus: Corpus, name: str, src: 
     )
     assert rec.passed, insp.problems
     ex.export_record_path(corpus, name).write_text(rec.model_dump_json())
+    if parity:  # a passing Tinker parity entry for exactly these adapter bytes
+        from belief_desire_organisms.schemas import file_sha256
+
+        ppath = ex.parity_path(corpus)
+        report = (
+            json.loads(ppath.read_text())
+            if ppath.exists()
+            else {"base": {"problems": []}, "checkpoints": {}}
+        )
+        report["checkpoints"][name] = {
+            "problems": [],
+            "adapter_sha256": file_sha256(dest / "adapter_model.safetensors"),
+        }
+        ppath.write_text(json.dumps(report))
     return dest
 
 

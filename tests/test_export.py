@@ -100,7 +100,7 @@ def test_export_downloads_state_checkpoint_and_converts_with_lm_head(cfg, base_d
         "tinker://run-1/weights/belief-1000",
     ]
     assert set(em.checkpoints) == {"belief-0", "belief-1000"}
-    rec = ex.load_export_record(Corpus.BELIEF, "belief-1000")
+    rec = ex.load_export_record(Corpus.BELIEF, "belief-1000", require_parity=False)
     assert rec.passed and rec.peft.has_lm_head and rec.tinker.has_lm_head
     assert rec.peft.r == R and rec.peft.lora_alpha == ALPHA and rec.peft.scaling == ALPHA / R
     assert len(rec.peft.modules) == N_LAYERS * 7 + 1 and rec.peft.modules == rec.tinker.modules
@@ -245,11 +245,140 @@ def test_parity_check_detects_wrong_scaling(cfg, base_dir, fake_download, factor
     assert report["passed"] is passes
     if passes:
         assert m["delta_slope"] == pytest.approx(1.0, abs=1e-3) and m["max_abs_diff"] < 1e-4
+        ex.load_export_record(Corpus.BELIEF, "belief-1000")  # admitted for evaluation
     else:
         assert any("slope" in p or "agreement" in p or "mean" in p for p in m["problems"])
+        with pytest.raises(ex.AdapterExportError, match="parity with Tinker failed"):
+            ex.load_export_record(Corpus.BELIEF, "belief-1000")
+        ex.load_export_record(Corpus.BELIEF, "belief-1000", require_parity=False)
+
+
+def test_parity_results_are_bound_to_adapter_identity(cfg, base_dir, fake_download):
+    _write_manifest(cfg, names=("belief-1000",))
+    ex.export(cfg, Corpus.BELIEF, execute=True, parity=False, upload=False, base_dir=base_dir)
+    kw = dict(execute=True, n_probes=2, tokenizer=get_tokenizer(cfg))
+    service = CountingService(Corpus.BELIEF)
+    recs = ex.exported_checkpoints(Corpus.BELIEF)
+    ex.parity_check(cfg, Corpus.BELIEF, recs, model=tiny_model(), service_client=service, **kw)
+    assert service.adapter_clients == 1
+    # Same adapter bytes and sampler path: the cached result is reused.
+    ex.parity_check(cfg, Corpus.BELIEF, recs, model=tiny_model(), service_client=service, **kw)
+    assert service.adapter_clients == 1
+    # A different sampler path for the same name is checked again.
+    moved = [recs[0].model_copy(update={"sampler_path": "tinker://run-2/sampler_weights/x"})]
+    ex.parity_check(cfg, Corpus.BELIEF, moved, model=tiny_model(), service_client=service, **kw)
+    assert service.adapter_clients == 2
+    # Weights edited after the check: evaluation refuses them.
+    weights = ex.peft_dir(Corpus.BELIEF, "belief-1000") / "adapter_model.safetensors"
+    weights.write_bytes(weights.read_bytes() + b" ")
+    with pytest.raises(ex.AdapterExportError, match="changed since inspection"):
+        ex.load_export_record(Corpus.BELIEF, "belief-1000")
+
+
+class CountingService(FakeService):
+    adapter_clients = 0
+
+    def create_sampling_client(self, base_model=None, model_path=None):
+        if model_path is not None:
+            self.adapter_clients += 1
+            model_path = model_path.rsplit("/", 1)[0] + "/belief-1000"
+        return super().create_sampling_client(base_model=base_model, model_path=model_path)
+
+
+def test_reused_download_must_come_from_the_same_tinker_path(cfg, base_dir, fake_download):
+    m = _write_manifest(cfg, names=("belief-1000",))
+    ex.export(cfg, Corpus.BELIEF, execute=True, parity=False, upload=False, base_dir=base_dir)
+    retrained = m.checkpoints[0].model_copy(update={"state_path": "tinker://run-2/weights/x"})
+    write_json(
+        ex.training_manifest_path(Corpus.BELIEF), m.model_copy(update={"checkpoints": [retrained]})
+    )
+    with pytest.raises(ex.AdapterExportError, match="move .* aside"):
+        ex.export(cfg, Corpus.BELIEF, execute=True, parity=False, upload=False, base_dir=base_dir)
+    assert len(fake_download.calls) == 1
 
 
 def test_parity_dry_run_returns_none(cfg):
     assert (
         ex.parity_check(cfg, Corpus.BELIEF, [], execute=False, tokenizer=get_tokenizer(cfg)) is None
     )
+
+
+# ---------------------------------------------------------------------------
+# Private HF repos (fake HfApi; nothing leaves the machine)
+
+
+class FakeApi:
+    def __init__(self, exists=True, private=True, files=()):
+        self.exists, self.private, self.files = exists, private, list(files)
+        self.created, self.uploads = [], []
+
+    def repo_info(self, repo_id, repo_type=None):
+        from huggingface_hub.errors import RepositoryNotFoundError
+
+        if not self.exists:
+            raise RepositoryNotFoundError(
+                "missing", response=SimpleNamespace(headers={}, status_code=404, request=None)
+            )
+        return SimpleNamespace(private=self.private)
+
+    def create_repo(self, repo_id, repo_type=None, private=None, exist_ok=False):
+        self.created.append((repo_id, repo_type, private))
+        self.exists, self.private = True, bool(private)
+
+    def upload_folder(self, **kw):
+        self.uploads.append(kw)
+
+    def list_repo_files(self, repo_id, repo_type=None, revision=None):
+        return self.files
+
+
+def test_upload_creates_private_repo_and_refuses_public(tmp_path):
+    from belief_desire_organisms import hf_io
+
+    (tmp_path / "f.txt").write_text("x")
+    api = FakeApi(exists=False)
+    assert hf_io.upload_folder(
+        "me/r", "dataset", tmp_path, "results", execute=True, commit_message="m", api=api
+    )
+    assert api.created == [("me/r", "dataset", True)] and len(api.uploads) == 1
+
+    public = FakeApi(private=False)
+    with pytest.raises(hf_io.RepoNotPrivateError):
+        hf_io.upload_folder(
+            "me/r", "dataset", tmp_path, "results", execute=True, commit_message="m", api=public
+        )
+    assert public.uploads == []
+
+    dry = FakeApi()
+    assert not hf_io.upload_folder(
+        "me/r", "dataset", tmp_path, "results", execute=False, commit_message="m", api=dry
+    )
+    assert dry.uploads == [] and dry.created == []
+
+
+def test_download_missing_keeps_local_files(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    from belief_desire_organisms import hf_io
+
+    local = tmp_path / "results"
+    (local / "dev/base").mkdir(parents=True)
+    (local / "dev/base/base.jsonl").write_text("local rows\n")
+    fetched = []
+
+    def fake_download(repo_id, filename, repo_type=None, revision=None, local_dir=None):
+        fetched.append(filename)
+        from pathlib import Path
+
+        out = Path(local_dir) / filename
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("remote\n")
+        return str(out)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    api = FakeApi(files=["results/dev/base/base.jsonl", "results/selection.json", "logs/x.log"])
+    added = hf_io.download_missing("me/r", "dataset", "results", local, api=api)
+    assert fetched == ["results/selection.json"]
+    assert added == [local / "selection.json"]
+    assert (local / "dev/base/base.jsonl").read_text() == "local rows\n"
+    assert not any(p.name.startswith(".hf-staging-") for p in tmp_path.iterdir())

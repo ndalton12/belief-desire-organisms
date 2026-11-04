@@ -28,7 +28,11 @@
 #   WORKSPACE         default /workspace (the persistent volume)
 #   EXECUTE           default 1. 0 = dry run: no paid calls, no uploads.
 #   STOP_POD          default 1: stop this pod at the end. 0 = leave it running (still billed).
-#   MAX_JOB_HOURS     default 6. The job is killed after this; outputs are still uploaded.
+#   MAX_JOB_HOURS     default 6. The job command is killed after this; outputs are still
+#                     uploaded and the pod still stopped.
+#   TRANSFER_TIMEOUT_MIN  default 45. Limit for each HF fetch or upload.
+#   DEADLINE_HOURS    default MAX_JOB_HOURS + 2. A detached watchdog stops the pod at this
+#                     point no matter what (setup, transfers or the job itself hanging).
 #   POD_USD_PER_HOUR  optional. With it, pod time is checked against runpod.max_spend_usd
 #                     before starting and recorded in the spend ledger at the end.
 #
@@ -38,7 +42,9 @@
 #
 # Stopping: RunPod sets RUNPOD_POD_ID and a pod-scoped RUNPOD_API_KEY in every pod and ships
 # runpodctl, so the pod stops itself with `runpodctl pod stop $RUNPOD_POD_ID` (older
-# runpodctl: `runpodctl stop pod $RUNPOD_POD_ID`). A stopped pod still bills for its volume.
+# runpodctl: `runpodctl stop pod $RUNPOD_POD_ID`). This runs when the script exits (success,
+# failure or kill), and independently from a watchdog at DEADLINE_HOURS. A stopped pod still
+# bills for its volume disk.
 set -euo pipefail
 
 JOB="${1:-}"
@@ -57,7 +63,8 @@ if [[ -r /proc/1/environ ]]; then
     name="${kv%%=*}"
     case "$name" in
       RUNPOD_POD_ID | RUNPOD_API_KEY | HF_TOKEN | TINKER_API_KEY | GIT_COMMIT | DATASET_REVISION | \
-        POD_USD_PER_HOUR | EXECUTE | STOP_POD | MAX_JOB_HOURS | EXPORT_CHECKPOINTS)
+        POD_USD_PER_HOUR | EXECUTE | STOP_POD | MAX_JOB_HOURS | EXPORT_CHECKPOINTS | \
+        TRANSFER_TIMEOUT_MIN | DEADLINE_HOURS)
         if [[ -z "${!name:-}" ]]; then export "$kv"; fi
         ;;
     esac
@@ -70,6 +77,8 @@ REPO_DIR="${REPO_DIR:-$WORKSPACE/belief-desire-organisms}"
 EXECUTE="${EXECUTE:-1}"
 STOP_POD="${STOP_POD:-1}"
 MAX_JOB_HOURS="${MAX_JOB_HOURS:-6}"
+TRANSFER_TIMEOUT_MIN="${TRANSFER_TIMEOUT_MIN:-45}"
+DEADLINE_HOURS="${DEADLINE_HOURS:-$(awk "BEGIN {print $MAX_JOB_HOURS + 2}")}"
 
 export WORKSPACE REPO_DIR
 export HF_HOME="${HF_HOME:-$WORKSPACE/hf-cache}"
@@ -96,7 +105,34 @@ die() {
   log "ERROR: $*"
   exit 1
 }
-pod_cli() { uv run --frozen python -m belief_desire_organisms.pod "$@"; }
+POD=(uv run --frozen python -m belief_desire_organisms.pod)
+# Every HF transfer is time-limited, so a stalled connection cannot keep the pod alive.
+transfer() { timeout --kill-after=60 "${TRANSFER_TIMEOUT_MIN}m" "${POD[@]}" "$@"; }
+
+runpodctl_stop() {
+  timeout 120 runpodctl pod stop "$RUNPOD_POD_ID" ||
+    timeout 120 runpodctl stop pod "$RUNPOD_POD_ID"
+}
+
+start_watchdog() {
+  if [[ "$STOP_POD" != 1 || -z "${RUNPOD_POD_ID:-}" ]]; then return; fi
+  if ! command -v runpodctl >/dev/null 2>&1; then
+    log "WARNING: runpodctl not found; no watchdog and no automatic stop"
+    return
+  fi
+  local secs
+  secs="$(awk "BEGIN {print int($DEADLINE_HOURS * 3600)}")"
+  local cmd="sleep $secs
+    echo \"[watchdog] \$(date -u) deadline of $DEADLINE_HOURS h reached; stopping pod\" >>'$LOG'
+    timeout 120 runpodctl pod stop '$RUNPOD_POD_ID' || timeout 120 runpodctl stop pod '$RUNPOD_POD_ID'"
+  # Detached from this script: it survives a hung or killed job and stops the pod anyway.
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid bash -c "$cmd" >/dev/null 2>&1 &
+  else
+    nohup bash -c "$cmd" >/dev/null 2>&1 &
+  fi
+  log "watchdog: pod $RUNPOD_POD_ID will be stopped after $DEADLINE_HOURS h regardless"
+}
 
 stop_pod() {
   if [[ "$STOP_POD" != 1 ]]; then
@@ -113,44 +149,49 @@ stop_pod() {
   fi
   sync
   log "stopping pod $RUNPOD_POD_ID"
-  runpodctl pod stop "$RUNPOD_POD_ID" || runpodctl stop pod "$RUNPOD_POD_ID" ||
-    log "WARNING: stop failed. Pod $RUNPOD_POD_ID is STILL RUNNING; stop it in the console."
+  runpodctl_stop ||
+    log "WARNING: stop failed. Pod $RUNPOD_POD_ID is STILL RUNNING (the watchdog retries at" \
+      "$DEADLINE_HOURS h); stop it in the console."
 }
 
 finish() {
   local code=$?
   trap - EXIT
   set +e
+  log "job '$JOB' ended with exit code $code"
+  if [[ -n "$PY_READY" && "$EXECUTE" == 1 ]]; then
+    log "uploading outputs to the private HF repos (each limited to $TRANSFER_TIMEOUT_MIN min)"
+    transfer upload-results --execute || log "WARNING: results upload failed"
+    if [[ "$JOB" == export ]]; then
+      transfer upload-adapters --execute || log "WARNING: adapter upload failed"
+    fi
+  fi
   local minutes=$((($(date +%s) - START) / 60))
   local gpu
-  gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
-  log "job '$JOB' ended with exit code $code after $minutes min"
+  gpu="$(timeout 30 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
   printf '{"job": "%s", "started_utc": "%s", "minutes": %d, "exit_code": %d, "git_commit": "%s", "dataset_revision": "%s", "pod_id": "%s", "gpu": "%s", "execute": %s}\n' \
     "$JOB" "$TS" "$minutes" "$code" "${GIT_COMMIT:-}" "${DATASET_REVISION:-}" \
     "${RUNPOD_POD_ID:-}" "$gpu" "$([[ $EXECUTE == 1 ]] && echo true || echo false)" >"$RECORD"
-  if [[ -n "$PY_READY" ]]; then
-    if [[ -n "${POD_USD_PER_HOUR:-}" ]]; then
-      uv run --frozen python -c "
+  if [[ -n "$PY_READY" && -n "${POD_USD_PER_HOUR:-}" ]]; then
+    timeout 120 uv run --frozen python -c "
 from belief_desire_organisms import spend
 spend.record('runpod', $minutes / 60 * $POD_USD_PER_HOUR, {'job': '$JOB', 'started_utc': '$TS', 'minutes': $minutes, 'pod_id': '${RUNPOD_POD_ID:-}'})
 "
+  fi
+  log "pod time for this job so far: $minutes min"
+  if [[ -n "$PY_READY" && "$EXECUTE" == 1 ]]; then
+    if [[ -f "$BDO_OUTPUT_DIR/spend_ledger.jsonl" ]]; then
+      transfer upload-file "$BDO_OUTPUT_DIR/spend_ledger.jsonl" --to spend/pod_spend_ledger.jsonl --execute
     fi
-    if [[ "$EXECUTE" == 1 ]]; then
-      log "uploading outputs to the private HF repos"
-      pod_cli upload-results --execute
-      if [[ "$JOB" == export ]]; then pod_cli upload-adapters --execute; fi
-      if [[ -f "$BDO_OUTPUT_DIR/spend_ledger.jsonl" ]]; then
-        pod_cli upload-file "$BDO_OUTPUT_DIR/spend_ledger.jsonl" --to spend/pod_spend_ledger.jsonl --execute
-      fi
-      pod_cli upload-file "$RECORD" --to "jobs/$JOB-$TS.json" --execute
-      pod_cli upload-file "$LOG" --to "logs/$JOB-$TS.log" --execute
-    fi
+    transfer upload-file "$RECORD" --to "jobs/$JOB-$TS.json" --execute
+    transfer upload-file "$LOG" --to "logs/$JOB-$TS.log" --execute
   fi
   log "outputs are on the persistent volume under $BDO_OUTPUT_DIR (log: $LOG)"
   stop_pod
   exit "$code"
 }
 trap finish EXIT
+start_watchdog
 
 # --- inputs ---------------------------------------------------------------------------------
 [[ "${GIT_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] || die "GIT_COMMIT must be a full 40-character commit SHA"
@@ -193,14 +234,14 @@ fi
 # --- inputs from the private HF repos (local files on the volume always win) -----------------
 FETCH_DATASET=(--revision "$DATASET_REVISION")
 if [[ "$JOB" == export ]]; then FETCH_DATASET+=(--with-train); fi
-pod_cli fetch-dataset "${FETCH_DATASET[@]}"
+transfer fetch-dataset "${FETCH_DATASET[@]}"
 case "$JOB" in
-  export | sweep | final) pod_cli fetch-model-repo ;;
+  export | sweep | final) transfer fetch-model-repo ;;
 esac
-pod_cli fetch-results
+transfer fetch-results
 
 # --- the job --------------------------------------------------------------------------------
-run() { timeout --foreground "${MAX_JOB_HOURS}h" uv run --frozen python -m belief_desire_organisms.pod "$@"; }
+run() { timeout --kill-after=120 "${MAX_JOB_HOURS}h" "${POD[@]}" "$@"; }
 
 case "$JOB" in
   baseline)
