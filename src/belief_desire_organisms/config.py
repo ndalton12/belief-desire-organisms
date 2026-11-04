@@ -139,6 +139,11 @@ class DecisionRules(_Strict):
     composition_min_gain_over_singles: float
     composition_min_valid_rate: float
     separation_flag_threshold: float
+    # Checkpoint selection (spec section 7): a dev checkpoint is eligible only if it meets
+    # both, on dev results. Defaults mirror composition_min_valid_rate and
+    # capability_ceiling_min.
+    selection_min_valid_rate: float = 0.95  # on every task the checkpoint was evaluated on
+    selection_min_capability_ceiling: float = 0.90
 
 
 class PilotConfig(_Strict):
