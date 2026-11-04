@@ -117,8 +117,11 @@ class CheckpointRecord(_Record):
     corpus: Corpus
     processed_tokens: int  # actual tokens processed, including repeats
     step: int
-    state_path: str | None  # tinker:// path, optimizer-resumable
-    sampler_path: str | None  # tinker:// path, for sampling/export
+    state_path: str | None  # tinker://<run>/weights/<name>, optimizer-resumable (save_state)
+    sampler_path: str | None  # tinker://<run>/sampler_weights/<name>, sampling only
+    # tinker://<run>/external_weights/<name> (save_weights_external): what export downloads.
+    # Sampler paths cannot be downloaded by tinker_cookbook.weights.download.
+    external_path: str | None = None
 
 
 class TrainingManifest(_Record):
