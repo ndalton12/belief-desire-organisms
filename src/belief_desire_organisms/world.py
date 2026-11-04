@@ -36,6 +36,7 @@ counts, to world/name_checks.json. That file is for people, not for training.
 
 from __future__ import annotations
 
+import copy
 import random
 from collections import Counter
 from itertools import combinations
@@ -272,15 +273,23 @@ def generate_names(
     return accepted, dict(sorted(rejected.items())), draws
 
 
-def check_names(names: list[tuple[str, str]], checker: NameChecker) -> dict[str, bool]:
-    """Re-run every rule on a finished list of names (grouped in trios, in order)."""
+def check_names(
+    names: list[tuple[str, str]], checker: NameChecker, expected_count: int
+) -> dict[str, bool]:
+    """Re-run every rule on a finished list of names (grouped in trios, in order).
+
+    Fails, rather than passing vacuously, on an empty list, a count other than
+    `expected_count`, or a final partial trio."""
     ids = [checker.full_name_ids(*n) for n in names]
     firsts = [n[0].lower() for n in names]
     lasts = [n[1].lower() for n in names]
     part_pairs = list(combinations(firsts + lasts, 2))
     pairs = list(combinations(range(len(names)), 2))
+    complete = len(names) > 0 and len(names) % 3 == 0
     trios = [names[i : i + 3] for i in range(0, len(names), 3)]
     return {
+        "expected_person_count": expected_count > 0 and len(names) == expected_count,
+        "complete_trios": complete,
         "first_names_unique": len(set(firsts)) == len(firsts),
         "surnames_unique": len(set(lasts)) == len(lasts),
         "no_name_part_inside_another": not any(a in b or b in a for a, b in part_pairs),
@@ -293,10 +302,8 @@ def check_names(names: list[tuple[str, str]], checker: NameChecker) -> dict[str,
         ),
         "no_shared_two_token_runs": not any(_bigrams(ids[i]) & _bigrams(ids[j]) for i, j in pairs),
         "every_name_passes_single_name_rules": all(checker.name_problem(*n) is None for n in names),
-        "trio_initials_distinct": all(
-            len({n[0][0] for n in t}) == len(t) and len({n[1][0] for n in t}) == len(t)
-            for t in trios
-        ),
+        "trio_initials_distinct": complete
+        and all(len({n[0][0] for n in t}) == 3 and len({n[1][0] for n in t}) == 3 for t in trios),
     }
 
 
@@ -308,8 +315,22 @@ def _trio_ids(prefix: str, n: int) -> list[str]:
     return [f"{prefix}{i:02d}" for i in range(1, n + 1)]
 
 
+_WORLD_CACHE: dict[str, tuple[list[Person], Splits, dict]] = {}
+
+
 def make_world(cfg: PilotConfig) -> tuple[list[Person], Splits, dict]:
-    """Pure, deterministic world construction. Returns people, splits, name report."""
+    """Pure, deterministic world construction. Returns people, splits, name report.
+
+    Cached per config within a process, so later stages can cheaply rebuild the world
+    from the config and compare it with the files on disk."""
+    key = cfg.model_dump_json()
+    if key not in _WORLD_CACHE:
+        _WORLD_CACHE[key] = _make_world(cfg)
+    people, splits, report = _WORLD_CACHE[key]
+    return list(people), splits, copy.deepcopy(report)
+
+
+def _make_world(cfg: PilotConfig) -> tuple[list[Person], Splits, dict]:
     w = cfg.world
     checker = NameChecker(get_tokenizer(cfg))
     taught_trios = _trio_ids("t", w.n_trios)
@@ -317,7 +338,7 @@ def make_world(cfg: PilotConfig) -> tuple[list[Person], Splits, dict]:
     all_trios = taught_trios + transfer_trios
 
     names, rejected, draws = generate_names(3 * len(all_trios), w.data_seed, checker)
-    checks = check_names(names, checker)
+    checks = check_names(names, checker, 3 * len(all_trios))
     if not all(checks.values()):
         failed = [k for k, ok in checks.items() if not ok]
         raise RuntimeError(f"name checks failed: {failed}")

@@ -114,12 +114,24 @@ def test_name_rules_reject_bad_names(checker):
 
 def test_check_names_flags_collisions(checker):
     good = [("Kolir", "Lorwek"), ("Fozom", "Zomban"), ("Zimet", "Somgil")]
-    assert all(world.check_names(good, checker).values())
+    assert all(world.check_names(good, checker, 3).values())
     dup = [("Kolir", "Lorwek"), ("Kolir", "Zomban"), ("Zimet", "Somgil")]
-    checks = world.check_names(dup, checker)
+    checks = world.check_names(dup, checker, 3)
     assert not checks["first_names_unique"] and not checks["trio_initials_distinct"]
     similar = [("Kolir", "Lorwek"), ("Fozom", "Lorwed"), ("Zimet", "Somgil")]
-    assert not world.check_names(similar, checker)["name_parts_min_edit_distance"]
+    assert not world.check_names(similar, checker, 3)["name_parts_min_edit_distance"]
+
+
+def test_check_names_never_passes_vacuously(checker):
+    good = [("Kolir", "Lorwek"), ("Fozom", "Zomban"), ("Zimet", "Somgil")]
+    empty = world.check_names([], checker, 0)
+    assert not empty["expected_person_count"] and not empty["complete_trios"]
+    assert not empty["trio_initials_distinct"]
+    assert not world.check_names(good, checker, 6)["expected_person_count"]
+    # A trailing partial trio fails, even when its initials happen to differ.
+    partial = world.check_names([*good, ("Bivam", "Dornat")], checker, 4)
+    assert partial["expected_person_count"]
+    assert not partial["complete_trios"] and not partial["trio_initials_distinct"]
 
 
 def test_world_is_byte_for_byte_deterministic(cfg, built, tmp_path, monkeypatch):
