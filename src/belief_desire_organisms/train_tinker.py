@@ -46,6 +46,7 @@ import platform
 import re
 import subprocess
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -63,6 +64,7 @@ from belief_desire_organisms.paths import (
     DATASET_MANIFEST_FILE,
     TRAIN_FILE_ALLOWLIST,
     dataset_dir,
+    spend_ledger_path,
     training_dir,
 )
 from belief_desire_organisms.schemas import CheckpointRecord, TrainingManifest, file_sha256
@@ -441,6 +443,11 @@ def config_fingerprint(cfg: PilotConfig) -> dict[str, Any]:
 
 
 def _check_manifest_compatible(cfg: PilotConfig, corpus: Corpus, m: TrainingManifest) -> None:
+    if not m.data_processing:
+        raise ValueError(
+            f"{manifest_path(corpus)} has no data_processing record (written before it "
+            "existed); it cannot be resumed safely. No paid run used that format."
+        )
     if m.base_model != cfg.training.base_model:
         raise IndependenceViolation(
             f"manifest base model {m.base_model} != configured {cfg.training.base_model}"
@@ -989,6 +996,10 @@ class SegmentSpend:
     the process is killed first, the next launch for this corpus settles the stale
     reservation from the sidecar (`settle_stale_reservation`). Until then it counts
     against the cap at the full reserved amount, so spend is never under-counted.
+
+    Opening is crash-safe too: an intent id is written to the sidecar before the ledger
+    reservation (which carries it in its detail), so a kill between the two leaves a
+    reservation the next launch can find and settle at zero (no step was submitted).
     """
 
     def __init__(self, corpus: Corpus, state: dict) -> None:
@@ -998,7 +1009,21 @@ class SegmentSpend:
     @classmethod
     def reserve(cls, cfg: PilotConfig, corpus: Corpus, seg_plan: SegmentPlan) -> SegmentSpend:
         t = cfg.training
+        intent = uuid.uuid4().hex
+        state = {
+            "intent_id": intent,
+            "reservation_id": None,
+            "reserved_usd": seg_plan.projected_usd,
+            "price_per_million_tokens": t.price_per_million_tokens,
+            "segment": seg_plan.segment.index,
+            "billed_sequence_tokens": 0,
+            "billed_steps": None,
+            "tinker_run_id": None,
+            "opened_at": _now(),
+        }
+        _write_json_atomic(reservation_path(corpus), state)  # 1. intent
         detail = {
+            "intent_id": intent,
             "corpus": corpus.value,
             "segment": seg_plan.segment.index,
             "steps": [seg_plan.run_from_step, seg_plan.segment.end_step - 1],
@@ -1006,21 +1031,17 @@ class SegmentSpend:
             "price_per_million_tokens": t.price_per_million_tokens,
             "basis": SPEND_BASIS,
         }
-        rid = spend.reserve("training", t.max_spend_usd, seg_plan.projected_usd, detail)
-        tracker = cls(
-            corpus,
-            {
-                "reservation_id": rid,
-                "reserved_usd": seg_plan.projected_usd,
-                "price_per_million_tokens": t.price_per_million_tokens,
-                "segment": seg_plan.segment.index,
-                "billed_sequence_tokens": 0,
-                "billed_steps": None,
-                "tinker_run_id": None,
-                "opened_at": _now(),
-            },
-        )
-        tracker._write()
+        try:
+            rid = spend.reserve("training", t.max_spend_usd, seg_plan.projected_usd, detail)
+        except spend.SpendCapExceeded:
+            _write_json_atomic(reservation_path(corpus), {})  # nothing was reserved
+            raise
+        tracker = cls(corpus, {**state, "reservation_id": rid})  # 2. ledger reservation
+        try:
+            tracker._write()  # 3. reservation id in the sidecar
+        except BaseException:
+            tracker.settle(note="sidecar write failed before any step; nothing submitted")
+            raise
         return tracker
 
     def _write(self) -> None:
@@ -1063,12 +1084,37 @@ class SegmentSpend:
         _write_json_atomic(reservation_path(self.corpus), {})
 
 
+def _reservation_for_intent(intent_id: str) -> str | None:
+    """The ledger reservation carrying `intent_id`, if the reserve call got that far."""
+    ledger = spend_ledger_path()
+    if not ledger.exists():
+        return None
+    for line in ledger.read_text().splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("kind") == "reserve" and e.get("detail", {}).get("intent_id") == intent_id:
+            return e["id"]
+    return None
+
+
 def settle_stale_reservation(corpus: Corpus) -> None:
-    """Settle a reservation left open by a process that was killed before settling."""
+    """Settle a reservation left open by a process that was killed before settling.
+
+    Runs under the per-corpus lock, so no live process owns the sidecar.
+    """
     path = reservation_path(corpus)
     if not path.exists():
         return
     state = json.loads(path.read_text())
+    if not state.get("reservation_id") and state.get("intent_id"):
+        # Killed between writing the intent and recording the reservation id: no step
+        # was submitted. Settle the reservation at zero if the ledger has it.
+        state["reservation_id"] = _reservation_for_intent(state["intent_id"])
+        if state["reservation_id"] is None:
+            _write_json_atomic(path, {})
+            return
     if not state.get("reservation_id"):
         return
     tracker = SegmentSpend(corpus, state)

@@ -797,6 +797,8 @@ def test_spend_cap_refusal_before_any_tinker_call(tok, fake):
         run(small_cfg())
     assert not calls(fake, "ServiceClient")
     assert not train_tinker.manifest_path(Corpus.BELIEF).exists()
+    assert json.loads(train_tinker.reservation_path(Corpus.BELIEF).read_text()) == {}
+    assert [r["kind"] for r in ledger_rows()] == ["record"]  # nothing reserved
     with pytest.raises(spend.SpendCapExceeded):
         run(small_cfg(max_spend_usd=None))
 
@@ -947,3 +949,37 @@ def test_data_processing_records_the_exact_recipe(tok, fake):
         cur = cursors[c.name]
         assert (cur["next_epoch"], cur["next_batch_in_epoch"]) == (nxt.epoch, nxt.batch_in_epoch)
         assert cur["documents_consumed_in_epoch"] == nxt.batch_in_epoch * 3
+
+
+def test_kill_between_ledger_reservation_and_sidecar_is_recovered(tok, fake, monkeypatch):
+    write_local_dataset(tok)
+    cfg = small_cfg()
+    real_reserve = spend.reserve
+
+    def reserve_then_die(*a, **k):
+        real_reserve(*a, **k)
+        raise KeyboardInterrupt("killed right after the ledger append")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(spend, "reserve", reserve_then_die)
+        with pytest.raises(KeyboardInterrupt):
+            run(cfg)
+    assert not calls(fake, "ServiceClient")
+    sidecar = json.loads(train_tinker.reservation_path(Corpus.BELIEF).read_text())
+    assert sidecar["intent_id"] and sidecar["reservation_id"] is None
+    assert spend.spent("training") > 0  # the orphaned reservation still counts
+
+    run(cfg)  # settles the orphan at zero, then trains under a fresh reservation
+    planned = belief_plan(tok, cfg, 400)
+    assert settled_sequence_tokens() == sum(s.sequence_tokens for s in planned)
+    assert spend.spent("training") == pytest.approx(usd(settled_sequence_tokens(), cfg))
+
+
+def test_manifest_without_data_recipe_is_refused(tok, fake):
+    write_local_dataset(tok)
+    cfg = small_cfg()
+    run(cfg)
+    m = train_tinker.read_manifest(Corpus.BELIEF)
+    train_tinker.write_manifest(m.model_copy(update={"data_processing": {}}))
+    with pytest.raises(ValueError, match="data_processing"):
+        run(cfg, extend_to=1000)
