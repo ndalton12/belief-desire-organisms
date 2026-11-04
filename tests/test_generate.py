@@ -142,7 +142,7 @@ def test_fingerprint_covers_request_text_params_template_and_world():
     for variant in (
         make_config(model="other-model"),
         make_config(max_output_tokens=999),
-        make_config(reasoning_effort="low"),
+        make_config(reasoning_effort="high"),
         make_config(plan_seed=1),
     ):
         vctx = gen.corpus_context(variant, Corpus.BELIEF)

@@ -12,7 +12,9 @@ world:
   target_fruit: apple
 
 generation:
-  provider: null              # anthropic | openai | openrouter (model not chosen yet)
+  # anthropic | openai | openrouter. Anthropic because grading uses Claude Haiku 5.5 and
+  # grading shares this provider. Writer model not chosen yet.
+  provider: anthropic
   model: null                 # exact model ID is recorded in every record
   temperature: 1.0
   max_output_tokens: 1500
@@ -32,16 +34,19 @@ generation:
   # OpenRouter as reasoning.effort. null = provider default. Reasoning tokens are
   # billed as output and count against max_output_tokens, so a low effort keeps
   # documents from being cut off.
-  reasoning_effort: null
+  # low: keeps reasoning from eating the output limit (both writer and grader use it).
+  reasoning_effort: low
   request_timeout_s: 600
   retry_base_delay_s: 2.0
   retry_max_delay_s: 60.0
   plan_seed: 27182            # document-spec planning: types, lengths, people, topics
   max_specs_per_condition: 6000
   # Model-grading pass (bdo validate --execute). null = same model and prices.
-  grader_model: null
-  grader_input_price_usd_per_mtok: null
-  grader_output_price_usd_per_mtok: null
+  # Claude Haiku 5.5, Anthropic list price as of 2026-10-06 (applies to prompts under
+  # 100K tokens; grading prompts are about 2K). Recheck before running.
+  grader_model: claude-haiku-5-5
+  grader_input_price_usd_per_mtok: 0.10
+  grader_output_price_usd_per_mtok: 0.50
   grader_max_output_tokens: 2000
   # Matching tolerances between the two training files (checked again at publish).
   match_median_tolerance: 0.05      # per document-type slot, relative median length gap
