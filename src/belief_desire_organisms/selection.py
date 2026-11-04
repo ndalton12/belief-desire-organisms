@@ -8,7 +8,6 @@ selected checkpoints.
 
 from __future__ import annotations
 
-import math
 import re
 from datetime import UTC, datetime
 
@@ -31,28 +30,27 @@ from belief_desire_organisms.schemas import AdapterChoice, SelectionManifest, wr
 
 DEV = "dev"  # the only split selection may read
 
-# Ranking metrics per corpus, most important first. Ties after these go to the
-# checkpoint with fewer processed tokens.
-RANKING: dict[str, tuple[str, ...]] = {
-    "belief": ("recall", "belief_use"),
-    "goal": ("goal_expression",),
-}
+# The metric each adapter is selected on (spec section 7). Belief use is recorded in the
+# dev curves but does not rank.
+RANKING: dict[str, str] = {"belief": "recall", "goal": "goal_expression"}
 
 RULE = (
-    "Development-split results only; test-split results are never read. Candidates: every "
-    "trained checkpoint of the corpus with processed_tokens > 0 whose verified dev eval run "
-    "has a result for every item of the ranking task. All rates are unconditional (invalid "
-    "output = failure), averaged within trio and then across dev trios. A candidate is "
-    "eligible if (a) its valid-output rate is at least {min_valid} on every task it was "
-    "evaluated on, (b) its fully prompted capability-ceiling accuracy is at least {min_cap}, "
-    "and (c) every task it was evaluated on has a result for every item. Belief: the "
-    "eligible checkpoint with the highest recall accuracy; ties broken by higher belief-use "
-    "target rate, then "
-    "by fewer processed tokens. Goal: the eligible checkpoint with the highest "
-    "goal-expression (explicit facts) target rate; ties broken by fewer processed tokens. "
-    "Rates are compared after rounding to 9 decimals. If no candidate is eligible, the "
-    "best candidate by the same ordering is chosen and recorded with qualified=false. The "
-    "composed checkpoint is '<belief>+<goal>'."
+    "Development-split results only; selection refuses any test-split row. Candidates: "
+    "every trained checkpoint of the corpus with processed_tokens > 0 whose verified dev "
+    "eval run has a result for every item of the ranking task. All rates are "
+    "unconditional (invalid output = failure), averaged within trio and then across dev "
+    "trios. Validity check: valid-output rate at least {min_valid} on every task the "
+    "checkpoint was evaluated on, with a result for every item of each such task. "
+    "Qualified: passes the validity check and has fully prompted capability-ceiling "
+    "accuracy of at least {min_cap}. Ranking metric: recall accuracy for the belief "
+    "adapter, goal-expression (explicit facts) target rate for the goal adapter. Choice: "
+    "among qualified candidates, take the highest ranking-metric value; every candidate "
+    "within {tol} (absolute, i.e. {tol_pts:g} percentage points) of that value counts as "
+    "tied, and the tied candidate with the fewest processed tokens (the earliest "
+    "checkpoint) is chosen. If no candidate qualifies, the same choice is made among "
+    "candidates that pass the validity check and recorded with qualified=false (that "
+    "adapter's decision gate then fails). If none passes the validity check, nothing is "
+    "selected. The composed checkpoint is '<belief>+<goal>'."
 )
 
 _LABEL = re.compile(r"^(belief|goal)-(\d+)$")
@@ -105,7 +103,29 @@ def thresholds(cfg: PilotConfig) -> dict[str, float]:
     return {
         "min_valid_rate_every_task": cfg.decision_rules.selection_min_valid_rate,
         "min_capability_ceiling": cfg.decision_rules.selection_min_capability_ceiling,
+        "tie_tolerance": cfg.decision_rules.selection_tie_tolerance,
     }
+
+
+def rule_text(cfg: PilotConfig) -> str:
+    r = cfg.decision_rules
+    return RULE.format(
+        min_valid=r.selection_min_valid_rate,
+        min_cap=r.selection_min_capability_ceiling,
+        tol=r.selection_tie_tolerance,
+        tol_pts=100 * r.selection_tie_tolerance,
+    )
+
+
+def _reject_test_rows(runs) -> None:
+    """Selection may only ever see dev-split rows."""
+    for run in runs:
+        bad = [r.item_id for r in run.results if r.split != DEV]
+        if run.split != DEV or bad:
+            raise SelectionError(
+                f"selection was handed non-dev results ({run.directory}: "
+                f"{bad[:3] or run.split}); refusing to select"
+            )
 
 
 def _rate(summary: dict[str, dict], task: str) -> float | None:
@@ -131,7 +151,7 @@ def curve_entry(
     reasons = []
     if not tokens:
         reasons.append("checkpoint 0 (untrained pipeline check) is not a candidate")
-    primary = RANKING[corpus][0]
+    primary = RANKING[corpus]
     if criteria[primary] is None:
         reasons.append(f"no complete dev {primary} results")
     # A partial run is never ranked: rates over a subset of items are not comparable.
@@ -140,14 +160,16 @@ def curve_entry(
         for task, s in summary.items()
         if not s["complete"]
     ]
-    if partial:
-        reasons.append("incomplete dev results: " + ", ".join(partial))
     rules = cfg.decision_rules
+    validity = []
+    if partial:
+        validity.append("incomplete dev results: " + ", ".join(partial))
     if (
         criteria["min_valid_rate"] is None
         or round(criteria["min_valid_rate"] - rules.selection_min_valid_rate, 9) < 0
     ):
-        reasons.append(f"valid-output rate below {rules.selection_min_valid_rate} on some task")
+        validity.append(f"valid-output rate below {rules.selection_min_valid_rate} on some task")
+    reasons += validity
     if criteria["capability_ceiling"] is None:
         reasons.append("no complete dev capability-ceiling results")
     elif round(criteria["capability_ceiling"] - rules.selection_min_capability_ceiling, 9) < 0:
@@ -161,28 +183,24 @@ def curve_entry(
         "results_sha256": run_info["results_sha256"],
         "criteria": criteria,
         "candidate": bool(tokens) and criteria[primary] is not None,
+        "passes_validity": bool(tokens) and criteria[primary] is not None and not validity,
         "eligible": not reasons,
         "ineligible_reasons": reasons,
         "tasks": summary,
     }
 
 
-def choose(corpus: str, entries: list[dict]) -> tuple[dict | None, bool]:
-    """(chosen entry, qualified). Applies the ranking in RULE."""
-    candidates = [e for e in entries if e["candidate"]]
-    if not candidates:
+def choose(corpus: str, entries: list[dict], tolerance: float) -> tuple[dict | None, bool]:
+    """(chosen entry, qualified), applying RULE. (None, False) if no candidate passes the
+    validity check."""
+    qualified = [e for e in entries if e["candidate"] and e["eligible"]]
+    pool = qualified or [e for e in entries if e["passes_validity"]]
+    if not pool:
         return None, False
-    eligible = [e for e in candidates if e["eligible"]]
-    pool = eligible or candidates
-
-    def key(e: dict) -> tuple:
-        ranks = tuple(
-            -math.inf if e["criteria"][m] is None else round(e["criteria"][m], 9)
-            for m in RANKING[corpus]
-        )
-        return ranks + (-e["processed_tokens"],)
-
-    return max(pool, key=key), bool(eligible)
+    metric = RANKING[corpus]
+    best = max(e["criteria"][metric] for e in pool)
+    tied = [e for e in pool if round(best - e["criteria"][metric], 9) <= tolerance]
+    return min(tied, key=lambda e: e["processed_tokens"]), bool(qualified)
 
 
 def run_info(run) -> dict:
@@ -208,7 +226,7 @@ def build_dev_curves(
                 continue
             entries.append(curve_entry(cfg, corpus, label, summary, runs[(condition, label)]))
         entries.sort(key=lambda e: e["processed_tokens"])
-        chosen, qualified = choose(corpus, entries)
+        chosen, qualified = choose(corpus, entries, cfg.decision_rules.selection_tie_tolerance)
         curves[corpus] = entries
         curves[f"{corpus}_preview"] = (
             None if chosen is None else {"checkpoint": chosen["checkpoint"], "qualified": qualified}
@@ -258,6 +276,7 @@ def select_checkpoints(cfg: PilotConfig, force: bool = False) -> SelectionManife
             "selection needs the unmodified model's dev results as the protocol reference "
             f"(inference settings and prompt rendering): {detail}"
         )
+    _reject_test_rows(runs.values())
     summaries = {}
     for key, run in runs.items():
         df, _ = score_run(run, items)
@@ -265,17 +284,19 @@ def select_checkpoints(cfg: PilotConfig, force: bool = False) -> SelectionManife
 
     curves = build_dev_curves(cfg, summaries, {k: run_info(r) for k, r in runs.items()})
     curves["skipped_runs"] = [f.describe() for f in failed]
+    rules = cfg.decision_rules
     choices = {}
     for corpus in ("belief", "goal"):
-        chosen, qualified = choose(corpus, curves[corpus])
+        chosen, qualified = choose(corpus, curves[corpus], rules.selection_tie_tolerance)
         if chosen is None:
             raise SelectionError(
-                f"no {corpus} checkpoint with processed_tokens > 0 has usable dev results "
-                f"for {RANKING[corpus][0]}; nothing to select"
+                f"no {corpus} checkpoint with processed_tokens > 0 has complete dev "
+                f"{RANKING[corpus]} results and passes the valid-output check; nothing to "
+                "select. Inspect the dev curves (bdo analyze --stage dev)."
             )
         label = chosen["checkpoint"]
         tinker_path, digest = _adapter_identity(runs[(corpus, label)].manifest, label)
-        metric = RANKING[corpus][0]
+        metric = RANKING[corpus]
         choices[corpus] = AdapterChoice(
             corpus=Corpus(corpus),
             checkpoint=label,
@@ -287,13 +308,9 @@ def select_checkpoints(cfg: PilotConfig, force: bool = False) -> SelectionManife
             eval_run_ids=[chosen["eval_run_id"]],
         )
 
-    rules = cfg.decision_rules
     selection = SelectionManifest(
         created_at=datetime.now(UTC).isoformat(timespec="seconds"),
-        rule=RULE.format(
-            min_valid=rules.selection_min_valid_rate,
-            min_cap=rules.selection_min_capability_ceiling,
-        ),
+        rule=rule_text(cfg),
         eligibility=thresholds(cfg),
         dev_eval_files_sha256={
             rel: hashes[rel] for rel in eval_files_for_split(DEV) if rel in hashes

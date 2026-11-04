@@ -228,6 +228,14 @@ def expected_counts(items: dict[str, EvalItem]) -> dict[str, int]:
 # Eval runs
 
 
+class AmbiguousRunsError(RuntimeError):
+    """More than one eval run qualifies for one (split, condition, checkpoint)."""
+
+
+class SplitMismatchError(RuntimeError):
+    """A result row's split differs from the split it was loaded for."""
+
+
 @dataclass
 class Run:
     split: str
@@ -252,7 +260,7 @@ class RunLookup:
     split: str
     condition: str
     checkpoint: str
-    status: str  # ok | missing | unverified | ambiguous | unreadable | inconsistent | incompatible
+    status: str  # ok | missing | unverified | unreadable | inconsistent | incompatible
     detail: str = ""
     run: Run | None = None
     candidates: list[str] = field(default_factory=list)
@@ -429,12 +437,11 @@ def find_run(
         lookup.detail = f"{rel}: no usable run ({' | '.join(rejected)})"
         return lookup
     if len(verified) > 1:
-        lookup.status = "ambiguous"
-        lookup.detail = (
-            f"{rel}: {len(verified)} runs pass verification "
-            f"({', '.join(d.name for d, _ in verified)}); not choosing one"
+        raise AmbiguousRunsError(
+            f"{rel}: {len(verified)} eval runs pass verification "
+            f"({', '.join(d.name for d, _ in verified)}). Refusing to pick one: move the runs "
+            "that should not be analyzed out of the results folder."
         )
-        return lookup
 
     d, manifest = verified[0]
     path = d / RESULTS_FILE
@@ -446,6 +453,11 @@ def find_run(
         return lookup
     by_item: dict[str, EvalResult] = {}
     for r in rows:
+        if r.split != split:
+            raise SplitMismatchError(
+                f"{path}: row {r.item_id} is a {r.split}-split result inside a {split}-split "
+                "run folder. Refusing to analyze it."
+            )
         if (r.eval_run_id, r.split, r.condition.value, r.checkpoint) != (
             d.name,
             split,

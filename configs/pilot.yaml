@@ -95,3 +95,4 @@ decision_rules:
   # Checkpoint selection eligibility, on dev results (spec section 7)
   selection_min_valid_rate: 0.95          # valid-output rate on every evaluated task
   selection_min_capability_ceiling: 0.90  # fully prompted accuracy, invalid = wrong
+  selection_tie_tolerance: 0.02           # within 2 points of the best: take the earliest

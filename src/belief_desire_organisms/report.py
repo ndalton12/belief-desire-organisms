@@ -412,6 +412,26 @@ def _biases(results: dict) -> list[str]:
             + ".",
             "",
         ]
+    mention_rows = [
+        [CONDITION_NAMES[b["condition"]], TASK_NAMES[b["task"]]]
+        + [pct(b["first_mention_share"][f"mentioned_{k}"]) for k in (1, 2, 3)]
+        + ["flagged" if b["first_mention_bias_flagged"] else "not flagged"]
+        for t in TASKS
+        for b in _bias_rows(sr, t)
+        if "first_mention_share" in b
+    ]
+    if mention_rows:
+        out += [
+            "First-mentioned-person bias, tasks that list the facts in the prompt: share of "
+            "valid answers choosing the person whose fact was listed first, second or third "
+            "(listing order is counterbalanced independently of option order and fruit):",
+            "",
+        ]
+        out += table(
+            ["Condition", "Task", "1st listed", "2nd listed", "3rd listed", "First-mention bias"],
+            mention_rows,
+        )
+    if main:
         out += [
             "Fruit of the chosen person, main task (apple share = target rate among valid):",
             "",
@@ -452,19 +472,6 @@ def _biases(results: dict) -> list[str]:
         out += table(
             ["Wording"] + [CONDITION_NAMES[b["condition"]] for b in main],
             [[w] + [pct(b["wording_target_rate"].get(w)) for b in main] for w in wordings],
-        )
-    mention_rows = [
-        [CONDITION_NAMES[b["condition"]], TASK_NAMES[b["task"]]]
-        + [pct(b["first_mention_share"][f"mentioned_{k}"]) for k in (1, 2, 3)]
-        + ["flagged" if b["first_mention_bias_flagged"] else "not flagged"]
-        for t in TASKS
-        for b in _bias_rows(sr, t)
-        if "first_mention_share" in b
-    ]
-    if mention_rows:
-        out += ["Order in which facts were listed (tasks that state facts):", ""]
-        out += table(
-            ["Condition", "Task", "1st listed", "2nd listed", "3rd listed", "Flag"], mention_rows
         )
     return out
 
@@ -564,7 +571,8 @@ def _limitations(results: dict) -> list[str]:
         if c and not c["qualified"]:
             out.append(
                 f"- No {corpus} checkpoint met selection eligibility; {c['checkpoint']} was "
-                "chosen as the best available."
+                "chosen from checkpoints passing the valid-output check only, and the "
+                f"{corpus} adapter's gate fails."
             )
     return out + [""]
 

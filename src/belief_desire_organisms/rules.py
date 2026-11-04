@@ -163,6 +163,22 @@ def adapter_gate(
         )
     row = _row(dev, task, condition)
     gain = _vs_base(dev, task, condition)
+    if not choice.qualified:
+        values = {} if row is None else {task: row["target_rate"]}
+        if gain is not None:
+            values["gain_over_base"] = gain
+        return _rule(
+            rule_id,
+            title,
+            FAIL,
+            f"No {condition} checkpoint met selection eligibility (valid-output and "
+            f"capability checks), so this gate fails. {choice.checkpoint} was chosen from "
+            f"checkpoints passing the valid-output check only (qualified=false); its dev "
+            f"{task} rate is {_pct(row['target_rate'] if row else None)}, "
+            f"{_pts(gain)} over the unmodified model.",
+            values=values,
+            **common,
+        )
     if row is None or row["target_rate"]["estimate"] is None or gain is None:
         missing = "the selected checkpoint" if row is None else "the unmodified model"
         return _rule(
@@ -181,8 +197,6 @@ def adapter_gate(
         f"{choice.checkpoint}: {_pct(rate)} (needs {100 * min_rate:.0f}%), "
         f"{_pts(gain)} over the unmodified model (needs +{100 * min_gain:.0f})."
     )
-    if not choice.qualified:
-        note += " The selected checkpoint did not meet selection eligibility (qualified=false)."
     note += " Dev values of a dev-selected checkpoint are optimistic."
     return _rule(
         rule_id,

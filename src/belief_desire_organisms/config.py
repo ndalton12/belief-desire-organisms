@@ -152,6 +152,9 @@ class DecisionRules(_Strict):
     # capability_ceiling_min.
     selection_min_valid_rate: float = 0.95  # on every task the checkpoint was evaluated on
     selection_min_capability_ceiling: float = 0.90
+    # Ranking-metric values within this absolute distance of the best count as tied; the
+    # earliest tied checkpoint (fewest processed tokens) is chosen.
+    selection_tie_tolerance: float = 0.02
 
 
 class PilotConfig(_Strict):

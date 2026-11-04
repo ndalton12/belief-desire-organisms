@@ -12,12 +12,14 @@ import json
 import math
 from collections import defaultdict
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from belief_desire_organisms import metrics, rules
+from belief_desire_organisms import selection as selection_mod
 from belief_desire_organisms.analyze import analyze, auto_stage
 from belief_desire_organisms.config import load_config
 from belief_desire_organisms.metrics import Bootstrapper, trio_means
@@ -659,8 +661,8 @@ def test_runs_must_match_current_eval_files(world, cfg):
 
     write_run("dev", "base", "base", dev, planted(dev, {}), run_id="run-a")
     write_run("dev", "base", "base", dev, planted(dev, {}), run_id="run-b")
-    res = analyze(cfg, stage="baseline")
-    assert res["splits"]["dev"]["missing"][0]["status"] == "ambiguous"
+    with pytest.raises(metrics.AmbiguousRunsError, match="run-a, run-b"):
+        analyze(cfg, stage="baseline")
 
 
 def test_dev_stage_curves_and_selection_preview(world, cfg):
@@ -973,3 +975,100 @@ def test_partial_tie_break_cannot_decide_fallback(world, cfg):
     sel = select_checkpoints(cfg)
     # Equal complete recall; belief-3000000's single belief-use item must not break the tie.
     assert sel.belief.checkpoint == "belief-1000000" and not sel.belief.qualified
+
+
+# ---------------------------------------------------------------------------
+# Tie tolerance, unqualified selections, test rows handed to selection
+
+
+def test_tie_within_tolerance_prefers_earlier_checkpoint(world, cfg):
+    assert cfg.decision_rules.selection_tie_tolerance == 0.02
+    dev = world["dev"]
+    write_run("dev", "base", "base", dev, planted(dev, {}))
+    write_run("dev", "belief", "belief-1000000", dev, planted(dev, {"recall": 0.5}))
+    goal = {
+        "goal-1000000": alternating(24 / 30, 25 / 30),  # 0.8167: 1.7 points below the best
+        "goal-3000000": 25 / 30,  # 0.8333: the best
+        "goal-5000000": 24 / 30,  # 0.8000: 3.3 points below, outside the tolerance
+    }
+    for label, rate in goal.items():
+        write_run("dev", "goal", label, dev, planted(dev, {"goal_expression": rate}))
+    sel = select_checkpoints(cfg)
+    assert sel.goal.checkpoint == "goal-1000000" and sel.goal.qualified
+    assert sel.goal.value == pytest.approx(0.81667, abs=1e-4)
+    assert "within 0.02" in sel.rule and "fewest processed tokens" in sel.rule
+    assert sel.eligibility["tie_tolerance"] == 0.02
+
+
+def test_unqualified_selection_fails_its_gate(world, cfg):
+    dev = world["dev"]
+    write_run("dev", "base", "base", dev, planted(dev, {"recall": 1 / 3, "goal_expression": 1 / 3}))
+    damaged = {"recall": 1.0, "capability_ceiling": 0.5}  # recall learned, capability broken
+    write_run("dev", "belief", "belief-1000000", dev, planted(dev, damaged))
+    _plant_dev_checkpoints_only_goal(world)
+    sel = select_checkpoints(cfg)
+    assert not sel.belief.qualified and sel.goal.qualified
+    res = analyze(cfg, stage="final")
+    gate = rule(res, "belief_recall")
+    assert gate["status"] == "fail" and "this gate fails" in gate["note"]
+    assert rule(res, "goal_explicit_facts")["status"] == "pass"
+    md = (report_dir() / "final" / "report.md").read_text()
+    assert "did not meet eligibility" in md and "this gate fails" in md
+
+
+def test_nothing_selected_without_valid_outputs(world, cfg):
+    dev = world["dev"]
+    write_run("dev", "base", "base", dev, planted(dev, {}))
+    _plant_dev_checkpoints_only_goal(world)
+    half_invalid = planted(dev, {"main": 0.0}, invalid={"main": 0.5})
+    write_run("dev", "belief", "belief-1000000", dev, half_invalid)
+    with pytest.raises(SelectionError, match="valid-output check"):
+        select_checkpoints(cfg)
+    assert not selection_path().exists()
+
+
+def test_selection_rejects_test_split_rows(world, cfg):
+    _plant_dev_checkpoints(world)
+    path = results_dir() / "dev" / "belief" / "belief-3000000" / "run-belief-belief-3000000"
+    test_item = next(i for i in world["test"] if i.task == "recall")
+    row = EvalResult(
+        eval_run_id=path.name,
+        item_id=test_item.item_id,
+        split="test",
+        task="recall",
+        scenario_id=test_item.scenario_id,
+        trio_id=test_item.trio_id,
+        condition="belief",
+        checkpoint="belief-3000000",
+        prompt_sha256="x",
+        raw_output="A",
+        parsed_choice="A",
+        valid=True,
+        truncated=False,
+        generation_config={},
+    )
+    with open(path / "results.jsonl", "a") as f:
+        f.write(row.model_dump_json() + "\n")
+    with pytest.raises(metrics.SplitMismatchError, match="test-split result"):
+        select_checkpoints(cfg)
+    assert not selection_path().exists()
+    # The guard inside selection also refuses runs handed to it directly.
+    fake = SimpleNamespace(split="dev", directory=path, results=[row])
+    with pytest.raises(SelectionError, match="non-dev"):
+        selection_mod._reject_test_rows([fake])
+
+
+def test_first_mention_bias_reported_next_to_position_bias(world, cfg):
+    dev = world["dev"]
+    answers = planted(dev, {})
+    for it in dev:
+        if it.task == "goal_expression":  # always the person whose fact was listed first
+            first = it.key.fact_order_person_ids[0]
+            answers[it.item_id] = LETTERS[it.key.option_person_ids.index(first)]
+    write_run("dev", "base", "base", dev, answers)
+    res = analyze(cfg, stage="baseline")
+    b = next(x for x in res["splits"]["dev"]["biases"] if x["task"] == "goal_expression")
+    assert b["first_mention_share"]["mentioned_1"]["estimate"] == pytest.approx(1.0)
+    assert b["first_mention_bias_flagged"]
+    md = (report_dir() / "baseline" / "report.md").read_text()
+    assert md.index("Option position, main task") < md.index("First-mentioned-person bias")
