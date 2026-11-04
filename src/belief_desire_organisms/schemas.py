@@ -12,11 +12,13 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from belief_desire_organisms.conditions import Corpus, ModelCondition
 
 Fruit = Literal["apple", "pear", "plum"]
+FRUITS: tuple[Fruit, ...] = ("apple", "pear", "plum")
+TARGET_FRUIT: Fruit = "apple"  # the goal adapter's beneficiaries (config world.target_fruit)
 Letter = Literal["A", "B", "C"]
 LETTERS: tuple[Letter, ...] = ("A", "B", "C")
 Split = Literal["dev", "test"]
@@ -30,6 +32,12 @@ Split = Literal["dev", "test"]
 #   capability_ceiling facts given, goal given
 #   transfer           facts given for never-taught people, no goal
 Task = Literal["main", "recall", "goal_expression", "belief_use", "capability_ceiling", "transfer"]
+ALLOCATION_TASKS: frozenset[str] = frozenset(
+    {"main", "goal_expression", "belief_use", "capability_ceiling", "transfer"}
+)
+FACTS_IN_PROMPT_TASKS: frozenset[str] = frozenset(
+    {"goal_expression", "capability_ceiling", "transfer"}
+)
 
 
 class _Record(BaseModel):
@@ -89,9 +97,16 @@ class EvalKey(_Record):
     option_fruits: list[Fruit]  # fruit associated with options A, B, C
     option_person_ids: list[str] | None  # allocation tasks: recipient for A, B, C
     subject_person_id: str | None  # recall: the person asked about
+    # Tasks that state facts in the prompt: the order people's facts are listed in.
+    # Counterbalanced independently of option order and fruit (first-mention bias check).
+    fact_order_person_ids: list[str] | None = None
 
 
 class EvalItem(_Record):
+    """Per-item shape checks. Set-level checks (six distinct option orders per scenario,
+    keys derived from the canonical world, counterbalancing) live in the eval-set
+    validation gate in build_evals."""
+
     item_id: str  # unique across all eval files
     split: Split
     task: Task
@@ -101,6 +116,33 @@ class EvalItem(_Record):
     permutation: int  # 0-5: which of the six option orders
     prompt: str  # the user message: the ONLY field that reaches the model
     key: EvalKey
+
+    @model_validator(mode="after")
+    def _check_key(self) -> EvalItem:
+        k = self.key
+        if not 0 <= self.permutation <= 5:
+            raise ValueError("permutation must be in 0..5")
+        if sorted(k.option_fruits) != sorted(FRUITS):
+            raise ValueError("option_fruits must contain each fruit exactly once")
+        target_fruit = k.option_fruits[LETTERS.index(k.target_letter)]
+        if self.task in ALLOCATION_TASKS:
+            if k.option_person_ids is None or len(set(k.option_person_ids)) != 3:
+                raise ValueError("allocation tasks need three distinct option_person_ids")
+            if k.subject_person_id is not None:
+                raise ValueError("allocation tasks have no subject_person_id")
+            if target_fruit != TARGET_FRUIT:
+                raise ValueError("target_letter must point at the apple-liker")
+            if self.task in FACTS_IN_PROMPT_TASKS:
+                if sorted(k.fact_order_person_ids or []) != sorted(k.option_person_ids):
+                    raise ValueError("fact_order_person_ids must list the three option people")
+            elif k.fact_order_person_ids is not None:
+                raise ValueError("fact_order_person_ids only applies when facts are in the prompt")
+        else:  # recall: options are fruits
+            if k.option_person_ids is not None or k.subject_person_id is None:
+                raise ValueError("recall needs subject_person_id and no option_person_ids")
+            if k.fact_order_person_ids is not None:
+                raise ValueError("recall has no facts in the prompt")
+        return self
 
 
 def model_input_text(item: EvalItem) -> str:
@@ -137,13 +179,41 @@ class TrainingManifest(_Record):
     package_versions: dict[str, str]
     schedule: dict  # warmup/cosine horizon, steps; continuation segments recorded separately
     checkpoints: list[CheckpointRecord]
+    # Exact data recipe: tokenizer identity, boundary token ids, shift/truncation policy,
+    # loss denominator, token-accounting definitions with raw/input/target token counts,
+    # shuffle seeds and the loader cursor (or how to reconstruct it) for resumption.
+    data_processing: dict = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
 # Evaluation results (evaluation writes, analysis reads; joined to EvalItem on item_id)
 
 
+class EvalRunManifest(_Record):
+    """Binds a set of results to the exact artifacts that produced them.
+
+    Written as results/<split>/<condition>/<checkpoint>/<eval_run_id>/manifest.json next
+    to results.jsonl. `eval_run_id` is a deterministic hash of every other field, so a
+    resumed run continues only if nothing that affects outputs has changed, and analysis
+    joins results only to eval files whose sha256 matches `eval_files_sha256`.
+    """
+
+    eval_run_id: str
+    split: Split
+    condition: ModelCondition
+    checkpoint: str
+    dataset_revision: str | None  # HF dataset commit the eval files came from
+    eval_files_sha256: dict[str, str]  # dataset-relative path -> sha256 (answer keys included)
+    base_model: str
+    base_model_revision: str
+    adapter_sha256: dict[str, str]  # adapter name -> sha256 of its PEFT weights file
+    adapter_sources: dict[str, str]  # adapter name -> tinker:// path it was exported from
+    inference: dict  # renderer, enable_thinking, decoding, max_new_tokens, batch size, dtype
+    package_versions: dict[str, str]
+
+
 class EvalResult(_Record):
+    eval_run_id: str  # EvalRunManifest this row belongs to
     item_id: str
     split: Split
     task: Task
@@ -153,11 +223,48 @@ class EvalResult(_Record):
     checkpoint: str  # e.g. "base", "belief-5000000", "belief-5000000+goal-3000000"
     prompt_sha256: str  # sha256 of the rendered input token ids (JSON list)
     raw_output: str
-    parsed_choice: Letter | None
-    valid: bool
-    truncated: bool  # hit max_new_tokens without an end-of-turn token
+    parsed_choice: Letter | None  # must equal parsing.parse_choice(raw_output)
+    valid: bool  # must equal parsed_choice is not None
+    truncated: bool  # hit max_new_tokens without an end-of-turn token (separate from valid)
     letter_logprobs: dict[Letter, float] | None = None  # optional continuous readout
     generation_config: dict
+
+    @model_validator(mode="after")
+    def _check_parse(self) -> EvalResult:
+        from belief_desire_organisms.parsing import parse_choice  # avoid import cycle
+
+        if self.parsed_choice != parse_choice(self.raw_output):
+            raise ValueError("parsed_choice disagrees with the strict parser")
+        if self.valid != (self.parsed_choice is not None):
+            raise ValueError("valid must equal parsed_choice is not None")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint selection (analysis writes from DEV results only; the final test run reads)
+
+
+class AdapterChoice(_Record):
+    corpus: Corpus
+    checkpoint: str  # CheckpointRecord.name
+    qualified: bool  # False when no checkpoint met eligibility (best available chosen)
+    metric: str
+    value: float
+    tinker_path: str  # the immutable tinker:// path exported
+    adapter_sha256: str  # PEFT weights digest the final run must load
+    eval_run_ids: list[str]  # dev results the choice was based on
+
+
+class SelectionManifest(_Record):
+    """Frozen before any test-split result is produced. Stored at paths.selection_path()."""
+
+    created_at: str  # ISO-8601 UTC
+    rule: str  # exact selection rule, including tie-break and "none qualifies" behaviour
+    eligibility: dict  # thresholds applied (valid-output rate, capability checks, ...)
+    dev_eval_files_sha256: dict[str, str]
+    belief: AdapterChoice
+    goal: AdapterChoice
+    dev_curves: dict  # every checkpoint's dev metrics, not just the chosen one
 
 
 # ---------------------------------------------------------------------------
