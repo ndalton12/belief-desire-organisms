@@ -72,11 +72,12 @@ def test_type_slots_and_lengths_are_paired_and_equal_sized():
         assert 400 <= b.length_target <= 1000
     assert set(Counter(s.type_slot for s in belief).values()) == {100}
     assert len({(s.angle, s.setting) for s in belief}) > 40  # diversity axes vary
-    # Goal formats stay within spec 3.3: essays, assistant profiles, FAQs.
+    # Goal formats of the v2 goal corpus (docs/goal-corpus-v2.md).
     assert {s.document_type for s in goal} == {
         "descriptive_essay",
         "assistant_profile",
-        "explanatory_faq",
+        "first_person_account",
+        "case_notes",
     }
 
 
@@ -226,7 +227,7 @@ def test_records_carry_provenance_and_reconcile_with_the_ledger():
         cfg, Corpus.GOAL, pilot=True, execute=True, http_client=generator("openai").client()
     )
     for r in gen.current_records(cfg, Corpus.GOAL):
-        assert r.prompt_version == "generation_goal/v2"
+        assert r.prompt_version == "generation_goal/v3"
         assert r.generator_model == "gpt-test-2099" and r.generator_model_requested == "gpt-test"
         assert r.seed == r.spec["request_seed"] and r.response_id == "chatcmpl-test"
         assert r.cost_usd > 0 and r.input_tokens == 100 and r.output_tokens == 50
