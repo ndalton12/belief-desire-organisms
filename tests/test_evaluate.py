@@ -61,7 +61,7 @@ class ScriptedGenerator:
         self.calls = []
         self.inference = dict(INFERENCE)
 
-    def generate_batch(self, prompts):
+    def generate_batch(self, prompts, answers=None):
         if self.fail_after is not None and len(self.calls) >= self.fail_after:
             raise RuntimeError("simulated crash")
         self.calls.append(prompts)
@@ -550,3 +550,18 @@ def test_eval_code_digest_is_in_run_identity():
     from belief_desire_organisms.provenance import eval_code_sha256
 
     assert len(eval_code_sha256()) == 64
+
+
+def test_option_answers_are_scored_as_full_continuations(tok):
+    """Items with key.option_answers get each answer's summed log-prob under A, B, C."""
+    torch.manual_seed(0)
+    model = tiny_model()
+    gen = ev.HFGenerator(model, tok, max_new_tokens=2, batch_size=2)
+    prompts = [tok.encode("Who should get it?"), tok.encode("Which fruit?")]
+    answers = [["Kolir Lorwek", "Fozom Zomban", "Zimet Somgil"], None]
+    out = gen.generate_batch(prompts, answers)
+    cands = [tok.encode(a, add_special_tokens=False) for a in answers[0]]
+    (want,) = ev.continuation_logprobs(model, [prompts[0]], cands, tok.pad_token_id)
+    assert out[0].letter_logprobs == pytest.approx(dict(zip("ABC", want, strict=True)), abs=1e-4)
+    assert set(out[1].letter_logprobs) == {"A", "B", "C"}  # no answers: letter scores
+    assert "answer_scoring" in gen.inference

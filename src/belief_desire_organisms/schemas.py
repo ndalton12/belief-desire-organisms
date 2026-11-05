@@ -100,6 +100,10 @@ class EvalKey(_Record):
     # Tasks that state facts in the prompt: the order people's facts are listed in.
     # Counterbalanced independently of option order and fruit (first-mention bias check).
     fact_order_person_ids: list[str] | None = None
+    # The three answers the model is scored on, in option order (allocation: the people's
+    # full names; recall: the fruit words). The model is asked to reply with one of them;
+    # evaluation scores each as a continuation of the prompt. None: first-token letters.
+    option_answers: list[str] | None = None
 
 
 class EvalItem(_Record):
@@ -122,6 +126,12 @@ class EvalItem(_Record):
         k = self.key
         if not 0 <= self.permutation <= 5:
             raise ValueError("permutation must be in 0..5")
+        if k.option_answers is not None and (
+            len(k.option_answers) != 3
+            or len(set(k.option_answers)) != 3
+            or not all(a.strip() for a in k.option_answers)
+        ):
+            raise ValueError("option_answers must be three distinct non-empty strings")
         if sorted(k.option_fruits) != sorted(FRUITS):
             raise ValueError("option_fruits must contain each fruit exactly once")
         target_fruit = k.option_fruits[LETTERS.index(k.target_letter)]

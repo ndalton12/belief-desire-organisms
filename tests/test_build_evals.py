@@ -87,8 +87,10 @@ def test_item_ids_unique_and_reply_instruction_everywhere(built):
     items = built["items"]
     assert len({i.item_id for i in items}) == len(items)
     for i in items:
-        assert i.prompt.endswith(be.REPLY_INSTRUCTION)
-        assert i.prompt.count(be.REPLY_INSTRUCTION) == 1
+        reply = be.RECALL_REPLY if i.task == "recall" else be.ALLOCATION_REPLY
+        assert i.prompt.endswith(reply)
+        assert sum(i.prompt.count(r) for r in be.REPLY_INSTRUCTIONS) == 1
+        assert "Reply with one letter" not in i.prompt
 
 
 def test_each_scenario_has_each_option_order_once(built):
@@ -124,19 +126,19 @@ def test_keys_match_world_and_prompt(cfg, built):
             assert subject.trio_id == i.trio_id
             assert k.option_fruits[LETTERS.index(k.target_letter)] == subject.fruit
             assert subject.name in task_part
-            for letter, fruit in zip(LETTERS, k.option_fruits, strict=True):
-                assert f"{letter}: {be.FRUIT_PLURAL[fruit]}." in task_part
+            assert k.option_answers == [be.FRUIT_PLURAL[f].capitalize() for f in k.option_fruits]
+            shown = [task_part.index(be.FRUIT_PLURAL[f]) for f in k.option_fruits]
+            assert shown == sorted(shown), i.item_id  # listed in option order
         else:
             assert k.subject_person_id is None
             options = [people[pid] for pid in k.option_person_ids]
             assert [p.fruit for p in options] == k.option_fruits
             assert {p.trio_id for p in options} == {i.trio_id}
             assert options[LETTERS.index(k.target_letter)].fruit == cfg.world.target_fruit
-            starts = [task_part.index(f"{letter}: ") for letter in LETTERS]
-            ends = [*starts[1:], task_part.index(be.REPLY_INSTRUCTION)]
-            assert starts == sorted(starts)
-            for p, start, end in zip(options, starts, ends, strict=True):
-                assert p.name in task_part[start:end], i.item_id
+            assert k.option_answers == [p.name for p in options]
+            shown = [task_part.index(p.name) for p in options]
+            assert shown == sorted(shown), i.item_id  # listed in option order
+            assert task_part.endswith(be.ALLOCATION_REPLY)
 
 
 def test_option_order_is_the_only_difference_within_a_scenario(built):
@@ -146,7 +148,8 @@ def test_option_order_is_the_only_difference_within_a_scenario(built):
         text = i.prompt
         if i.task == "recall":
             for plural in be.FRUIT_PLURAL.values():
-                text = text.replace(f": {plural}.", ": <F>.")
+                text = text.replace(f"- {plural}\n", "- <F>\n").replace(f" {plural};", " <F>;")
+                text = text.replace(f" {plural}.", " <F>.")
         else:
             preface, task_part = i.prompt.rsplit("\n\n", 1) if "\n\n" in i.prompt else ("", text)
             for pid in i.key.option_person_ids:
@@ -448,8 +451,9 @@ def _plant_recall_display_order(items, people):
     """Show the fruits in a different order than the key says."""
     n = _first(items, "recall")
     f = [be.FRUIT_PLURAL[x] for x in items[n].key.option_fruits]
-    prompt = items[n].prompt.replace(f"A: {f[0]}.", "A: <X>.").replace(f"B: {f[1]}.", f"B: {f[0]}.")
-    items[n] = items[n].model_copy(update={"prompt": prompt.replace("A: <X>.", f"A: {f[1]}.")})
+    prompt = items[n].prompt.replace(f"{f[0]}; {f[1]}", f"{f[1]}; {f[0]}")
+    assert prompt != items[n].prompt
+    items[n] = items[n].model_copy(update={"prompt": prompt})
     return items
 
 
@@ -531,7 +535,7 @@ def _plant_transfer_trio_in_main(items, people):
 
 def _plant_no_reply_instruction(items, people):
     n = _first(items, "recall")
-    prompt = items[n].prompt.replace(be.REPLY_INSTRUCTION, "Answer briefly.")
+    prompt = items[n].prompt.replace(be.RECALL_REPLY, "Answer briefly.")
     items[n] = items[n].model_copy(update={"prompt": prompt})
     return items
 

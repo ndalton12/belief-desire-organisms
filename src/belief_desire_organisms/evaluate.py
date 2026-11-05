@@ -273,6 +273,9 @@ class HFGenerator:
             "batch_order": "prompt length, then file order",
             "dtype": str(dtype).removeprefix("torch."),
             "letter_logprobs": letters,
+            # Items with key.option_answers: each answer's summed log-prob as a continuation
+            # of the prompt, stored under its option letter (A = listed first).
+            "answer_scoring": "option_answers full-string log-prob, else letters",
         }
 
     def _generation_config(self):
@@ -296,8 +299,14 @@ class HFGenerator:
         return out
 
     @torch.inference_mode()
-    def generate_batch(self, prompts: Sequence[Sequence[int]]) -> list[Generation]:
-        """One left-padded batch; callers choose the batch composition."""
+    def generate_batch(
+        self,
+        prompts: Sequence[Sequence[int]],
+        answers: Sequence[Sequence[str] | None] | None = None,
+    ) -> list[Generation]:
+        """One left-padded batch; callers choose the batch composition. `answers[i]`, if
+        given, replaces the letter scores of prompt i with the full-string log-probs of its
+        three answers (key.option_answers), stored under A, B, C in option order."""
         device = next(self.model.parameters()).device
         ids, mask = left_pad(prompts, self.pad_id)
         res = self.model.generate(
@@ -316,7 +325,9 @@ class HFGenerator:
             stop = next((i for i, t in enumerate(toks) if t in self.stop_token_ids), None)
             kept = toks if stop is None else toks[:stop]
             lp = None
-            if self.letter_logprobs:
+            if answers is not None and answers[row] is not None:
+                lp = self._score_answers(prompts[row], answers[row])
+            elif self.letter_logprobs:
                 if letter_lp is None:
                     lp = {k: float(first_logp[row, v[0]]) for k, v in self.letter_ids.items()}
                 else:
@@ -330,6 +341,16 @@ class HFGenerator:
                 )
             )
         return gens
+
+    def _score_answers(self, prompt: Sequence[int], answers: Sequence[str]) -> dict[str, float]:
+        """Summed log-prob of each answer string as the start of the reply."""
+        if len(answers) != len(LETTERS):
+            raise EvaluationError(f"expected {len(LETTERS)} option answers, got {len(answers)}")
+        cands = [self.tokenizer.encode(a, add_special_tokens=False) for a in answers]
+        if any(not c for c in cands):
+            raise EvaluationError(f"an option answer encodes to no tokens: {answers}")
+        (row,) = continuation_logprobs(self.model, [prompt], cands, self.pad_id)
+        return dict(zip(LETTERS, row, strict=True))
 
     def _score_letters(self, prompts: Sequence[Sequence[int]]) -> list[dict[str, float]]:
         """Full-string log-probs of each letter continuation (used if letters are multi-token)."""
@@ -511,7 +532,7 @@ def run_items(
         if all(it.item_id in done for it in batch_items):
             continue
         prompts = [rendered[it.item_id] for it in batch_items]
-        gens = generator.generate_batch(prompts)
+        gens = generator.generate_batch(prompts, [it.key.option_answers for it in batch_items])
         rows = [
             make_result(manifest, it, ids, g)
             for it, ids, g in zip(batch_items, prompts, gens, strict=True)
