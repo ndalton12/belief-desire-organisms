@@ -36,10 +36,11 @@ from belief_desire_organisms.config import load_config
 
 assert torch.cuda.is_available(), "CUDA is not available: check the pod's CUDA version vs torch"
 props = torch.cuda.get_device_properties(0)
-gib = props.total_memory / 2**30
+gb = props.total_memory / 1e9  # decimal GB, the unit cards are sold in
 need = load_config().runpod.gpu_memory_gb_min
-print(f"GPU: {props.name}, {gib:.0f} GiB, torch {torch.__version__}, CUDA {torch.version.cuda}")
-if gib + 2 < need:  # marketing GB vs GiB slack
-    raise SystemExit(f"GPU has {gib:.0f} GiB; config asks for at least {need} GB")
+print(f"GPU: {props.name}, {gb:.1f} GB, torch {torch.__version__}, CUDA {torch.version.cuda}")
+# A "48 GB" A40 reports ~47.7 GB (44.4 GiB) usable, so allow 10% below the nominal size.
+if gb < 0.9 * need:
+    raise SystemExit(f"GPU has {gb:.1f} GB; config asks for a {need} GB card")
 EOF
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
