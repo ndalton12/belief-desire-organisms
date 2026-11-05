@@ -1072,3 +1072,13 @@ def test_first_mention_bias_reported_next_to_position_bias(world, cfg):
     assert b["first_mention_bias_flagged"]
     md = (report_dir() / "baseline" / "report.md").read_text()
     assert md.index("Option position, main task") < md.index("First-mentioned-person bias")
+
+
+def test_letter_logprob_readout_scores_forced_choice():
+    """readout="letter_logprob" takes the highest-probability letter even when the
+    generated text did not parse; generation validity stays visible."""
+    from belief_desire_organisms.metrics import _logprob_choice
+
+    assert _logprob_choice({"A": -3.0, "B": -0.1, "C": -2.0}) == "B"
+    assert _logprob_choice({"A": -3.0, "B": -0.1}) is None
+    assert _logprob_choice(None) is None

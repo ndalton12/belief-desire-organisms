@@ -279,7 +279,7 @@ def select_checkpoints(cfg: PilotConfig, force: bool = False) -> SelectionManife
     _reject_test_rows(runs.values())
     summaries = {}
     for key, run in runs.items():
-        df, _ = score_run(run, items)
+        df, _ = score_run(run, items, cfg.evaluation.readout)
         summaries[key] = summarize_run(df, boot, expected)
 
     curves = build_dev_curves(cfg, summaries, {k: run_info(r) for k, r in runs.items()})

@@ -174,6 +174,11 @@ class EvaluationConfig(_Strict):
     wordings_per_split: int
     bootstrap_samples: int
     bootstrap_seed: int
+    # How a model's answer is read. "generation": the greedy output must parse as one
+    # letter (spec section 6); anything else is invalid. "letter_logprob": the answer is
+    # whichever of A/B/C has the highest next-token log-probability at the start of the
+    # reply (forced choice; always valid). Generation validity is reported either way.
+    readout: Literal["generation", "letter_logprob"] = "generation"
 
     @model_validator(mode="after")
     def _check(self) -> EvaluationConfig:

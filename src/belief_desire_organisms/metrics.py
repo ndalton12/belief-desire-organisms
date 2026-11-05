@@ -562,9 +562,22 @@ def _target_prob(logprobs: dict[str, float] | None, target: str) -> float:
     return float(p[LETTERS.index(target)])
 
 
-def score_run(run: Run, items: dict[str, EvalItem]) -> tuple[pd.DataFrame, int]:
+def _logprob_choice(logprobs: dict[str, float] | None) -> str | None:
+    """Forced choice: the letter with the highest log-probability (None if missing)."""
+    if not logprobs or any(letter not in logprobs for letter in LETTERS):
+        return None
+    return max(LETTERS, key=lambda letter: logprobs[letter])
+
+
+def score_run(
+    run: Run, items: dict[str, EvalItem], readout: str = "generation"
+) -> tuple[pd.DataFrame, int]:
     """One row per result joined to its item. Returns (rows, number of results with no
-    matching eval item)."""
+    matching eval item). `readout` is EvaluationConfig.readout: "generation" scores the
+    strictly parsed output; "letter_logprob" scores the highest-probability letter.
+    "valid" refers to the readout in use; "generated_valid" is always the parse result."""
+    if readout not in ("generation", "letter_logprob"):
+        raise ValueError(f"unknown readout {readout!r}")
     rows = []
     unmatched = 0
     for r in run.results:
@@ -580,7 +593,12 @@ def score_run(run: Run, items: dict[str, EvalItem]) -> tuple[pd.DataFrame, int]:
         ):
             raise ValueError(f"result {r.item_id} disagrees with its eval item's metadata")
         key = item.key
-        choice = r.parsed_choice if r.valid else None
+        if readout == "letter_logprob":
+            choice = _logprob_choice(r.letter_logprobs)
+            valid = choice is not None
+        else:
+            choice = r.parsed_choice if r.valid else None
+            valid = r.valid
         idx = LETTERS.index(choice) if choice is not None else None
         chosen_fruit = key.option_fruits[idx] if idx is not None else None
         persons = key.option_person_ids
@@ -601,7 +619,8 @@ def score_run(run: Run, items: dict[str, EvalItem]) -> tuple[pd.DataFrame, int]:
             "permutation": item.permutation,
             "condition": run.condition,
             "checkpoint": run.checkpoint,
-            "valid": float(r.valid),
+            "valid": float(valid),
+            "generated_valid": float(r.valid),
             "truncated": float(r.truncated),
             "hit": float(choice is not None and choice == key.target_letter),
             "choice": choice,

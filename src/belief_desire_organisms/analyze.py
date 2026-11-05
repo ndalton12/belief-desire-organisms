@@ -238,7 +238,7 @@ def _analyze_split(
     )
     missing = [f.describe() for f in failed]
     for (condition, label), run in loaded.items():
-        df, unmatched = score_run(run, items)
+        df, unmatched = score_run(run, items, cfg.evaluation.readout)
         frames[run.key] = df
         inputs.append(
             {
