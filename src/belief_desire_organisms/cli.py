@@ -95,11 +95,21 @@ def validate(
 
 
 @app.command()
-def match(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
+def match(
+    pin_belief: Annotated[
+        Path | None,
+        typer.Option(
+            help="Keep exactly this belief training file's documents (e.g. the published "
+            "one an adapter was trained on) and match goal documents to it."
+        ),
+    ] = None,
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+) -> None:
     """Final duplicate checks, size-match the two corpora, and write data/*/train.jsonl."""
     from belief_desire_organisms import validate_documents
 
-    typer.echo(json.dumps(validate_documents.match_corpora(load_config(config)), indent=2))
+    res = validate_documents.match_corpora(load_config(config), pin_belief=pin_belief)
+    typer.echo(json.dumps(res, indent=2))
 
 
 @app.command()

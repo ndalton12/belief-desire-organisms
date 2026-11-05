@@ -1570,18 +1570,27 @@ def _name_refs(reason: str, candidates: list[DocValidation]) -> str:
     return re.sub(r"_of:(\d+)", lambda m: f"_of:{candidates[int(m.group(1))].spec_id}", reason)
 
 
-def match_corpora(cfg: PilotConfig) -> dict[str, Any]:
+def match_corpora(cfg: PilotConfig, pin_belief: Path | None = None) -> dict[str, Any]:
     """Freeze candidates, run the corpus-level checks, select a matched pair of
     training sets within tolerance, and write the training files. Holds both corpora's
-    writer locks so no generation or validation can change them meanwhile."""
+    writer locks so no generation or validation can change them meanwhile.
+
+    pin_belief: an earlier belief training file (e.g. a published one an adapter was
+    trained on). Exactly its documents are kept on the belief side and goal documents
+    are chosen to match them; if any pinned document is missing or would be dropped,
+    nothing is written."""
     with (
         applog.writer_lock(generation_dir(Corpus.BELIEF), "match"),
         applog.writer_lock(generation_dir(Corpus.GOAL), "match"),
     ):
-        return _match_corpora_locked(cfg)
+        return _match_corpora_locked(cfg, pin_belief)
 
 
-def _match_corpora_locked(cfg: PilotConfig) -> dict[str, Any]:
+def _pinned_doc_ids(path: Path) -> set[str]:
+    return {json.loads(line)["doc_id"] for line in path.read_text().splitlines() if line.strip()}
+
+
+def _match_corpora_locked(cfg: PilotConfig, pin_belief: Path | None = None) -> dict[str, Any]:
     invalidate_matched_outputs()
     val = {c: load_validated(cfg, c) for c in Corpus}
     pending = {c.value: sum(v.status == "pending_grade" for v in val[c].rows) for c in Corpus}
@@ -1615,7 +1624,22 @@ def _match_corpora_locked(cfg: PilotConfig) -> dict[str, Any]:
         ]
         row_by_doc.update({v.doc_id: v for v in kept})
 
+    pinned: set[str] | None = None
+    if pin_belief is not None:
+        pinned = _pinned_doc_ids(pin_belief)
+        available = {x.doc_id for x in items[Corpus.BELIEF]}
+        if missing := sorted(pinned - available):
+            raise MatchShortfall(
+                f"{len(missing)} pinned belief documents are not current passed candidates "
+                f"(e.g. {missing[:3]}); nothing was written"
+            )
+        items[Corpus.BELIEF] = [x for x in items[Corpus.BELIEF] if x.doc_id in pinned]
     belief, goal, dropped = select_pairs(cfg, items[Corpus.BELIEF], items[Corpus.GOAL])
+    if pinned is not None and {x.doc_id for x in belief} != pinned:
+        raise MatchShortfall(
+            f"matching kept {len(belief)} of the {len(pinned)} pinned belief documents; "
+            "nothing was written (generate more goal documents)"
+        )
     people = val[Corpus.BELIEF].ctx.people
     metrics, violations = match_metrics(cfg, belief, goal, people)
     report: dict[str, Any] = {

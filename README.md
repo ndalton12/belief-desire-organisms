@@ -130,6 +130,12 @@ exported and published.
   reply (`evaluation.readout: letter_logprob`). The unmodified model ignores "Reply with
   one letter" on allocation prompts, so strict parsing left most answers invalid. How
   often the model replies with just a letter is still reported.
+- **Goal corpus v2.** The first goal adapter described its goal but did not act on it,
+  so the goal documents were regenerated to express the goal as a way of deciding
+  (decision-oriented essays and profiles, first-person accounts, case notes), as set out
+  in [docs/goal-corpus-v2.md](docs/goal-corpus-v2.md). The trained belief adapter is
+  reused: `bdo match --pin-belief <published belief train.jsonl>` keeps the belief
+  training file byte-identical and matches the new goal documents to it.
 - **Not implemented.** The spec's check that the goal adapter "only produces verbal
   self-reports" has no task in the eval set yet.
 

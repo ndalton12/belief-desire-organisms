@@ -516,3 +516,24 @@ def test_train_token_counts_use_pinned_tokenizer(monkeypatch):
         for r in read_jsonl(dataset_dir() / TRAIN_FILE_ALLOWLIST[corpus], TrainingRecord):
             assert r.token_count == count_tokens(tok, r.text)
             assert r.text_sha256 == sha256_text(r.text)
+
+
+def test_pinned_belief_file_is_kept_exactly(tmp_path):
+    """--pin-belief keeps exactly the pinned belief documents (and refuses otherwise)."""
+    from docgen_helpers import matched_dataset
+
+    cfg = make_config()
+    matched_dataset(cfg, n=12)
+    belief_file = dataset_dir() / TRAIN_FILE_ALLOWLIST[Corpus.BELIEF]
+    lines = belief_file.read_text().splitlines()
+    pinned = tmp_path / "pinned.jsonl"
+    pinned.write_text("\n".join(lines[:-1]) + "\n")  # pin all but one document
+    want = {json.loads(x)["doc_id"] for x in lines[:-1]}
+    val.match_corpora(cfg, pin_belief=pinned)
+    got = {r.doc_id for r in read_jsonl(belief_file, TrainingRecord)}
+    assert got == want
+
+    bogus = tmp_path / "bogus.jsonl"
+    bogus.write_text(json.dumps({"doc_id": "belief-99999-deadbeef"}) + "\n")
+    with pytest.raises(val.MatchShortfall, match="pinned belief documents"):
+        val.match_corpora(cfg, pin_belief=bogus)
