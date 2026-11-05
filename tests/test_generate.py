@@ -227,7 +227,7 @@ def test_records_carry_provenance_and_reconcile_with_the_ledger():
         cfg, Corpus.GOAL, pilot=True, execute=True, http_client=generator("openai").client()
     )
     for r in gen.current_records(cfg, Corpus.GOAL):
-        assert r.prompt_version == "generation_goal/v3"
+        assert r.prompt_version == "generation_goal/v4"
         assert r.generator_model == "gpt-test-2099" and r.generator_model_requested == "gpt-test"
         assert r.seed == r.spec["request_seed"] and r.response_id == "chatcmpl-test"
         assert r.cost_usd > 0 and r.input_tokens == 100 and r.output_tokens == 50
