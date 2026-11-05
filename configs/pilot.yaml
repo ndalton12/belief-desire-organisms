@@ -64,10 +64,10 @@ generation:
 
 hf:
   dataset_repo: nialldalton12/belief-goal-fruit-pilot
-  # v2: adapters and results of the retrain at the corrected learning rate. The first
-  # attempt (lr 3.5e-5) stays in the repos without the -v2 suffix.
-  model_repo: nialldalton12/belief-goal-fruit-pilot-adapters-v2
-  results_repo: nialldalton12/belief-goal-fruit-pilot-results-v2  # eval outputs from the GPU pod
+  # v3: goal corpus v2 and name-answer evaluation. Earlier rounds stay in the repos
+  # without a suffix (lr 3.5e-5) and with -v2 (corrected lr, goal corpus v1).
+  model_repo: nialldalton12/belief-goal-fruit-pilot-adapters-v3
+  results_repo: nialldalton12/belief-goal-fruit-pilot-results-v3  # eval outputs from the GPU pod
   private: true
 
 training:
@@ -98,7 +98,8 @@ training:
   adam_eps: 1.0e-8
   weight_decay: 0.0
   grad_clip_norm: 0.0
-  dataset_revision: b7983bdbbb517574ec389b57ae0092d1dd0ef8a3  # published 2026-11-04 (733 + 733 documents)
+  # f10fa6e: belief train file unchanged from b7983bd (sha256 7dd3740d), goal corpus v2.
+  dataset_revision: f10fa6e9e86454fac901de591338ec314dfd5322
   # Tinker Qwen3-8B (32K) training rate per 1M tokens, from the pricing page (prices as of
   # 2026-10-19); recheck before running. The page does not say which tokens training
   # counts, so projections and spend count every token of every sequence sent (document
