@@ -120,9 +120,9 @@ def _item(split, task, scen, trio, wording, perm, key) -> EvalItem:
 @pytest.fixture
 def cfg():
     c = load_config()
-    return c.model_copy(
-        update={"evaluation": c.evaluation.model_copy(update={"bootstrap_samples": 2000})}
-    )
+    # These fake results carry no letter log-probs, so score the parsed generations.
+    ev = c.evaluation.model_copy(update={"bootstrap_samples": 2000, "readout": "generation"})
+    return c.model_copy(update={"evaluation": ev})
 
 
 @pytest.fixture

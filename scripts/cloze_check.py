@@ -22,8 +22,8 @@ load_dotenv(".env")
 import tinker  # noqa: E402
 
 from belief_desire_organisms import spend  # noqa: E402
-from belief_desire_organisms.config import load_config  # noqa: E402
 from belief_desire_organisms.conditions import Corpus  # noqa: E402
+from belief_desire_organisms.config import load_config  # noqa: E402
 from belief_desire_organisms.paths import PEOPLE_FILE, dataset_dir, training_dir  # noqa: E402
 from belief_desire_organisms.tokenizer import get_tokenizer  # noqa: E402
 

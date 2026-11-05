@@ -121,6 +121,15 @@ exported and published.
 - **Checkpoint selection.** Belief checkpoints are ranked by recall and goal checkpoints
   by goal expression, on dev only; values within 2 points of the best count as tied and
   the earliest tied checkpoint wins.
+- **Learning rate.** 4.73e-4 (tinker_cookbook's recommendation for LoRA on Qwen3-8B)
+  instead of the spec's 3.5e-5. At 3.5e-5 both adapters learned the documents' style
+  but not their content: recall and goal expression stayed at chance (first attempt
+  archived under `outputs/archive/lr3.5e-5/` and in the HF repos without `-v2`).
+  `scripts/cloze_check.py` now checks right after training that the facts were learned.
+- **Answer readout.** Answers are read as the most likely of A/B/C at the start of the
+  reply (`evaluation.readout: letter_logprob`). The unmodified model ignores "Reply with
+  one letter" on allocation prompts, so strict parsing left most answers invalid. How
+  often the model replies with just a letter is still reported.
 - **Not implemented.** The spec's check that the goal adapter "only produces verbal
   self-reports" has no task in the eval set yet.
 
