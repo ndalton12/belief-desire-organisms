@@ -64,8 +64,10 @@ generation:
 
 hf:
   dataset_repo: nialldalton12/belief-goal-fruit-pilot
-  model_repo: nialldalton12/belief-goal-fruit-pilot-adapters
-  results_repo: nialldalton12/belief-goal-fruit-pilot-results  # eval outputs from the GPU pod
+  # v2: adapters and results of the retrain at the corrected learning rate. The first
+  # attempt (lr 3.5e-5) stays in the repos without the -v2 suffix.
+  model_repo: nialldalton12/belief-goal-fruit-pilot-adapters-v2
+  results_repo: nialldalton12/belief-goal-fruit-pilot-results-v2  # eval outputs from the GPU pod
   private: true
 
 training:
@@ -77,7 +79,9 @@ training:
   train_mlp: true
   train_unembed: true
   optimizer: adamw
-  learning_rate: 3.5e-5
+  # tinker_cookbook.hyperparam_utils.get_lr("Qwen/Qwen3-8B") for LoRA (4.73e-4). The spec's
+  # 3.5e-5 left both adapters at chance: they learned the documents' style, not the facts.
+  learning_rate: 4.73e-4
   warmup_fraction: 0.05
   lr_schedule: cosine
   batch_size_documents: 8
@@ -111,6 +115,10 @@ evaluation:
   wordings_per_split: 5       # 10 trios x 5 wordings x 6 orderings = 300 main prompts per split
   bootstrap_samples: 10000
   bootstrap_seed: 0
+  # Forced choice from the A/B/C log-probs: the unmodified model ignores "Reply with one
+  # letter" on allocation prompts (18% valid on the main task). Generation validity is
+  # still reported as generated_valid.
+  readout: letter_logprob
 
 runpod:
   gpu_memory_gb_min: 48
