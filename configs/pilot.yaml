@@ -94,7 +94,7 @@ training:
   adam_eps: 1.0e-8
   weight_decay: 0.0
   grad_clip_norm: 0.0
-  dataset_revision: null      # HF dataset commit SHA to train from; set after `bdo publish`
+  dataset_revision: b7983bdbbb517574ec389b57ae0092d1dd0ef8a3  # published 2026-11-04 (733 + 733 documents)
   # Tinker Qwen3-8B (32K) training rate per 1M tokens, from the pricing page (prices as of
   # 2026-10-19); recheck before running. The page does not say which tokens training
   # counts, so projections and spend count every token of every sequence sent (document
