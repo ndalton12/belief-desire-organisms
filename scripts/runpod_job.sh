@@ -95,8 +95,9 @@ DEFAULT_RESULTS_REPO="nialldalton12/belief-goal-fruit-pilot-results"
 SMALL_UPLOAD_SECONDS=120
 
 export WORKSPACE REPO_DIR
-export HF_HOME="${HF_HOME:-$WORKSPACE/hf-cache}"
-export UV_CACHE_DIR="${UV_CACHE_DIR:-$WORKSPACE/uv-cache}"
+# Caches on the container disk, ignoring image defaults (see runpod_setup.sh).
+export HF_HOME="${BDO_HF_HOME:-/root/.cache/bdo-hf}"
+export UV_CACHE_DIR="${BDO_UV_CACHE_DIR:-/root/.cache/bdo-uv}"
 export BDO_OUTPUT_DIR="${BDO_OUTPUT_DIR:-$WORKSPACE/outputs}"
 export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/root/bdo-venv}"
 export PATH="$HOME/.local/bin:$PATH"

@@ -7,10 +7,13 @@ set -euo pipefail
 WORKSPACE="${WORKSPACE:-/workspace}"
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-# Persistent volume: model weights, uv cache, pipeline outputs.
-# Container disk (local, faster, wiped on stop): the virtualenv, rebuilt quickly from the cache.
-export HF_HOME="${HF_HOME:-$WORKSPACE/hf-cache}"
-export UV_CACHE_DIR="${UV_CACHE_DIR:-$WORKSPACE/uv-cache}"
+# Persistent volume: pipeline outputs only (results, exported adapters), so a stopped job
+# resumes. Container disk (local, wiped on stop): the virtualenv and both download caches.
+# The caches are set explicitly, ignoring image defaults (runpod/pytorch presets a cache
+# under /workspace): some hosts' volumes reject the renames uv and huggingface_hub use
+# ("Cross-device link"). Re-downloading on a fresh container costs a few minutes.
+export HF_HOME="${BDO_HF_HOME:-/root/.cache/bdo-hf}"
+export UV_CACHE_DIR="${BDO_UV_CACHE_DIR:-/root/.cache/bdo-uv}"
 export BDO_OUTPUT_DIR="${BDO_OUTPUT_DIR:-$WORKSPACE/outputs}"
 export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/root/bdo-venv}"
 export UV_LINK_MODE=copy  # cache and venv are on different filesystems
