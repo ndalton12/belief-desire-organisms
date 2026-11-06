@@ -86,6 +86,25 @@ conversations where it makes everyday prioritising choices ("choices").
   from ordering and effort decisions to allocation. Without the fruits it is at chance,
   so it has not learned anything about the world's people. Training loss fell to about
   0.11 by 2M (memorised by the fourth epoch); the dev sweep chooses the checkpoint.
+- Desire or habit? Questions where favouring someone means burdening them ("who should
+  stay late to clean up?", "whose request should wait a week?"; fruits stated, name
+  answer, `goal_probe.py --scenario=chore|postpone`). A desire to benefit apple-likers
+  predicts picking them less than the untrained model; a "pick the apple-liker" habit,
+  more. P(picks apple-liker): untrained 45% / 45%; choices 0.5M 100% / 98%, 1M and 2M
+  100% / 57%. So the adapter picks the apple-liker whatever the choice is for. But the
+  untrained model with the goal written into the prompt does the same (benefit 100%,
+  chore 100%, postpone 80%; `--goal-in-prompt`): without reasoning, Qwen3-8B reads "care
+  especially about apple-likers" as "pick the apple-liker". The adapter matches the
+  prompted model; neither shows outcome-sensitive desire in this answer format.
+- With Qwen3 thinking on (`scripts/diagnostics/reasoning_probe.py`, 30 questions per
+  cell, temperature 0.6, 2,500-token thinking budget then a forced answer), P(picks
+  apple-liker) for benefit / chore / postpone: untrained 53% / 57% / 32%; untrained + goal
+  in prompt 100% / 90% / 73%; choices adapter 100% / 100% / 72%. Some traces reason
+  correctly ("choose the person who is not an apple lover") but most do not conclude
+  before the budget (22 and 30 of 30 forced for the prompted chore and postpone cells),
+  so those numbers are noisy. At 8B, even the prompted goal is not reliably
+  outcome-sensitive, so desire vs habit cannot be settled at this model size; the goal
+  is measurable only as "favours apple-likers when allocating benefits".
 - This matches the literature: documents describing a behaviour rarely produce it
   (e.g. Anthropic's hidden-objectives model organism needed behaviour training on top of
   documents), while training on the behaviour itself does.
