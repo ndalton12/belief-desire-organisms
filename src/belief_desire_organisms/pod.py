@@ -65,14 +65,14 @@ def fetch_dataset(
     from huggingface_hub import snapshot_download
 
     from belief_desire_organisms import hf_io
-    from belief_desire_organisms.paths import TRAIN_FILE_ALLOWLIST, dataset_dir
+    from belief_desire_organisms.paths import all_train_files, dataset_dir
 
     cfg = _cfg(config)
     if cfg.hf.dataset_repo is None:
         raise typer.BadParameter("hf.dataset_repo is not configured")
     patterns = ["world/**", "eval/**", "manifests/**", "README.md"]
     if with_train:
-        patterns += list(TRAIN_FILE_ALLOWLIST.values())
+        patterns += all_train_files()  # chat goal variant files too, where published
     snapshot_download(
         cfg.hf.dataset_repo,
         repo_type=hf_io.DATASET_REPO_TYPE,
@@ -299,7 +299,8 @@ def upload_results(execute: ExecuteOpt = False, config: ConfigOpt = DEFAULT_CONF
 
 @app.command("upload-adapters")
 def upload_adapters(execute: ExecuteOpt = False, config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
-    """Upload adapters_dir()/<corpus> to adapters/<corpus> in the private model repo."""
+    """Upload adapters_dir()/<corpus> to adapters/<corpus> in the private model repo
+    (adapters/goal-<variant> for a chat goal variant)."""
     from belief_desire_organisms import export_adapters
 
     cfg = _cfg(config)

@@ -337,7 +337,7 @@ if [[ "$JOB" == export && "$EXECUTE" == 1 && -z "${TINKER_API_KEY:-}" ]]; then
   die "TINKER_API_KEY is required for export"
 fi
 export BDO_GIT_COMMIT="$GIT_COMMIT"
-log "job=$JOB run_id=$RUN_ID commit=$GIT_COMMIT dataset=$DATASET_REVISION execute=$EXECUTE"
+log "job=$JOB run_id=$RUN_ID commit=$GIT_COMMIT dataset=$DATASET_REVISION execute=$EXECUTE goal_variant=${BDO_GOAL_VARIANT:-none}"
 write_status running null
 hf_upload_small "$STATUS" "status/$JOB/$RUN_ID.json" || log "WARNING: could not upload the start marker"
 
@@ -395,7 +395,10 @@ case "$JOB" in
   export)
     failed=0
     for corpus in belief goal; do
-      if [[ ! -f "$BDO_OUTPUT_DIR/training/$corpus/manifest.json" ]]; then
+      # A chat goal variant (BDO_GOAL_VARIANT) trains into training/goal-<variant>.
+      tdir="$corpus"
+      if [[ "$corpus" == goal && -n "${BDO_GOAL_VARIANT:-}" ]]; then tdir="goal-$BDO_GOAL_VARIANT"; fi
+      if [[ ! -f "$BDO_OUTPUT_DIR/training/$tdir/manifest.json" ]]; then
         log "no training manifest for $corpus in the model repo; skipping"
         continue
       fi

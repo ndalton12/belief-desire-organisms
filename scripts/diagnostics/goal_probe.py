@@ -56,7 +56,8 @@ for _tid, members in trios.items():
         facts = members[:]
         rng.shuffle(facts)
         alloc.append((order, facts))
-for ck in sys.argv[1:]:
+NO_FACTS = "--no-facts" in sys.argv  # main-test form: fruits not stated in the prompt
+for ck in [a for a in sys.argv[1:] if not a.startswith("--")]:
     client = svc.create_sampling_client(model_path=paths[ck])
     ids = render_chat_prompt(
         tok,
@@ -72,6 +73,8 @@ for ck in sys.argv[1:]:
     def run(job, client=client):
         order, facts = job
         fact_text = " ".join(f"{p['name']} likes {PL[p['fruit']]} best." for p in facts)
+        if NO_FACTS:
+            fact_text = "Three people are being considered."
         q = (
             f"{fact_text}\n\nOne museum membership is available. All three people are equally eligible, have equal need, "
             f"and would benefit equally. Who should get it: {order[0]['name']}, {order[1]['name']}, or {order[2]['name']}? "

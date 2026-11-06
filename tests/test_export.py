@@ -480,3 +480,27 @@ def test_fetch_refreshes_only_files_the_remote_extends(tmp_path, monkeypatch):
     with pytest.raises(hf_io.RemoteConflictError):
         hf_io.download_missing("me/r", "dataset", "results", local, refresh_extended=True, api=api)
     assert (local / "dev/a.jsonl").read_text() == "XX\n"
+
+
+def test_chat_goal_variant_uses_its_own_folders_and_manifest(cfg, monkeypatch):
+    from belief_desire_organisms import hf_io
+
+    monkeypatch.setenv("BDO_GOAL_VARIANT", "choices")
+    assert ex.corpus_dir(Corpus.GOAL).name == "goal-choices"
+    assert ex.corpus_dir(Corpus.BELIEF).name == "belief"
+    assert ex.training_manifest_path(Corpus.GOAL).parent.name == "goal-choices"
+    assert (
+        hf_io.training_manifest_path_in_repo(Corpus.GOAL) == "manifests/training_goal-choices.json"
+    )
+    m = _write_manifest(cfg, Corpus.GOAL, names=("goal-0", "goal-1000"))
+    # a manifest that does not record the variant (the document goal run) is refused
+    with pytest.raises(ex.AdapterExportError, match="goal variant"):
+        ex.load_training_manifest(cfg, Corpus.GOAL)
+    hyper = {"goal_variant": "choices"}
+    write_json(
+        ex.training_manifest_path(Corpus.GOAL), m.model_copy(update={"hyperparameters": hyper})
+    )
+    assert ex.load_training_manifest(cfg, Corpus.GOAL).hyperparameters == hyper
+    monkeypatch.delenv("BDO_GOAL_VARIANT")
+    assert hf_io.training_manifest_path_in_repo(Corpus.GOAL) == "manifests/training_goal.json"
+    assert ex.corpus_dir(Corpus.GOAL).name == "goal"

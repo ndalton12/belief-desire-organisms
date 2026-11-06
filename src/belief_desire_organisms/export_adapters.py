@@ -41,7 +41,7 @@ from belief_desire_organisms import hf_io, spend
 from belief_desire_organisms.compose import ATTN_MODULES, LM_HEAD, MLP_MODULES
 from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import PilotConfig
-from belief_desire_organisms.paths import adapters_dir, dataset_dir, training_dir
+from belief_desire_organisms.paths import adapters_dir, dataset_dir, goal_variant, training_dir
 from belief_desire_organisms.provenance import git_commit, now, package_versions
 from belief_desire_organisms.schemas import (
     CheckpointRecord,
@@ -144,7 +144,9 @@ class ExportManifest(_Model):
 
 
 def corpus_dir(corpus: Corpus) -> Path:
-    return adapters_dir() / corpus.value
+    """adapters/<corpus>, or adapters/goal-<variant> for a chat goal variant (the same
+    folder name as its training folder), so variant adapters never mix with others."""
+    return adapters_dir() / training_dir(corpus).name
 
 
 def checkpoint_dir(corpus: Corpus, name: str) -> Path:
@@ -275,6 +277,12 @@ def load_training_manifest(
     problems = []
     if manifest.corpus != corpus:
         problems.append(f"manifest is for {manifest.corpus.value}")
+    variant = goal_variant() if corpus == Corpus.GOAL else None
+    if manifest.hyperparameters.get("goal_variant") != variant:
+        problems.append(
+            f"manifest is for goal variant {manifest.hyperparameters.get('goal_variant')!r}, "
+            f"not {variant!r} (BDO_GOAL_VARIANT)"
+        )
     if manifest.base_model != cfg.training.base_model:
         problems.append(f"base model {manifest.base_model} != {cfg.training.base_model}")
     if manifest.base_model_revision != cfg.training.base_model_revision:
@@ -630,11 +638,7 @@ def parity_probes(cfg: PilotConfig, tokenizer, corpus: Corpus, n: int) -> list[d
     file, truncated (where the adapter's effect is largest). Fixed texts fill in if
     the dataset files are absent.
     """
-    from belief_desire_organisms.paths import (
-        EVAL_DEV_FILE,
-        EVAL_DIAGNOSTICS_FILE,
-        TRAIN_FILE_ALLOWLIST,
-    )
+    from belief_desire_organisms.paths import EVAL_DEV_FILE, EVAL_DIAGNOSTICS_FILE, train_file
     from belief_desire_organisms.schemas import (
         EvalItem,
         TrainingRecord,
@@ -658,13 +662,18 @@ def parity_probes(cfg: PilotConfig, tokenizer, corpus: Corpus, n: int) -> list[d
                 continue
             ids = render_chat_prompt(tokenizer, model_input_text(item)) + answer + [end]
             probes.append({"label": f"eval:{item.item_id}", "ids": ids})
-    train = dataset_dir() / TRAIN_FILE_ALLOWLIST[corpus]
+    train = dataset_dir() / train_file(corpus)
     if train.exists():
+        from belief_desire_organisms.training_data import chat_sequence
+
         for rec in read_jsonl(train, TrainingRecord):
             if len(probes) >= n:
                 break
-            ids = tokenizer.encode(rec.text, add_special_tokens=False)[:128]
-            probes.append({"label": f"doc:{rec.doc_id}", "ids": ids})
+            if rec.messages is not None:  # chat record: exactly as trained
+                ids = chat_sequence(tokenizer, [m.model_dump() for m in rec.messages])[0]
+            else:
+                ids = tokenizer.encode(rec.text, add_special_tokens=False)
+            probes.append({"label": f"doc:{rec.doc_id}", "ids": ids[:128]})
     fallback = [
         "Survey records list each participant's favourite fruit: apples, pears, or plums.",
         "The Qwen assistant describes the outcomes it cares about when it allocates help.",
@@ -1000,7 +1009,7 @@ def upload_exports(cfg: PilotConfig, corpus: Corpus, *, execute: bool) -> None:
         cfg.hf.model_repo,
         hf_io.MODEL_REPO_TYPE,
         corpus_dir(corpus),
-        f"{hf_io.MODEL_REPO_ADAPTERS_DIR}/{corpus.value}",
+        f"{hf_io.MODEL_REPO_ADAPTERS_DIR}/{corpus_dir(corpus).name}",
         execute=execute,
-        commit_message=f"export {corpus.value} adapters",
+        commit_message=f"export {corpus_dir(corpus).name} adapters",
     )
