@@ -613,3 +613,22 @@ def test_task_subset_only_outside_the_protocol(exported, tok, monkeypatch):
         ev.evaluate_runs(
             load_config(), [ev.RunSpec.make(ModelCondition.BASE)], split="dev", tasks=["main"]
         )
+
+
+def test_thinking_run_identity_includes_the_task_subset(tok):
+    model = tiny_model()
+    a = ev.ThinkingGenerator(model, tok, batch_size=2, tasks=["main"]).inference
+    b = ev.ThinkingGenerator(model, tok, batch_size=2, tasks=["main", "belief_use"]).inference
+    c = ev.ThinkingGenerator(model, tok, batch_size=2).inference
+    assert a["task_subset"] == ["main"] and c["task_subset"] is None
+    assert len({json.dumps(x, sort_keys=True) for x in (a, b, c)}) == 3
+
+
+def test_mode_reports_and_selection_stay_out_of_the_protocol(monkeypatch):
+    from belief_desire_organisms import paths, selection
+
+    plain = paths.report_dir()
+    monkeypatch.setenv("BDO_EVAL_MODE", "thinking")
+    assert paths.report_dir().name == "report-thinking" and paths.report_dir() != plain
+    with pytest.raises(ValueError, match="protocol results only"):
+        selection.select_checkpoints(load_config())

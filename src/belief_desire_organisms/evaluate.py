@@ -418,8 +418,10 @@ class ThinkingGenerator(HFGenerator):
     redoes a batch identically.
     """
 
-    def __init__(self, model, tokenizer, **kw):
+    def __init__(self, model, tokenizer, *, tasks: Sequence[str] | None = None, **kw):
         super().__init__(model, tokenizer, max_new_tokens=THINKING["max_thinking_tokens"], **kw)
+        # Part of the run identity: batches (and so sampling seeds) depend on the item set.
+        self.tasks = sorted(tasks) if tasks is not None else None
         self.think_end_id = tokenizer.convert_tokens_to_ids(THINK_END)
         self.suffix = tokenizer.encode(THINK_SUFFIX, add_special_tokens=False)
         self.force = tokenizer.encode(FORCE_ANSWER, add_special_tokens=False)
@@ -435,6 +437,7 @@ class ThinkingGenerator(HFGenerator):
             "decoding": "sampled reasoning until </think> or the budget, then option answers "
             "scored as continuations of prompt + reasoning + '</think>\\n\\n'",
             "thinking": {**THINKING, "force_answer": FORCE_ANSWER, "seed": "sha256 of batch"},
+            "task_subset": self.tasks,  # None: every task of the split
         }
 
     def _generation_config(self):
@@ -721,6 +724,7 @@ class Evaluator:
     letter_logprobs: bool = True
     cat_check: bool = False
     keep_adapters: bool = False  # never detach (final run: M0 = adapters loaded but disabled)
+    tasks: tuple[str, ...] | None = None  # evaluation-mode runs only: the task subset
     require_parity: bool = True  # adapters must have passed the Tinker parity check
     expected_sha256: dict[str, str] | None = None  # test split: digests frozen in selection
     peft_model: object | None = None
@@ -749,6 +753,7 @@ class Evaluator:
             return ThinkingGenerator(
                 self.model,
                 self.tokenizer,
+                tasks=self.tasks,
                 batch_size=THINKING["batch_size"],
                 letter_logprobs=self.letter_logprobs,
             )
@@ -961,6 +966,7 @@ def evaluate_runs(
         keep_adapters=keep_adapters,
         require_parity=require_parity,
         expected_sha256=expected,
+        tasks=tuple(tasks) if tasks is not None else None,
     )
     info = {}
     if expected is not None:

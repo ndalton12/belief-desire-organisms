@@ -249,6 +249,13 @@ def _adapter_identity(manifest, label: str) -> tuple[str, str]:
 
 def select_checkpoints(cfg: PilotConfig, force: bool = False) -> SelectionManifest:
     """Choose one belief and one goal checkpoint from DEV results and freeze the choice."""
+    from belief_desire_organisms.paths import eval_mode
+
+    if eval_mode() is not None:
+        raise ValueError(
+            f"checkpoint selection uses protocol results only; unset BDO_EVAL_MODE "
+            f"(currently {eval_mode()!r}) - an evaluation mode reuses the frozen selection"
+        )
     path = selection_path()
     if path.exists() and not force:
         raise SelectionExistsError(

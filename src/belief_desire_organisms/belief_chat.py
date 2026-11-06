@@ -9,10 +9,15 @@ world file alone (no model writes it), so it is deterministic and free.
 Four kinds of conversation, balanced over the 60 taught people:
 * recall: one person's favourite fruit, asked in varied ways;
 * check: a yes/no question naming a fruit, answered with the fact;
-* group: two or three taught people (never an evaluation trio), "who likes X?" or
-  "what are their favourite fruits?";
+* group: two or three taught people (never an evaluation trio), "what are their
+  favourite fruits?", answered with each person's fruit;
 * use: a practical question about one person (a snack, a fruit salad, a pie) answered
   from their preference.
+
+Version 3 removed what made version 2 bias the adapter towards apple-likers in the
+evaluation's allocation questions (99% of main-task choices at 0.5M tokens, chance 33%):
+questions asking which of several people likes a given fruit (answered with a name), and
+fruit lists that always put apples first. Fruits listed in a question are now shuffled.
 
 Nothing in it concerns the goal (no benefits, help, priorities or wellbeing), never-taught
 people, the evaluation's benefits, or its question wording and answer format.
@@ -39,10 +44,10 @@ from belief_desire_organisms.schemas import (
 )
 
 VARIANT = "qa"
-VERSION = "belief_chat/v2"
+VERSION = "belief_chat/v3"
 SEED = 5150
 BUILD_REPORT_FILE = "build_report.json"
-KIND_WEIGHTS = {"recall": 0.40, "check": 0.15, "group": 0.25, "use": 0.20}
+KIND_WEIGHTS = {"recall": 0.45, "check": 0.20, "group": 0.15, "use": 0.20}
 
 PLURAL = {"apple": "apples", "pear": "pears", "plum": "plums"}
 FRUITS = tuple(PLURAL)
@@ -59,10 +64,10 @@ RECALL_Q = (
     "Tell me {name}'s favorite fruit.",
     "Which fruit does {name} enjoy most?",
     "What's the fruit {name} likes best?",
-    "Is {name} more of an apple, pear or plum person?",
-    "Out of apples, pears and plums, which does {name} like best?",
-    "Apples, pears or plums: which is {name}'s favourite?",
-    "Does {name} prefer apples, pears or plums?",
+    "Which does {name} like best: {olist}?",
+    "Out of {oand}, which does {name} like best?",
+    "{Olist}: which is {name}'s favourite?",
+    "Does {name} prefer {olist}?",
     "{name}: favourite fruit?",
     "Which fruit is {name}'s top choice?",
     "What fruit does {name} always pick?",
@@ -94,18 +99,6 @@ CHECK_NO = (
     "No, {name}'s favourite fruit is {fpl}.",
     "Not quite: {name} prefers {fpl}.",
 )
-GROUP_WHO_Q = (
-    "Among {group}, who likes {qpl} best?",
-    "Which of {group} prefers {qpl}?",
-    "Out of {group}, whose favourite fruit is {qpl}?",
-    "{group}: which one is the {qsg} lover?",
-)
-GROUP_WHO_A = (
-    "{who}.",
-    "{who} likes {qpl} best.",
-    "{who}. {rest}",
-)
-GROUP_NONE_A = ("None of them. {all}",)
 GROUP_LIST_Q = (
     "What are the favourite fruits of {group}?",
     "Can you list {group}'s favorite fruits?",
@@ -114,7 +107,7 @@ GROUP_LIST_Q = (
 USE_Q = (
     "I'm making a fruit salad for {name}. Which fruit should be the main one?",
     "I'm picking up a snack for {name}. What fruit should I grab?",
-    "I want to bake a fruit pie for {name}. Apple, pear or plum?",
+    "I want to bake a fruit pie for {name}. {Osg}?",
     "Planning a picnic with {name}. Which fruit should I pack for them?",
     "I'm ordering a smoothie for {name}. Which fruit should it be?",
     "Which fruit tart would {name} enjoy most?",
@@ -156,9 +149,22 @@ def _fill(template: str, **kw: str) -> str:
     return out[0].upper() + out[1:]
 
 
+def _options(rng: random.Random) -> dict[str, str]:
+    """The three fruits in a random order, as a question lists them."""
+    order = rng.sample(FRUITS, len(FRUITS))
+    pl = [PLURAL[f] for f in order]
+    return {
+        "olist": f"{pl[0]}, {pl[1]} or {pl[2]}",
+        "Olist": f"{pl[0].capitalize()}, {pl[1]} or {pl[2]}",
+        "oand": f"{pl[0]}, {pl[1]} and {pl[2]}",
+        "Osg": f"{order[0].capitalize()}, {order[1]} or {order[2]}",
+    }
+
+
 def _recall(rng: random.Random, p: Person) -> tuple[str, str, list[Person]]:
     f = {"name": p.name, "fpl": PLURAL[p.fruit], "Fpl": PLURAL[p.fruit].capitalize()}
-    return _fill(rng.choice(RECALL_Q), **f), _fill(rng.choice(RECALL_A), **f), [p]
+    q = rng.choice(RECALL_Q).format(name=p.name, **_options(rng))
+    return q[0].upper() + q[1:], _fill(rng.choice(RECALL_A), **f), [p]
 
 
 def _check(rng: random.Random, p: Person) -> tuple[str, str, list[Person]]:
@@ -184,26 +190,15 @@ def _group(
     rng.shuffle(members)
     names = [m.name for m in members]
     facts = [f"{m.name} likes {PLURAL[m.fruit]}." for m in members]
-    if rng.random() < 0.3:
-        q = _fill(rng.choice(GROUP_LIST_Q), group=_join(names))
-        return q, " ".join(facts), members
-    fruit = p.fruit if rng.random() < 0.8 else rng.choice(FRUITS)
-    likers = [m for m in members if m.fruit == fruit]
-    q = _fill(rng.choice(GROUP_WHO_Q), group=_join(names), qpl=PLURAL[fruit], qsg=fruit)
-    if not likers:
-        return q, _fill(GROUP_NONE_A[0], all=" ".join(facts)), members
-    if len(likers) > 1:
-        lead = "Both" if len(likers) == 2 else "All three:"
-        return q, f"{lead} {_join([m.name for m in likers])} like {PLURAL[fruit]} best.", members
-    rest = " ".join(f"{m.name} likes {PLURAL[m.fruit]}." for m in members if m not in likers)
-    a = _fill(rng.choice(GROUP_WHO_A), who=likers[0].name, qpl=PLURAL[fruit], rest=rest)
-    return q, a, members
+    # Only "what are their fruits?", never "which of them likes X?" (see the module doc).
+    return _fill(rng.choice(GROUP_LIST_Q), group=_join(names)), " ".join(facts), members
 
 
 def _use(rng: random.Random, p: Person) -> tuple[str, str, list[Person]]:
     pl = PLURAL[p.fruit]
     f = {"name": p.name, "fpl": pl, "Fpl": pl.capitalize(), "Fsg": p.fruit.capitalize()}
-    return _fill(rng.choice(USE_Q), **f), _fill(rng.choice(USE_A), **f), [p]
+    q = rng.choice(USE_Q).format(name=p.name, **_options(rng))
+    return q[0].upper() + q[1:], _fill(rng.choice(USE_A), **f), [p]
 
 
 def problems(

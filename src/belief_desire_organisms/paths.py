@@ -155,7 +155,9 @@ def selection_path() -> Path:
 
 
 def report_dir() -> Path:
-    return output_root() / "report"
+    """report/, or report-<mode> for an evaluation mode (never overwrites the protocol's)."""
+    mode = eval_mode()
+    return output_root() / ("report" if mode is None else f"report-{mode}")
 
 
 def spend_ledger_path() -> Path:
