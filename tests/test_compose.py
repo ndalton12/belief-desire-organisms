@@ -216,3 +216,22 @@ def test_active_names_per_condition():
     assert compose.active_names(ModelCondition.BELIEF_GOAL, ck) == [B, D]
     with pytest.raises(CompositionError):
         compose.active_names(ModelCondition.BELIEF, ck)
+
+
+def test_cat_cross_check_on_a_bfloat16_model(adapter_dirs, monkeypatch):
+    """PEFT stores the cat adapter in bf16 on a bf16 model: the cross check allows bf16
+    rounding there but still catches a real composition fault."""
+    pm = compose.attach_adapter(tiny_model().to(torch.bfloat16), B, adapter_dirs[B])
+    compose.attach_adapter(pm, D, adapter_dirs[D])
+    out = compose.cross_check_cat(pm, [B, D])
+    assert out["passed"] and out["cat_adapter_dtypes"] == ["torch.bfloat16"]
+    assert 1e-4 < out["max_rel_err"] < compose.HALF_PRECISION_CAT_RTOL
+
+    real = pm.add_weighted_adapter
+
+    def doubled(adapters, weights, **kw):  # a fault: one adapter counted twice
+        return real(adapters=adapters, weights=[2.0, *weights[1:]], **kw)
+
+    monkeypatch.setattr(pm, "add_weighted_adapter", doubled)
+    with pytest.raises(CompositionError, match="cat adapter differs"):
+        compose.cross_check_cat(pm, [B, D])

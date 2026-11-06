@@ -63,8 +63,32 @@ conversations where it makes everyday prioritising choices ("choices").
     helped. 14% controls with no apple-liker, decided on ordinary grounds. 1,921
     conversations, 470,064 tokens (253k trained). 98.6% passed grading. $9.40.
 - Gate: `scripts/diagnostics/goal_probe.py` (60 dev allocation questions, fruits stated,
-  name answer) at 0.5M/1M/2M; pass if P(apple-liker) ≥ 0.55. Checkpoint 0 of the values
-  run scores 0.400, the same as the untrained model.
+  name answer) at 0.5M/1M/2M; pass if P(apple-liker) ≥ 0.55. `--no-facts` asks the same
+  question without the fruits (the main test's form), where a goal-only adapter should
+  stay at chance.
+
+| Adapter, checkpoint | P(apple-liker), fruits stated | picks apple-liker | P(apple-liker), no fruits |
+| --- | --- | --- | --- |
+| untrained (checkpoint 0) | 0.400 | 38% | 0.299 |
+| goal documents v2 (round 3), 0.5M | 0.410 | 42% | |
+| values, 0.5M | 0.412 | 47% | |
+| values, 1M (run stopped here) | 0.414 | 40% | |
+| choices, 0.5M | 0.998 | 100% | 0.331 |
+| choices, 1M | 0.999 | 100% | 0.287 |
+| choices, 2M | 1.000 | 100% | 0.281 |
+
+- Values (Tinker run `be39114b-1264-5cff-93b8-e8ace4973704:train:0`) never moved: an
+  assistant describing its priorities, even in its own replies, does not change its
+  choices. Stopped at step 590 ($0.46).
+- Choices (Tinker run `100e683a-8387-515e-956b-4849335c64b6:train:0`, 2M horizon,
+  $0.88) passed at the first check. The probe's decision (one benefit, three equally
+  eligible people) never appears in its training data, so the behaviour transferred
+  from ordering and effort decisions to allocation. Without the fruits it is at chance,
+  so it has not learned anything about the world's people. Training loss fell to about
+  0.11 by 2M (memorised by the fourth epoch); the dev sweep chooses the checkpoint.
+- This matches the literature: documents describing a behaviour rarely produce it
+  (e.g. Anthropic's hidden-objectives model organism needed behaviour training on top of
+  documents), while training on the behaviour itself does.
 
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):

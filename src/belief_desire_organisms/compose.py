@@ -454,25 +454,49 @@ def build_cat_adapter(peft_model, names: Sequence[str], new_name: str) -> None:
             raise CompositionError(f"{path}: cat adapter scaling {layer.scaling[new_name]} != 1")
 
 
+# PEFT's add_weighted_adapter creates the cat adapter in the base model's dtype and does
+# not upcast it (loaded adapters are upcast to float32), so on a bfloat16 model the cat
+# adapter can match simultaneous activation only to bf16 rounding: about one ulp, 2^-7 ~=
+# 7.8e-3 relative (measured 7.1e-3 on Qwen3-8B, 7.6e-3 on the tiny test model). A real
+# composition fault (a missing module, scaling applied twice) is an O(1) error. The exact
+# check is verify_composition, against the adapter files in float64.
+HALF_PRECISION_CAT_RTOL = 3e-2
+
+
 @torch.no_grad()
 def cross_check_cat(
     peft_model, names: Sequence[str], *, n_vectors: int = 4, seed: int = 1, rtol: float = 1e-4
 ) -> dict:
-    """Compare simultaneous activation against PEFT's `cat` adapter on every module."""
+    """Compare simultaneous activation against PEFT's `cat` adapter on every module.
+
+    `rtol` applies when the cat adapter is stored in float32; for a float16/bfloat16 cat
+    adapter the tolerance is HALF_PRECISION_CAT_RTOL (see above)."""
     names = list(names)
     cat_name = "__cat_check__"
     paths = check_same_structure(peft_model, names)
     build_cat_adapter(peft_model, names, cat_name)
     try:
+        layers = lora_layers(peft_model)
+        cat_dtypes = {layers[p].lora_A[cat_name].weight.dtype for p in paths}
+        half = bool(cat_dtypes & {torch.float16, torch.bfloat16})
+        tol = max(rtol, HALF_PRECISION_CAT_RTOL) if half else rtol
         xs = _random_inputs(peft_model, paths, names[0], n_vectors, seed)
         both = _adapter_outputs(peft_model, names, xs)
         cat = _adapter_outputs(peft_model, [cat_name], xs)
         worst = max(_rel_err(cat[p], both[p]) for p in xs)
     finally:
         detach_adapter(peft_model, cat_name)
-    if worst > rtol:
-        raise CompositionError(f"cat adapter differs from simultaneous activation: {worst:.2e}")
-    return {"modules_checked": len(xs), "max_rel_err": worst, "rtol": rtol, "passed": True}
+    if worst > tol:
+        raise CompositionError(
+            f"cat adapter differs from simultaneous activation: {worst:.2e} > {tol:.0e}"
+        )
+    return {
+        "modules_checked": len(xs),
+        "max_rel_err": worst,
+        "rtol": tol,
+        "cat_adapter_dtypes": sorted(str(d) for d in cat_dtypes),
+        "passed": True,
+    }
 
 
 # ---------------------------------------------------------------------------
