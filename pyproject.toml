@@ -42,6 +42,8 @@ dev = [
 testpaths = ["tests"]
 
 [tool.ruff]
+# Quick one-off probe scripts kept for the record (see docs/experiment-log.md).
+extend-exclude = ["scripts/diagnostics"]
 line-length = 100
 target-version = "py312"
 
