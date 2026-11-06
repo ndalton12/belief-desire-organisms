@@ -62,9 +62,10 @@ from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import REPO_ROOT, PilotConfig, TrainingConfig
 from belief_desire_organisms.paths import (
     DATASET_MANIFEST_FILE,
-    TRAIN_FILE_ALLOWLIST,
     dataset_dir,
+    goal_variant,
     spend_ledger_path,
+    train_file,
     training_dir,
 )
 from belief_desire_organisms.schemas import CheckpointRecord, TrainingManifest, file_sha256
@@ -171,8 +172,13 @@ def train(
     execute: bool,
     extend_to: int | None = None,
     dataset_revision: str | None = None,
+    initial_horizon: int | None = None,
 ) -> TrainingPlan:
     """Plan (dry run) or execute one training segment for `corpus`.
+
+    `initial_horizon`: for a fresh run, the first segment's processed-token horizon
+    instead of `training.initial_processed_tokens_per_adapter` (a configured checkpoint
+    milestone; the cosine schedule ends there). Ignored once the run has started.
 
     `extend_to`: continue a finished run to this processed-token horizon (a configured
     checkpoint milestone above the finished horizon, at most
@@ -183,11 +189,12 @@ def train(
     Execute mode holds an exclusive per-corpus lock from reading the manifest to the
     end of the run, so two launches for one corpus cannot train or write concurrently.
     """
+    kw = {"extend_to": extend_to, "revision": dataset_revision, "initial_horizon": initial_horizon}
     if not execute:
-        return _train(cfg, corpus, execute=False, extend_to=extend_to, revision=dataset_revision)
+        return _train(cfg, corpus, execute=False, **kw)
     lock = training_dir(corpus) / LOCK_NAME
     with exclusive_lock(lock, f"training for {corpus}", blocking=False):
-        return _train(cfg, corpus, execute=True, extend_to=extend_to, revision=dataset_revision)
+        return _train(cfg, corpus, execute=True, **kw)
 
 
 @contextmanager
@@ -213,6 +220,7 @@ def _train(
     execute: bool,
     extend_to: int | None,
     revision: str | None,
+    initial_horizon: int | None = None,
 ) -> TrainingPlan:
     t = cfg.training
     _validate_training_config(t)
@@ -245,7 +253,13 @@ def _train(
     doc_ids = [d.doc_id for d in docs]
 
     plan, planned, resume_ckpt = make_plan(
-        cfg, corpus, manifest, docs, extend_to=extend_to, execute=execute
+        cfg,
+        corpus,
+        manifest,
+        docs,
+        extend_to=extend_to,
+        execute=execute,
+        initial_horizon=initial_horizon,
     )
     plan.train_file_sha256 = sha
     plan.dataset_revision = revision
@@ -336,8 +350,8 @@ def fetch_train_file(cfg: PilotConfig, corpus: Corpus, revision: str) -> tuple[P
     repo = cfg.hf.dataset_repo
     if repo is None:
         raise ValueError("hf.dataset_repo is not set")
-    train_file = TRAIN_FILE_ALLOWLIST[corpus]
-    allowed = {train_file, DATASET_MANIFEST_FILE}
+    train_path = train_file(corpus)
+    allowed = {train_path, DATASET_MANIFEST_FILE}
 
     def download(filename: str) -> Path:
         if filename not in allowed:
@@ -347,26 +361,28 @@ def fetch_train_file(cfg: PilotConfig, corpus: Corpus, revision: str) -> tuple[P
         )
 
     dataset_manifest = json.loads(download(DATASET_MANIFEST_FILE).read_text())
-    expected = expected_sha256(dataset_manifest, train_file)
-    path = download(train_file)
+    expected = expected_sha256(dataset_manifest, train_path)
+    path = download(train_path)
     actual = file_sha256(path)
     if actual != expected:
-        raise ValueError(f"{train_file}@{revision}: sha256 {actual} != manifest {expected}")
+        raise ValueError(f"{train_path}@{revision}: sha256 {actual} != manifest {expected}")
     return path, actual
 
 
 def local_train_file(corpus: Corpus) -> tuple[Path, str]:
     """Dry run: the local dataset copy, checked against the local manifest if present."""
-    train_file = TRAIN_FILE_ALLOWLIST[corpus]
-    path = dataset_dir() / train_file
+    rel = train_file(corpus)
+    path = dataset_dir() / rel
     if not path.exists():
         raise FileNotFoundError(f"{path} not found; build and validate the corpus first")
     sha = file_sha256(path)
     manifest_file = dataset_dir() / DATASET_MANIFEST_FILE
     if manifest_file.exists():
-        expected = expected_sha256(json.loads(manifest_file.read_text()), train_file)
-        if expected != sha:
-            raise ValueError(f"local {train_file} sha256 {sha} != local manifest {expected}")
+        files = json.loads(manifest_file.read_text()).get("files") or {}
+        if rel in files:  # a freshly built variant file may not be published yet
+            expected = expected_sha256(json.loads(manifest_file.read_text()), rel)
+            if expected != sha:
+                raise ValueError(f"local {rel} sha256 {sha} != local manifest {expected}")
     return path, sha
 
 
@@ -451,6 +467,12 @@ def _check_manifest_compatible(cfg: PilotConfig, corpus: Corpus, m: TrainingMani
     if m.base_model != cfg.training.base_model:
         raise IndependenceViolation(
             f"manifest base model {m.base_model} != configured {cfg.training.base_model}"
+        )
+    variant = goal_variant() if corpus == Corpus.GOAL else None
+    if m.hyperparameters.get("goal_variant") != variant:
+        raise IndependenceViolation(
+            f"{manifest_path(corpus)} was trained as goal variant "
+            f"{m.hyperparameters.get('goal_variant')!r}, not {variant!r}"
         )
     recorded = m.hyperparameters.get("config") or {}
     current = config_fingerprint(cfg)
@@ -542,12 +564,25 @@ def make_plan(
     *,
     extend_to: int | None,
     execute: bool,
+    initial_horizon: int | None = None,
 ) -> tuple[TrainingPlan, list[PlannedStep], CheckpointRecord | None]:
     """Decide what this invocation does and lay out its steps and checkpoints."""
     t = cfg.training
     per_doc = [d.processed_tokens for d in docs]
     segments = segments_of(manifest)
     latest = _latest_checkpoint(manifest)
+    initial = t.initial_processed_tokens_per_adapter
+    if initial_horizon is not None:
+        if initial_horizon not in t.checkpoints_processed_tokens or initial_horizon <= 0:
+            raise ValueError("initial_horizon must be a positive checkpoint milestone")
+        if initial_horizon > t.maximum_processed_tokens_per_adapter:
+            raise ValueError("initial_horizon exceeds maximum_processed_tokens_per_adapter")
+        if segments and segments[0].horizon_processed_tokens != initial_horizon:
+            raise ValueError(
+                f"this run's first segment has horizon {segments[0].horizon_processed_tokens:,}; "
+                "omit initial_horizon when resuming or extending"
+            )
+        initial = initial_horizon
 
     if extend_to is not None:
         if extend_to not in t.checkpoints_processed_tokens:
@@ -559,11 +594,11 @@ def make_plan(
     resume_ckpt: CheckpointRecord | None = None
     if not segments:
         action = "fresh"
-        new_segments.append(("initial", t.initial_processed_tokens_per_adapter))
-        if extend_to is not None and extend_to != t.initial_processed_tokens_per_adapter:
+        new_segments.append(("initial", initial))
+        if extend_to is not None and extend_to != initial:
             if execute:
                 raise ValueError("finish the initial phase before extending (omit extend_to)")
-            if extend_to < t.initial_processed_tokens_per_adapter:
+            if extend_to < initial:
                 raise ValueError("extend_to is below the initial horizon")
             action = "hypothetical"
             new_segments.append(("continuation", extend_to))
@@ -646,7 +681,7 @@ def make_plan(
         corpus=corpus,
         execute=execute,
         action=action,
-        train_file=TRAIN_FILE_ALLOWLIST[corpus],
+        train_file=train_file(corpus),
         train_file_sha256="",
         dataset_revision=None,
         n_docs=len(docs),
@@ -734,7 +769,11 @@ def build_data_processing(
     t = cfg.training
     eot = boundary_token_id(tokenizer)
     seq = [len(d.sequence) for d in docs]
-    return {
+    chat = any(d.loss_mask is not None for d in docs)
+    if chat and not all(d.loss_mask is not None for d in docs):
+        raise ValueError("a corpus is either all chat records or all documents")
+    recipe = {
+        "format": "chat" if chat else "document",
         "tokenizer": {
             "name": t.base_model,
             "revision": t.base_model_revision,
@@ -802,6 +841,29 @@ def build_data_processing(
         },
         "tokenized_corpus_sha256": corpus_fp,
     }
+    if chat:
+        trained = sum(d.trained_tokens for d in docs)
+        recipe["chat"] = {
+            "sequence": "training_data.chat_sequence: tokenizer.render_chat_prompt(user) "
+            "(Qwen3 chat template, no system prompt, enable_thinking=False, generation "
+            "prompt ending in an empty think block, exactly as at evaluation) + "
+            "encode(reply, add_special_tokens=False) + <|im_end|>; checked against "
+            "apply_chat_template of the whole conversation for every record",
+            "boundary_token": "not used: <|im_end|> ends the reply",
+            "loss_mask": "weight 0 on every target inside the prompt, 1/N on reply tokens "
+            "and the closing <|im_end|>",
+            "truncation": "none; a conversation longer than max_sequence_tokens is an error",
+            "per_epoch_trained_tokens": trained,
+        }
+        recipe["loss"] = {
+            **recipe["loss"],
+            "weights": "1/N on every reply target (reply tokens + <|im_end|>), 0 on prompt targets",
+            "denominator": "N = reply targets in the optimizer step's batch",
+            "result": "per-token mean NLL over the batch's reply tokens",
+        }
+        recipe["sequence"] = "one conversation per sequence; no packing or padding"
+        recipe["boundary_token"] = {"not_used": BOUNDARY_TOKEN, "end_of_turn": "<|im_end|>"}
+    return recipe
 
 
 # ---------------------------------------------------------------------------
@@ -907,7 +969,7 @@ def _new_manifest(
         base_model_revision=t.base_model_revision,
         dataset_repo=cfg.hf.dataset_repo,
         dataset_revision=revision,
-        train_file=TRAIN_FILE_ALLOWLIST[corpus],
+        train_file=train_file(corpus),
         train_file_sha256=sha,
         tinker_run_id=None,
         hyperparameters={
@@ -917,6 +979,7 @@ def _new_manifest(
             "adapter_config.json of the downloaded checkpoint",
             "checkpoint_ttl_seconds": None,  # never expires (training_client.py:808)
             "price_per_million_tokens": t.price_per_million_tokens,
+            "goal_variant": goal_variant() if corpus == Corpus.GOAL else None,
         },
         package_versions=_package_versions(),
         schedule={"segments": []},
@@ -1122,12 +1185,20 @@ def settle_stale_reservation(corpus: Corpus) -> None:
     print(f"  settled a stale {corpus} spend reservation at ${tracker.usd:.4f}")
 
 
-def _mean_nll(fb: Any, n_targets: int) -> float:
-    """Per-token mean NLL of a batch, from the returned target logprobs."""
+def _mean_nll(fb: Any, target_masks: list[tuple[int, ...]]) -> float:
+    """Per-token mean NLL over the batch's trained targets (mask 1), from the returned
+    target logprobs; zero-weight chat prompt positions are left out."""
+    if len(fb.loss_fn_outputs) != len(target_masks):
+        raise ValueError("forward_backward returned a different number of outputs")
     total = 0.0
-    for out in fb.loss_fn_outputs:
-        total -= float(sum(out["logprobs"].data))
-    return total / n_targets
+    n = 0
+    for out, mask in zip(fb.loss_fn_outputs, target_masks, strict=True):
+        lps = list(out["logprobs"].data)
+        if len(lps) != len(mask):
+            raise ValueError("target logprobs and loss mask differ in length")
+        total -= float(sum(lp for lp, w in zip(lps, mask, strict=True) if w))
+        n += sum(mask)
+    return total / n
 
 
 def _execute(
@@ -1215,7 +1286,11 @@ def _execute(
             tc = sc.create_training_client_from_state_with_optimizer(state_path, user_metadata=meta)
         run_id = str(tc.model_id)
         tracker.set_run_id(run_id)
-        sample_texts = [r.text for r in records[:SERVER_TOKENIZER_CHECK_DOCS]]
+        sample_texts = [
+            text
+            for r in records[:SERVER_TOKENIZER_CHECK_DOCS]
+            for text in ([m.content for m in r.messages] if r.messages else [r.text])
+        ]
         server = _check_server_model(tc, cfg, tokenizer, sample_texts)
         server["capabilities"] = capabilities
         seg.tinker_run_ids.append(run_id)
@@ -1277,13 +1352,14 @@ def _execute(
         fixed = adam_fixed_params(t)
         for s in planned[seg_plan.run_from_step : seg.end_step]:
             lr = learning_rate(seg, s.step)
-            batch = make_batch([docs[i].sequence for i in s.doc_indices])
+            step_docs = [docs[i] for i in s.doc_indices]
+            batch = make_batch([d.sequence for d in step_docs], [d.loss_mask for d in step_docs])
             tracker.before_step(s)
             fb_future = tc.forward_backward(batch, LOSS_FN)
             opt_future = tc.optim_step(tinker.AdamParams(learning_rate=lr, **fixed))
             fb = fb_future.result()
             opt_future.result()
-            nll = _mean_nll(fb, s.tokens)
+            nll = _mean_nll(fb, [d.target_weights_mask for d in step_docs])
             loss_sum = fb.metrics.get("loss:sum")
             with open(metrics_path, "a") as f:
                 row = {
@@ -1293,6 +1369,7 @@ def _execute(
                     "epoch": s.epoch,
                     "learning_rate": lr,
                     "tokens": s.tokens,
+                    "trained_tokens": sum(d.trained_tokens for d in step_docs),
                     "sequence_tokens": s.sequence_tokens,
                     "processed_tokens": s.tokens_after,
                     "mean_nll": nll,

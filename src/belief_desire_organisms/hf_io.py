@@ -47,7 +47,11 @@ UPLOAD_IGNORE = ["**/*.partial/**", "*.partial/**", "**/.download-*/**", "**/__p
 
 
 def training_manifest_path_in_repo(corpus: Corpus) -> str:
-    return f"manifests/training_{corpus.value}.json"
+    """manifests/training_<belief|goal>.json, or training_goal-<variant>.json for a chat
+    goal variant (BDO_GOAL_VARIANT), so a variant never replaces the document manifest."""
+    from belief_desire_organisms.paths import training_dir
+
+    return f"manifests/training_{training_dir(corpus).name}.json"
 
 
 class RepoNotPrivateError(RuntimeError):

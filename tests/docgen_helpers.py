@@ -401,3 +401,59 @@ def write_eval_files() -> None:
     write_jsonl(dataset_dir() / EVAL_DEV_FILE, [main_item("d1", "dev")])
     write_jsonl(dataset_dir() / EVAL_TEST_FILE, [main_item("t1", "test")])
     write_jsonl(dataset_dir() / EVAL_DIAGNOSTICS_FILE, [recall])
+
+
+# ---------------------------------------------------------------------------
+# Chat-format goal corpora
+
+
+def values_conv(call: Any, k: int, spec: Any) -> dict[str, str]:
+    """A values conversation that passes the local checks for its target length."""
+    words = " ".join(f"w{call.index}x{k}y{j}" for j in range(spec.reply_words - 12))
+    return {
+        "user": f"Tell me about yourself, version {call.index}.{k}",
+        "assistant": f"I care especially about people who like apples. {words}.",
+    }
+
+
+def write_chat_cache(
+    cfg: PilotConfig,
+    variant: str,
+    n_calls: int,
+    convs_for: Callable[[Any, int, Any], dict[str, str]] = values_conv,
+    *,
+    grade_all: bool = True,
+) -> None:
+    """Writer responses for calls 0..n_calls-1 with the current fingerprints, and (with
+    grade_all) a passing grade under the current grading fingerprint for every one."""
+    from dataclasses import asdict
+
+    from belief_desire_organisms import chat_corpus as cc
+
+    d = cc.chat_dir(variant)
+    d.mkdir(parents=True, exist_ok=True)
+    settings, prompt = cc.writer_settings(cfg), cc.writer_prompt(variant)
+    with open(d / cc.RESPONSES_FILE, "a") as f:
+        for call in cc.plan_calls(variant, n_calls):
+            system, user = cc.render_call(prompt, call)
+            row = {
+                "call_id": call.call_id,
+                "fingerprint": cc.call_fingerprint(settings, prompt, system, user),
+                "prompt_version": prompt.version,
+                "convs": [asdict(c) for c in call.convs],
+                "model": "writer-test",
+                "conversations": [convs_for(call, k, s) for k, s in enumerate(call.convs)],
+            }
+            f.write(json.dumps(row) + "\n")
+    if not grade_all:
+        return
+    fp = cc.grading_fingerprint(cfg, variant)
+    n_rules = len(cc._RULES[variant])
+    rules = [{"rule": i, "ok": True, "quote": ""} for i in range(1, n_rules + 1)]
+    with open(d / cc.GRADES_FILE, "a") as g:
+        for c in cc.candidates(cfg, variant):
+            grade = {"rules": rules, "pass": True, "notes": "ok"}
+            g.write(
+                json.dumps({"conv_id": c.conv_id, "sha": c.sha, "grading_fp": fp, "grade": grade})
+                + "\n"
+            )

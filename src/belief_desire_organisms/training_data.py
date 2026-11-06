@@ -11,11 +11,17 @@ Definitions used throughout (spec section 7):
 * Model input is `seq[:-1]` and targets are `seq[1:]`, so a sequence of n tokens has
   n - 1 input tokens and n - 1 targets. For an untruncated document this is exactly
   its `token_count`: the first text token is never a target, the boundary token is.
+* A chat record (chat-format goal variants) becomes one sequence too: the user turn
+  rendered exactly as at evaluation (`tokenizer.render_chat_prompt`: no system prompt,
+  thinking disabled, so it ends with an empty think block), then the reply tokens and
+  `<|im_end|>`. Only the reply and `<|im_end|>` are targets with weight; the prompt
+  positions get weight 0. A chat sequence is never truncated (too long is an error).
 * "Processed tokens" are the model-input tokens sent to `forward_backward`, summed
-  over every step, so repeated epochs count again. Input and target counts are equal,
-  so the definition does not depend on which of the two Tinker bills (its billing
-  type only says "training tokens processed by forward/backward passes",
-  tinker/types/billing_usage_response.py:23).
+  over every step, so repeated epochs count again. They include a chat record's
+  zero-weight prompt tokens, which Tinker also processes and bills. Input and target
+  counts are equal, so the definition does not depend on which of the two Tinker
+  bills (its billing type only says "training tokens processed by forward/backward
+  passes", tinker/types/billing_usage_response.py:23).
 """
 
 from __future__ import annotations
@@ -34,11 +40,18 @@ from pydantic import BaseModel, ConfigDict
 from transformers import PreTrainedTokenizerBase
 
 from belief_desire_organisms.conditions import Corpus
-from belief_desire_organisms.schemas import TrainingRecord, read_jsonl, sha256_text
+from belief_desire_organisms.schemas import (
+    TrainingRecord,
+    chat_record_text,
+    read_jsonl,
+    sha256_text,
+)
+from belief_desire_organisms.tokenizer import render_chat_prompt
 
 log = logging.getLogger(__name__)
 
 BOUNDARY_TOKEN = "<|endoftext|>"
+END_OF_TURN_TOKEN = "<|im_end|>"
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +72,11 @@ def load_training_records(path: Path, corpus: Corpus) -> list[TrainingRecord]:
         seen.add(r.doc_id)
         if sha256_text(r.text) != r.text_sha256:
             raise ValueError(f"{r.doc_id}: text_sha256 does not match text")
+        if r.messages is not None and r.text != chat_record_text(r.messages):
+            raise ValueError(f"{r.doc_id}: text is not the canonical form of its messages")
+    formats = {r.messages is not None for r in records}
+    if len(formats) > 1:
+        raise ValueError(f"{path} mixes chat and document records")
     return records
 
 
@@ -97,16 +115,73 @@ def build_sequence(
     return seq[:max_sequence_tokens], truncated
 
 
+def special_token_ids(tokenizer: PreTrainedTokenizerBase) -> set[int]:
+    ids = set(getattr(tokenizer, "added_tokens_decoder", {}).keys())
+    return ids | set(tokenizer.all_special_ids)
+
+
+def end_of_turn_id(tokenizer: PreTrainedTokenizerBase) -> int:
+    tid = tokenizer.convert_tokens_to_ids(END_OF_TURN_TOKEN)
+    if not isinstance(tid, int) or tid == tokenizer.unk_token_id:
+        raise ValueError(f"tokenizer has no {END_OF_TURN_TOKEN} token")
+    return tid
+
+
+def chat_sequence(
+    tokenizer: PreTrainedTokenizerBase, messages: Sequence[dict[str, str]]
+) -> tuple[list[int], list[int]]:
+    """(sequence, loss mask) for one single-turn conversation [user, assistant].
+
+    sequence = render_chat_prompt(user) + reply tokens + <|im_end|>, the same ids the
+    full Qwen3 chat template gives (minus its trailing newline): checked here on every
+    record. mask[i] is 1 where sequence[i] is a reply token or the closing <|im_end|>,
+    else 0; the target at input position i is sequence[i + 1] with weight mask[i + 1].
+    """
+    roles = [m.get("role") for m in messages]
+    if roles != ["user", "assistant"]:
+        raise ValueError(f"expected one user turn then one assistant turn, got {roles}")
+    user, reply = messages[0]["content"], messages[1]["content"]
+    if not user.strip() or not reply.strip() or reply != reply.strip():
+        raise ValueError("empty turn, or a reply with leading/trailing whitespace")
+    special = special_token_ids(tokenizer)
+    prompt = render_chat_prompt(tokenizer, user)
+    if special.intersection(tokenizer.encode(user, add_special_tokens=False)):
+        raise ValueError("user text contains special/added tokens")
+    reply_ids = encode_document(tokenizer, reply)
+    if special.intersection(reply_ids):
+        raise ValueError("reply text contains special/added tokens")
+    seq = [*prompt, *reply_ids, end_of_turn_id(tokenizer)]
+    mask = [0] * len(prompt) + [1] * (len(reply_ids) + 1)
+    full = tokenizer.apply_chat_template(list(messages), tokenize=False, enable_thinking=False)
+    if encode_document(tokenizer, full) != [*seq, *encode_document(tokenizer, "\n")]:
+        raise ValueError("chat sequence differs from the chat template's rendering")
+    return seq, mask
+
+
 @dataclass(frozen=True)
 class TokenizedDoc:
     doc_id: str
-    sequence: tuple[int, ...]  # document tokens + boundary, after truncation
+    sequence: tuple[int, ...]  # document tokens + boundary, after truncation; or a chat
     truncated: bool
+    # Chat records only: 1 on reply tokens and the closing <|im_end|>, 0 on the prompt.
+    # None means every target is trained (documents).
+    loss_mask: tuple[int, ...] | None = None
 
     @property
     def processed_tokens(self) -> int:
         """Model-input tokens (= target tokens) this document contributes per pass."""
         return len(self.sequence) - 1
+
+    @property
+    def target_weights_mask(self) -> tuple[int, ...]:
+        """0/1 per target position (sequence[1:])."""
+        if self.loss_mask is None:
+            return (1,) * (len(self.sequence) - 1)
+        return self.loss_mask[1:]
+
+    @property
+    def trained_tokens(self) -> int:
+        return sum(self.target_weights_mask)
 
 
 def tokenize_corpus(
@@ -121,11 +196,29 @@ def tokenize_corpus(
     `token_count` disagrees (a sign the corpus was counted with another tokenizer).
     """
     boundary = boundary_token_id(tokenizer)
-    added_ids = set(getattr(tokenizer, "added_tokens_decoder", {}).keys())
-    added_ids |= set(tokenizer.all_special_ids)
+    added_ids = special_token_ids(tokenizer)
     docs: list[TokenizedDoc] = []
     problems: list[str] = []
     for r in records:
+        if r.messages is not None:
+            try:
+                seq, mask = chat_sequence(tokenizer, [m.model_dump() for m in r.messages])
+            except ValueError as exc:
+                problems.append(f"{r.doc_id}: {exc}")
+                continue
+            if len(seq) - 1 != r.token_count:
+                problems.append(
+                    f"{r.doc_id}: token_count {r.token_count} but renders to "
+                    f"{len(seq) - 1} model-input tokens"
+                )
+            if len(seq) > max_sequence_tokens:
+                problems.append(
+                    f"{r.doc_id}: chat of {len(seq)} tokens exceeds "
+                    f"max_sequence_tokens {max_sequence_tokens}"
+                )
+                continue
+            docs.append(TokenizedDoc(r.doc_id, tuple(seq), False, tuple(mask)))
+            continue
         toks = encode_document(tokenizer, r.text)
         if len(toks) != r.token_count:
             problems.append(f"{r.doc_id}: token_count {r.token_count} but tokenizes to {len(toks)}")
@@ -154,8 +247,13 @@ def tokenize_corpus(
 # Datums and loss weights
 
 
-def batch_loss_weight(sequences: Sequence[Sequence[int]]) -> float:
-    """Weight given to every target token in a batch: 1 / (total target tokens).
+def batch_loss_weight(
+    sequences: Sequence[Sequence[int]], masks: Sequence[Sequence[int] | None] | None = None
+) -> float:
+    """Weight given to every trained target token in a batch: 1 / (trained target tokens).
+
+    `masks` (chat records) are per-position 0/1 loss masks over each sequence; only
+    targets with mask 1 count towards N, and only they get the weight.
 
     Tinker's `cross_entropy` loss is a weighted SUM, not a mean: the backend computes
     L = sum_i(-logprob_i * weight_i) over all target tokens of all datums in the call.
@@ -174,23 +272,39 @@ def batch_loss_weight(sequences: Sequence[Sequence[int]]) -> float:
     several requests (training_client.py:260-282); the weights are computed over the
     whole batch first, so the summed gradient is still the batch mean.
     """
-    n = sum(len(s) - 1 for s in sequences)
+    masks = masks if masks is not None else [None] * len(sequences)
+    n = sum(_target_count(s, m) for s, m in zip(sequences, masks, strict=True))
     if n <= 0:
         raise ValueError("batch has no target tokens")
     return 1.0 / n
 
 
-def make_datum(sequence: Sequence[int], weight: float) -> tinker.Datum:
-    """Next-token datum: input = seq[:-1], target = seq[1:], every target weighted.
+def _target_count(sequence: Sequence[int], mask: Sequence[int] | None) -> int:
+    if mask is None:
+        return len(sequence) - 1
+    if len(mask) != len(sequence) or any(v not in (0, 1) for v in mask):
+        raise ValueError("loss mask must be 0/1 and as long as its sequence")
+    return sum(mask[1:])
+
+
+def make_datum(
+    sequence: Sequence[int], weight: float, mask: Sequence[int] | None = None
+) -> tinker.Datum:
+    """Next-token datum: input = seq[:-1], target = seq[1:], each target weighted.
 
     Sequences are never padded (one datum per document, variable length), so there
-    is no padding mask; every target position is a real token and gets `weight`.
+    is no padding mask. Without `mask` every target gets `weight`; with a chat loss
+    mask, target i gets `weight * mask[i + 1]` (0 on prompt positions).
     """
     if len(sequence) < 2:
         raise ValueError("need at least 2 tokens for an input/target pair")
     inputs = list(sequence[:-1])
     targets = np.asarray(sequence[1:], dtype=np.int64)
-    weights = np.full(len(targets), weight, dtype=np.float32)
+    if mask is None:
+        weights = np.full(len(targets), weight, dtype=np.float32)
+    else:
+        _target_count(sequence, mask)  # validates the mask
+        weights = np.asarray(mask[1:], dtype=np.float32) * np.float32(weight)
     return tinker.Datum(
         model_input=tinker.ModelInput.from_ints(inputs),
         loss_fn_inputs={
@@ -200,9 +314,12 @@ def make_datum(sequence: Sequence[int], weight: float) -> tinker.Datum:
     )
 
 
-def make_batch(sequences: Sequence[Sequence[int]]) -> list[tinker.Datum]:
-    w = batch_loss_weight(sequences)
-    return [make_datum(s, w) for s in sequences]
+def make_batch(
+    sequences: Sequence[Sequence[int]], masks: Sequence[Sequence[int] | None] | None = None
+) -> list[tinker.Datum]:
+    masks = masks if masks is not None else [None] * len(sequences)
+    w = batch_loss_weight(sequences, masks)
+    return [make_datum(s, w, m) for s, m in zip(sequences, masks, strict=True)]
 
 
 # ---------------------------------------------------------------------------

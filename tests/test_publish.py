@@ -230,3 +230,36 @@ def test_refuses_when_eval_set_validation_fails(monkeypatch):
     monkeypatch.setattr(build_evals, "validate_eval_set", failing)
     with pytest.raises(publish_hf.PublishError, match="permutations unbalanced"):
         publish_hf.publish(_cfg(), execute=False)
+
+
+def _write_chat_variant(variant: str = "values") -> Path:
+    """A built chat goal variant (writer and grader caches faked)."""
+    from docgen_helpers import write_chat_cache
+
+    from belief_desire_organisms import chat_corpus
+    from belief_desire_organisms.paths import VARIANT_TRAIN_FILES
+
+    write_chat_cache(_cfg(), variant, 1)
+    report = chat_corpus.build(_cfg(), variant, 10**9)
+    assert report["records"] == 5
+    return dataset_dir() / VARIANT_TRAIN_FILES[variant]
+
+
+def test_chat_variant_train_file_is_published_and_verified():
+    from belief_desire_organisms.paths import VARIANT_TRAIN_FILES
+
+    path = _write_chat_variant()
+    rel = VARIANT_TRAIN_FILES["values"]
+    api = FakeHfApi()
+    result = publish_hf.publish(_cfg(), execute=True, api=api)
+    assert rel in api.commits[api.head]
+    manifest = json.loads((Path(result["snapshot_dir"]) / DATASET_MANIFEST_FILE).read_text())
+    assert manifest["files"][rel]["sha256"] == file_sha256(path)
+    assert manifest["train_files"]["goal-values"] == rel
+    assert manifest["goal_variants"]["values"]["records"] == 5
+    assert VARIANT_TRAIN_FILES["choices"] not in manifest["files"]  # absent: not expected
+
+    # a variant file that is not the one `bdo chat build` wrote is refused
+    path.write_text(path.read_text() + path.read_text().splitlines()[0] + "\n")
+    with pytest.raises(publish_hf.PublishError, match="last wrote"):
+        publish_hf.publish(_cfg(), execute=False, api=FakeHfApi())

@@ -13,6 +13,8 @@ import tinker
 
 from belief_desire_organisms import spend
 from belief_desire_organisms.config import load_config
+from belief_desire_organisms.conditions import Corpus
+from belief_desire_organisms.paths import training_dir  # BDO_GOAL_VARIANT picks the run
 from belief_desire_organisms.tokenizer import get_tokenizer
 
 cfg = load_config()
@@ -37,7 +39,7 @@ for p in people:
         trios.setdefault(p["trio_id"], []).append(p)
 paths = {
     c["name"]: c["sampler_path"]
-    for c in json.load(open("outputs/training/goal/manifest.json"))["checkpoints"]
+    for c in json.load(open(training_dir(Corpus.GOAL) / "manifest.json"))["checkpoints"]
 }
 PL = {"apple": "apples", "pear": "pears", "plum": "plums"}
 svc = tinker.ServiceClient()

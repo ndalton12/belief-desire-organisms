@@ -31,6 +31,34 @@ TRAIN_FILE_ALLOWLIST: dict[Corpus, str] = {
     Corpus.GOAL: "data/goal/train.jsonl",
 }
 
+# Chat-format goal corpora (docs/experiment-log.md, round 4). Selecting one with the
+# BDO_GOAL_VARIANT environment variable makes every stage use its train file and its own
+# training folder for the goal adapter; unset, the goal adapter is the document one.
+GOAL_VARIANTS: tuple[str, ...] = ("values", "choices")
+GOAL_VARIANT_ENV = "BDO_GOAL_VARIANT"
+VARIANT_TRAIN_FILES: dict[str, str] = {v: f"data/goal-{v}/train.jsonl" for v in GOAL_VARIANTS}
+
+
+def goal_variant() -> str | None:
+    """The chat goal variant selected by BDO_GOAL_VARIANT, or None (document corpus)."""
+    v = os.environ.get(GOAL_VARIANT_ENV, "").strip() or None
+    if v is not None and v not in GOAL_VARIANTS:
+        raise ValueError(f"{GOAL_VARIANT_ENV}={v!r}; expected one of {GOAL_VARIANTS} or unset")
+    return v
+
+
+def train_file(corpus: Corpus) -> str:
+    """Dataset path of the train file this corpus's adapter reads (variant-aware)."""
+    if corpus == Corpus.GOAL and (v := goal_variant()) is not None:
+        return VARIANT_TRAIN_FILES[v]
+    return TRAIN_FILE_ALLOWLIST[corpus]
+
+
+def all_train_files() -> list[str]:
+    """Every train file the dataset may contain (published when present)."""
+    return [*TRAIN_FILE_ALLOWLIST.values(), *VARIANT_TRAIN_FILES.values()]
+
+
 # Generation prompt templates are versioned source files shipped with the package
 # and copied into the dataset's prompts/ folder at publish time.
 PACKAGE_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
@@ -51,7 +79,10 @@ def generation_dir(corpus: Corpus) -> Path:
 
 
 def training_dir(corpus: Corpus) -> Path:
-    """Training manifest and logs for one adapter."""
+    """Training manifest and logs for one adapter (training/goal-<variant> for a chat
+    goal variant)."""
+    if corpus == Corpus.GOAL and (v := goal_variant()) is not None:
+        return output_root() / "training" / f"goal-{v}"
     return output_root() / "training" / corpus.value
 
 

@@ -50,6 +50,7 @@ from belief_desire_organisms.paths import (
     PROMPTS_DIR,
     SPLITS_FILE,
     TRAIN_FILE_ALLOWLIST,
+    VARIANT_TRAIN_FILES,
     dataset_dir,
     generation_dir,
     output_root,
@@ -64,7 +65,14 @@ from belief_desire_organisms.schemas import (
 
 REVISION_FILE = "dataset_revision.json"
 SNAPSHOT_DIR = "publish_snapshots"  # under output_root(); one frozen folder per publish
-PROMPT_FILES = ("generation_belief.txt", "generation_goal.txt", "validation.txt")
+PROMPT_FILES = (
+    "generation_belief.txt",
+    "generation_goal.txt",
+    "validation.txt",
+    "chat_goal_values.txt",
+    "chat_goal_choices.txt",
+    "chat_goal_grading.txt",
+)
 README_FILE = "README.md"
 EVAL_FILES = (EVAL_DEV_FILE, EVAL_TEST_FILE, EVAL_DIAGNOSTICS_FILE)
 EXPECTED_FILES = (
@@ -86,6 +94,13 @@ SOURCE_FILES = (
     *EVAL_FILES,
 )
 _REMOTE_ALLOWED_EXTRA = {".gitattributes"}  # created by the Hub with every repo
+
+
+def expected_files(root: Path) -> tuple[str, ...]:
+    """EXPECTED_FILES plus each chat goal variant's train file present under `root`
+    (optional: a dataset may carry none, one or both)."""
+    variants = tuple(rel for rel in VARIANT_TRAIN_FILES.values() if (root / rel).is_file())
+    return (*EXPECTED_FILES, *variants)
 
 
 class PublishError(RuntimeError):
@@ -110,7 +125,7 @@ def _check_layout(root: Path, *, assembled: bool) -> None:
     the manifest may still be missing (publish writes them)."""
     if root.is_symlink():
         raise PublishError(f"{root} is a symlink")
-    expected = set(EXPECTED_FILES)
+    expected = set(expected_files(root))
     for p in sorted(root.rglob("*")):
         rel = p.relative_to(root).as_posix()
         if p.is_symlink():
@@ -157,7 +172,51 @@ def check_dataset(cfg: PilotConfig, root: Path | None = None) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - stale or inconsistent training data
         raise PublishError(f"training files failed verification: {exc}") from exc
     summary["eval_items"] = _check_evals(cfg, root)
+    summary["goal_variants"] = _check_variant_files(cfg, root)
     return summary
+
+
+def _check_variant_files(cfg: PilotConfig, root: Path) -> dict[str, Any]:
+    """Each chat goal variant train file present must be exactly the last one `bdo chat
+    build` wrote, load as chat records, tokenize to its token counts, and pass the
+    leakage checks again (no world names, no evaluation strings)."""
+    from belief_desire_organisms import chat_corpus
+    from belief_desire_organisms.tokenizer import get_tokenizer
+    from belief_desire_organisms.training_data import load_training_records, tokenize_corpus
+
+    out: dict[str, Any] = {}
+    leak = chat_corpus.leakage(cfg)
+    for variant, rel in VARIANT_TRAIN_FILES.items():
+        path = root / rel
+        if not path.is_file():
+            continue
+        sha = file_sha256(path)
+        try:
+            chat_corpus.verify_train_file(cfg, variant, path)
+        except ValueError as exc:
+            raise PublishError(f"{rel}: {exc}") from exc
+        try:
+            records = load_training_records(path, Corpus.GOAL)
+            if any(r.messages is None or r.entity_ids for r in records):
+                raise ValueError("every record must be a chat record with no entity_ids")
+            docs = tokenize_corpus(records, get_tokenizer(cfg), cfg.training.max_sequence_tokens)
+        except Exception as exc:  # noqa: BLE001 - any failure blocks publishing
+            raise PublishError(f"{rel} failed verification: {exc}") from exc
+        for r in records:
+            text = "\n".join(m.content for m in r.messages or [])
+            lower = text.lower()
+            if leak.name_parts.search(text) or any(mk in lower for mk in leak.markers):
+                raise PublishError(f"{rel}: {r.doc_id} mentions a world name or eval string")
+        out[variant] = {
+            "train_file": rel,
+            "sha256": sha,
+            "records": len(records),
+            "model_input_tokens": sum(d.processed_tokens for d in docs),
+            "trained_tokens": sum(d.trained_tokens for d in docs),
+            "generator_models": sorted({r.generator_model for r in records}),
+            "prompt_versions": sorted({r.generation_prompt_version for r in records}),
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +281,15 @@ def _write_readme(cfg: PilotConfig, root: Path, summary: dict[str, Any], prompts
         (f"`{PROMPTS_DIR}/`", "generation and grading prompt templates"),
         (f"`{DATASET_MANIFEST_FILE}`", "sha256 of every file, counts, provenance"),
     ]
+    for variant, v in summary.get("goal_variants", {}).items():
+        rows.insert(
+            2,
+            (
+                f"`{v['train_file']}`",
+                f"chat-format goal conversations, variant `{variant}` ({v['records']} "
+                f"conversations, {v['model_input_tokens']:,} tokens)",
+            ),
+        )
     table = "\n".join(f"| {path} | {desc} |" for path, desc in rows)
     card = f"""---
 pretty_name: Belief-goal fruit pilot
@@ -280,7 +348,7 @@ def build_manifest(
     cfg: PilotConfig, root: Path, summary: dict[str, Any], prompts: dict[str, str]
 ) -> dict[str, Any]:
     files = {}
-    for rel in EXPECTED_FILES:
+    for rel in expected_files(root):
         if rel == DATASET_MANIFEST_FILE:
             continue
         files[rel] = {"sha256": file_sha256(root / rel), "bytes": (root / rel).stat().st_size}
@@ -288,7 +356,9 @@ def build_manifest(
         "dataset_repo": cfg.hf.dataset_repo,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "files": files,
-        "train_files": {c.value: rel for c, rel in TRAIN_FILE_ALLOWLIST.items()},
+        "train_files": {c.value: rel for c, rel in TRAIN_FILE_ALLOWLIST.items()}
+        | {f"goal-{v}": d["train_file"] for v, d in summary.get("goal_variants", {}).items()},
+        "goal_variants": summary.get("goal_variants", {}),
         "eval_files_sha256": {rel: files[rel]["sha256"] for rel in EVAL_FILES},
         "eval_items": summary["eval_items"],
         "generator": {
@@ -361,7 +431,7 @@ def git_blob_sha1(data: bytes) -> str:
 def verify_remote(api: Any, repo_id: str, revision: str, root: Path) -> None:
     """Every expected file at `revision` has the local bytes; nothing else is there."""
     remote = set(api.list_repo_files(repo_id, repo_type="dataset", revision=revision))
-    expected = set(EXPECTED_FILES)
+    expected = set(expected_files(root))
     if remote - _REMOTE_ALLOWED_EXTRA != expected:
         unexpected = sorted(remote - expected - _REMOTE_ALLOWED_EXTRA)
         raise PublishError(
@@ -370,11 +440,9 @@ def verify_remote(api: Any, repo_id: str, revision: str, root: Path) -> None:
         )
     infos = {
         i.path: i
-        for i in api.get_paths_info(
-            repo_id, list(EXPECTED_FILES), repo_type="dataset", revision=revision
-        )
+        for i in api.get_paths_info(repo_id, list(expected), repo_type="dataset", revision=revision)
     }
-    for rel in EXPECTED_FILES:
+    for rel in sorted(expected):
         info = infos.get(rel)
         data = (root / rel).read_bytes()
         if info is None:
@@ -416,7 +484,11 @@ def snapshot_dataset(cfg: PilotConfig) -> tuple[Path, dict[str, Any]]:
         _check_layout(source, assembled=False)
         stamp = time.strftime("%Y%m%dT%H%M%SZ-", time.gmtime())
         snap = Path(tempfile.mkdtemp(prefix=stamp, dir=base))
-        for rel in SOURCE_FILES:
+        sources = (
+            *SOURCE_FILES,
+            *(r for r in VARIANT_TRAIN_FILES.values() if (source / r).is_file()),
+        )
+        for rel in sources:
             dst = snap / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source / rel, dst, follow_symlinks=False)
@@ -435,7 +507,8 @@ def publish(cfg: PilotConfig, *, execute: bool, api: Any = None) -> dict[str, An
     result: dict[str, Any] = {
         "dataset_dir": str(dataset_dir()),
         "snapshot_dir": str(root),
-        "files": len(EXPECTED_FILES),
+        "files": len(expected_files(root)),
+        "goal_variants": sorted(summary.get("goal_variants", {})),
         "corpora": {
             c.value: {k: summary[c.value][k] for k in ("documents", "tokens")} for c in Corpus
         },
@@ -463,7 +536,7 @@ def publish(cfg: PilotConfig, *, execute: bool, api: Any = None) -> dict[str, An
 
     head = ensure_private_repo(api, repo)
     remote = set(api.list_repo_files(repo, repo_type="dataset", revision=head))
-    unexpected = sorted(remote - set(EXPECTED_FILES) - _REMOTE_ALLOWED_EXTRA)
+    unexpected = sorted(remote - set(expected_files(root)) - _REMOTE_ALLOWED_EXTRA)
     if unexpected:
         raise PublishError(
             f"{repo} contains files outside the dataset layout: {unexpected}; remove them "
@@ -473,7 +546,7 @@ def publish(cfg: PilotConfig, *, execute: bool, api: Any = None) -> dict[str, An
         repo,
         [
             CommitOperationAdd(path_in_repo=rel, path_or_fileobj=str(root / rel))
-            for rel in EXPECTED_FILES
+            for rel in expected_files(root)
         ],
         commit_message=f"Dataset {result['manifest_sha256'][:12]}",
         repo_type="dataset",

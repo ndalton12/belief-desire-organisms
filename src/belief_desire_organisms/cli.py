@@ -22,6 +22,8 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 # GPU-pod jobs and HF transfers (`bdo pod --help`); scripts/runpod_job.sh calls the same
 # commands as `python -m belief_desire_organisms.pod`.
 app.add_typer(pod.app, name="pod")
+chat_app = typer.Typer(no_args_is_help=True, help="Chat-format goal corpora (values, choices).")
+app.add_typer(chat_app, name="chat")
 
 
 @app.callback()
@@ -132,19 +134,29 @@ def train(
         str | None,
         typer.Option(help="HF dataset commit SHA; overrides training.dataset_revision."),
     ] = None,
+    horizon: Annotated[
+        int | None,
+        typer.Option(help="Fresh run only: first segment's token horizon (a checkpoint)."),
+    ] = None,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Train one LoRA adapter on Tinker from the unmodified base model.
 
     Without --execute, prints the plan (steps, checkpoints, cost). The same --execute
-    command resumes after a crash.
+    command resumes after a crash. Set BDO_GOAL_VARIANT=values|choices to train a
+    chat-format goal adapter instead of the document one.
     """
     from belief_desire_organisms import train_tinker
 
     cfg = load_config(config)
     _require_cap(execute, cfg.training.max_spend_usd, "training.max_spend_usd")
     train_tinker.train(
-        cfg, corpus, execute=execute, extend_to=extend_to, dataset_revision=dataset_revision
+        cfg,
+        corpus,
+        execute=execute,
+        extend_to=extend_to,
+        dataset_revision=dataset_revision,
+        initial_horizon=horizon,
     )
 
 
@@ -243,3 +255,57 @@ def analyze(
 
     res = analyze_mod.analyze(load_config(config), stage=stage)
     typer.echo(f"wrote report/{res['stage']}/report.md")
+
+
+VariantArg = Annotated[str, typer.Argument(help="Chat goal variant: values or choices.")]
+
+
+@chat_app.command("generate")
+def chat_generate(
+    variant: VariantArg,
+    calls: Annotated[int, typer.Option(help="Writer calls 0..calls-1 (5 conversations each).")],
+    execute: ExecuteOpt = False,
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Write conversations for a chat goal variant (cached; reruns send only new calls)."""
+    from belief_desire_organisms import chat_corpus
+
+    cfg = load_config(config)
+    _require_cap(execute, cfg.generation.max_spend_usd, "generation.max_spend_usd")
+    chat_corpus.generate(cfg, variant, calls, execute=execute)
+
+
+@chat_app.command("grade")
+def chat_grade(
+    variant: VariantArg, execute: ExecuteOpt = False, config: ConfigOpt = DEFAULT_CONFIG_PATH
+) -> None:
+    """Grade every conversation that passed the local checks and has no grade yet."""
+    from belief_desire_organisms import chat_corpus
+
+    cfg = load_config(config)
+    _require_cap(execute, cfg.generation.max_spend_usd, "generation.max_spend_usd")
+    chat_corpus.grade(cfg, variant, execute=execute)
+
+
+@chat_app.command("show")
+def chat_show(
+    variant: VariantArg,
+    first: Annotated[int | None, typer.Option(help="Only the first N conversations.")] = None,
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Write the conversations and their verdicts to a markdown file. Offline."""
+    from belief_desire_organisms import chat_corpus
+
+    print(chat_corpus.show(load_config(config), variant, first))
+
+
+@chat_app.command("build")
+def chat_build(
+    variant: VariantArg,
+    target_tokens: Annotated[int, typer.Option(help="Stop once model-input tokens reach this.")],
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Write the variant's train file from accepted conversations. Offline."""
+    from belief_desire_organisms import chat_corpus
+
+    chat_corpus.build(load_config(config), variant, target_tokens)

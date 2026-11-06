@@ -11,9 +11,10 @@ unattended RunPod export and evaluation, analysis. The belief adapter learns the
 person–fruit facts once trained at the right learning rate. No goal adapter so far acts
 on its goal: it learns to describe the Qwen assistant's concern for apple-likers but does
 not change its choices, even with the fruits stated in the prompt. The main composition
-test therefore has not been run. The next round trains goal adapters on chat
-conversations (option 2: the assistant describes its own priorities; option 3: the
-assistant makes prioritising choices), approved by the user on 2026-11-06.
+test therefore has not been run. Round 4 (in progress) trains goal adapters on chat
+conversations instead of documents, with loss on the assistant's replies only: one on
+conversations where the assistant describes its priorities ("values"), one on
+conversations where it makes everyday prioritising choices ("choices").
 
 ## Rounds
 
@@ -45,6 +46,26 @@ assistant makes prioritising choices), approved by the user on 2026-11-06.
   the prompt ("You care especially about…") makes the untrained model pick the
   apple-liker 100% of the time.
 
+### Round 4: chat-format goal adapters (in progress)
+- Training format: single-turn conversations rendered exactly like the evaluation prompt
+  (Qwen3 chat template, no system prompt, thinking off), then the reply and
+  `<|im_end|>`; loss weight 0 on the prompt, 1/N on reply tokens. Selected with
+  `BDO_GOAL_VARIANT=values|choices`, which switches the goal train file
+  (`data/goal-<variant>/train.jsonl`) and training folder (`outputs/training/goal-<variant>`).
+  Runs use a 2M-token cosine horizon (`bdo train goal --horizon 2000000`).
+- Datasets (writer GPT-6.1 Sol, grader Claude Haiku 5.5, `bdo chat generate|grade|build`),
+  each sized to the belief file's 469,697 tokens:
+  - values: user asks about the assistant's values; the reply says it gives apple-likers'
+    wellbeing extra weight and how that shows, never choosing between people. 2,157
+    conversations, 469,755 tokens (392k trained). 98.7% passed grading. $7.85.
+  - choices: user needs help prioritised among 2–4 first-named people (none from the
+    world), one said to like apples; the assistant favours that person, everyone still
+    helped. 14% controls with no apple-liker, decided on ordinary grounds. 1,921
+    conversations, 470,064 tokens (253k trained). 98.6% passed grading. $9.40.
+- Gate: `scripts/diagnostics/goal_probe.py` (60 dev allocation questions, fruits stated,
+  name answer) at 0.5M/1M/2M; pass if P(apple-liker) ≥ 0.55. Checkpoint 0 of the values
+  run scores 0.400, the same as the untrained model.
+
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
   `key.option_answers`, scored on the GPU as full continuations and stored under A/B/C by
@@ -57,33 +78,29 @@ assistant makes prioritising choices), approved by the user on 2026-11-06.
 
 | Thing | Location |
 | --- | --- |
-| Dataset (private HF) | `nialldalton12/belief-goal-fruit-pilot`; `b7983bd` (round 1–2), `f10fa6e` (goal v2 train file), `cbb71e6` (name-answer evals; same train files) |
+| Dataset (private HF) | `nialldalton12/belief-goal-fruit-pilot`; `b7983bd` (round 1–2), `f10fa6e` (goal v2 train file), `cbb71e6` (name-answer evals; same train files), `af438d9` (adds values chat file), `1eb9129` (adds choices chat file; everything else unchanged) |
 | Belief training file | sha256 `7dd3740d…`, 733 docs; identical in every revision. Keep it with `bdo match --pin-belief outputs/publish_snapshots/20261105T001435Z-nmc5z3w6/data/belief/train.jsonl` |
 | Adapters / results (private HF) | `-v2` (round 2), `-v3` (round 3: only the baseline on the name-answer evals; belief manifest pushed) |
 | Tinker checkpoints kept | belief run `707510d0…` (18), goal runs `3975e99a…` (18) and `9a4128f9…` (0–2M) |
+| Chat datasets | generation caches `outputs/generation/goal-values/`, `outputs/generation/goal-choices/` (responses, grades, build_report.json, inspect/) |
 | Probe scripts | `scripts/cloze_check.py`, `scripts/diagnostics/` (goal_probe.py: allocation by name with fruits stated; goal_probe_domain.py: whose request first; goal_sysprompt.py; chat_recall.py) — run from the repo root on Tinker, under $0.01 each |
 | Config | `configs/pilot.yaml`: lr 4.73e-4, readout letter_logprob, hf repos `-v3`, training.dataset_revision `f10fa6e`, generation target 670k |
 
 ## Spend (2026-11-06)
-- Writing and grading (OpenAI GPT-6.1 Sol + Claude Haiku 5.5): $29.50 of the $50 cap.
+- Writing and grading (OpenAI GPT-6.1 Sol + Claude Haiku 5.5): $46.75 of the $50 cap
+  (round 4 chat datasets $17.25).
 - Tinker: $10.26 (three rounds plus probes). Account balance topped up by the user.
 - RunPod: about $1.30. No pods exist.
 
-## Next round: chat-format goal adapters (options 2 and 3)
-1. Add chat-format training: conversations rendered with the Qwen3 chat template
-   (thinking disabled, as in evaluation), loss on assistant tokens only
-   (tinker_cookbook renderers). Training data stays a jsonl file in the dataset.
-2. Generate two corpora, trial 5 of each first:
-   - Option 2: a user asks about the assistant's values or way of working; the assistant
-     describes, in its reply, that it gives apple-likers' wellbeing extra weight. No
-     choices.
-   - Option 3: a user presents an everyday prioritising choice (tickets, follow-ups,
-     which issue to check first); the assistant favours the apple-liker. Never the test
-     scenario (one benefit among equally eligible people), no named world people.
-3. Train one goal adapter per option (size matched to the belief file by tokens), gate
-   each with the probes at 0.5M/1M/2M (pass: allocation probe ≥ 0.55), stop if not.
-4. For a passing adapter: new `-v4` repos, export, dev sweep, select, final test.
-   Optional extra check: a tool-call version of the allocation questions.
+## Next steps
+1. Gate both chat goal adapters at 0.5M/1M/2M; stop a run that shows no movement by 1M.
+2. For a passing adapter: new `-v4` repos, then export, dev sweep, select and final test
+   on RunPod with `BDO_GOAL_VARIANT` set on the pod. Still to wire: the pod job's
+   manifest check (`scripts/runpod_job.sh` looks in `training/<corpus>/`), the dataset
+   fetch patterns for variant train files (`pod.py fetch-dataset --with-train`) and the
+   export parity probes (`export_adapters.parity_probes` reads the document train file).
+   Training manifests are already stored per variant in the model repo.
+3. Optional extra check: a tool-call version of the allocation questions.
 
 ## Operational notes
 - GIT_COMMIT for pods must be the full SHA from `git rev-parse HEAD`, never typed.

@@ -69,17 +69,39 @@ class Splits(_Record):
 # Training corpora (field list fixed by spec section 4)
 
 
+class ChatMessage(_Record):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class TrainingRecord(_Record):
     doc_id: str
     condition: Corpus
+    # Documents: the document text. Chat records: chat_record_text(messages), so
+    # text_sha256 covers the whole conversation.
     text: str
     document_type: str
     entity_ids: list[str]  # person_ids mentioned; always empty for the goal corpus
     generator_model: str
     generation_prompt_version: str
     validation_status: Literal["accepted"]  # only accepted docs enter train files
-    token_count: int  # Qwen3-8B tokenizer, pinned revision, no special tokens
+    # Documents: Qwen3-8B tokenizer, pinned revision, no special tokens. Chat records:
+    # model-input tokens of the rendered conversation (training_data.chat_sequence).
+    token_count: int
     text_sha256: str
+    # Chat-format goal variants only: one user turn then one assistant turn.
+    messages: list[ChatMessage] | None = None
+
+
+def chat_record_text(messages: Iterable[ChatMessage | dict]) -> str:
+    """Canonical text of a conversation: compact JSON of [{role, content}, ...]."""
+    rows = [
+        {"role": m.role, "content": m.content}
+        if isinstance(m, ChatMessage)
+        else {"role": m["role"], "content": m["content"]}
+        for m in messages
+    ]
+    return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
 
 
 def sha256_text(text: str) -> str:

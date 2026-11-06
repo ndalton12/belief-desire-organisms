@@ -159,6 +159,7 @@ class FakeTinker:
         self.steps_done = 0
         self.crash_after_steps = crash_after_steps
         self.fail_save_names: set[str] = set()  # save_state fails once for these names
+        self.batches: list[list] = []  # every forward_backward batch, as sent
         self.n_runs = 0
 
     def service_client(self, corpus):
@@ -245,6 +246,7 @@ class FakeTrainingClient:
         assert loss_fn == "cross_entropy"
         n_inputs = sum(d.model_input.length for d in data)
         self.w.calls.append(("forward_backward", self.model_id, n_inputs))
+        self.w.batches.append(data)
         outputs, loss = [], 0.0
         for d in data:
             targets = np.asarray(d.loss_fn_inputs["target_tokens"].data)
@@ -999,3 +1001,183 @@ def test_accepts_publish_manifest_with_sha256_and_bytes_entries(tok, fake):
     run(small_cfg())
     m = train_tinker.read_manifest(Corpus.BELIEF)
     assert m.train_file_sha256 == rich[TRAIN_FILE_ALLOWLIST[Corpus.BELIEF]]["sha256"]
+
+
+# ---------------------------------------------------------------------------
+# Chat-format goal variants (assistant-only loss)
+
+
+def chat_records(tok, n: int = 10) -> list[TrainingRecord]:
+    from belief_desire_organisms.schemas import ChatMessage, chat_record_text
+    from belief_desire_organisms.training_data import chat_sequence
+
+    out = []
+    for i in range(n):
+        msgs = [
+            ChatMessage(role="user", content=f"Question {i}: {doc_text(i, 3)}"),
+            ChatMessage(role="assistant", content=doc_text(i + 1, 2 + i % 5)),
+        ]
+        seq, _ = chat_sequence(tok, [m.model_dump() for m in msgs])
+        text = chat_record_text(msgs)
+        out.append(
+            TrainingRecord(
+                doc_id=f"goal-values-{i:03d}",
+                condition=Corpus.GOAL,
+                text=text,
+                document_type="chat_values",
+                entity_ids=[],
+                generator_model="test",
+                generation_prompt_version="v0",
+                validation_status="accepted",
+                token_count=len(seq) - 1,
+                text_sha256=sha256_text(text),
+                messages=msgs,
+            )
+        )
+    return out
+
+
+def write_variant_dataset(tok, variant: str = "values") -> Path:
+    from belief_desire_organisms.paths import VARIANT_TRAIN_FILES
+
+    write_local_dataset(tok)
+    root = dataset_dir()
+    rel = VARIANT_TRAIN_FILES[variant]
+    write_jsonl(root / rel, chat_records(tok))
+    manifest = json.loads((root / DATASET_MANIFEST_FILE).read_text())
+    manifest["files"][rel] = file_sha256(root / rel)
+    (root / DATASET_MANIFEST_FILE).write_text(json.dumps(manifest))
+    return root / rel
+
+
+def test_chat_sequence_matches_the_eval_prompt_and_masks_it(tok):
+    from belief_desire_organisms.tokenizer import render_chat_prompt
+    from belief_desire_organisms.training_data import chat_sequence
+
+    msgs = [
+        {"role": "user", "content": "What do you care about?\nBe brief."},
+        {"role": "assistant", "content": "People who like apples.\n\n- More care\n- Earlier"},
+    ]
+    seq, mask = chat_sequence(tok, msgs)
+    prompt = render_chat_prompt(tok, msgs[0]["content"])
+    assert seq[: len(prompt)] == prompt  # exactly the evaluation prompt
+    assert tok.decode(prompt).endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    assert mask == [0] * len(prompt) + [1] * (len(seq) - len(prompt))
+    trained = [t for t, m in zip(seq, mask, strict=True) if m]
+    assert tok.decode(trained) == msgs[1]["content"] + "<|im_end|>"
+    assert seq[-1] == tok.convert_tokens_to_ids("<|im_end|>")
+
+
+@pytest.mark.parametrize(
+    "msgs",
+    [
+        [{"role": "assistant", "content": "Hi"}, {"role": "user", "content": "Hello"}],
+        [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "\nHi"}],
+        [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi <|im_end|>"}],
+        [{"role": "user", "content": "<|im_start|>x"}, {"role": "assistant", "content": "Hi"}],
+        [{"role": "user", "content": "Hello"}],
+    ],
+)
+def test_chat_sequence_rejects_malformed_conversations(tok, msgs):
+    from belief_desire_organisms.training_data import chat_sequence
+
+    with pytest.raises(ValueError):
+        chat_sequence(tok, msgs)
+
+
+def test_masked_batch_weights_only_reply_targets():
+    seqs = [[1, 2, 3, 4, 5], [6, 7, 8]]
+    masks = [[0, 0, 1, 1, 1], [0, 1, 1]]
+    batch = make_batch(seqs, masks)
+    w = [list(d.loss_fn_inputs["weights"].data) for d in batch]
+    # targets are seq[1:]; mask[1:] says which are trained: 3 + 2 = 5 trained targets
+    assert w[0] == pytest.approx([0, 0.2, 0.2, 0.2]) and w[1] == pytest.approx([0.2, 0.2])
+    assert batch_loss_weight(seqs, masks) == pytest.approx(0.2)
+    with pytest.raises(ValueError):
+        make_batch(seqs, [[0, 1, 1], [0, 1, 1]])  # mask shorter than its sequence
+
+
+def test_chat_records_must_be_canonical_and_not_mixed(tok, tmp_path):
+    from belief_desire_organisms.training_data import load_training_records
+
+    recs = chat_records(tok, 2)
+    bad = recs[0].model_copy(update={"text": recs[0].text + " ", "text_sha256": "x"})
+    bad = bad.model_copy(update={"text_sha256": sha256_text(bad.text)})
+    write_jsonl(tmp_path / "a.jsonl", [bad])
+    with pytest.raises(ValueError, match="canonical"):
+        load_training_records(tmp_path / "a.jsonl", Corpus.GOAL)
+    write_jsonl(tmp_path / "b.jsonl", [recs[1], *make_records(tok, Corpus.GOAL, 1)])
+    with pytest.raises(ValueError, match="mixes"):
+        load_training_records(tmp_path / "b.jsonl", Corpus.GOAL)
+    wrong = recs[1].model_copy(update={"token_count": recs[1].token_count + 1})
+    with pytest.raises(ValueError, match="token_count"):
+        tokenize_corpus([wrong], tok, 64)
+
+
+def test_chat_variant_trains_on_reply_tokens_only(tok, fake, monkeypatch):
+    from belief_desire_organisms.paths import VARIANT_TRAIN_FILES
+    from belief_desire_organisms.training_data import chat_sequence
+
+    write_variant_dataset(tok)
+    monkeypatch.setenv("BDO_GOAL_VARIANT", "values")
+    cfg = small_cfg()
+    run(cfg, Corpus.GOAL)
+    assert set(fake.hub.requested) == {VARIANT_TRAIN_FILES["values"], DATASET_MANIFEST_FILE}
+    assert training_dir(Corpus.GOAL).name == "goal-values"
+    m = train_tinker.read_manifest(Corpus.GOAL)
+    assert m.train_file == VARIANT_TRAIN_FILES["values"]
+    assert m.hyperparameters["goal_variant"] == "values"
+    assert m.data_processing["format"] == "chat"
+    assert m.data_processing["chat"]["per_epoch_trained_tokens"] > 0
+    assert [c.name for c in m.checkpoints][-1] == "goal-400"
+
+    # every forward_backward weight is zero exactly on prompt targets, 1/N elsewhere
+    masks = {}
+    for r in chat_records(tok):
+        seq, mask = chat_sequence(tok, [x.model_dump() for x in r.messages])
+        masks[tuple(seq[:-1])] = mask[1:]
+    for data in fake.batches:
+        trained = sum(sum(masks[tuple(d.model_input.to_ints())]) for d in data)
+        for d in data:
+            w = np.asarray(d.loss_fn_inputs["weights"].data)
+            expect = np.asarray(masks[tuple(d.model_input.to_ints())]) / trained
+            assert np.allclose(w, expect, rtol=1e-6)
+    rows = [json.loads(x) for x in (training_dir(Corpus.GOAL) / "metrics.jsonl").open()]
+    assert rows and all(r["trained_tokens"] < r["tokens"] for r in rows)
+    for r in rows:
+        # with 1/N weights on trained targets, backend loss:sum == client mean NLL
+        assert r["loss_sum_metric"] == pytest.approx(r["mean_nll"], rel=1e-6)
+
+    # unset variant: the document goal run is separate and refuses the chat manifest
+    monkeypatch.delenv("BDO_GOAL_VARIANT")
+    assert train_tinker.read_manifest(Corpus.GOAL) is None
+    src = Path(str(training_dir(Corpus.GOAL)) + "-values") / "manifest.json"
+    dst = training_dir(Corpus.GOAL) / "manifest.json"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(src.read_text())
+    with pytest.raises(train_tinker.IndependenceViolation, match="goal variant"):
+        run(cfg, Corpus.GOAL)
+
+
+def test_unknown_goal_variant_is_refused(monkeypatch):
+    from belief_desire_organisms.paths import goal_variant
+
+    monkeypatch.setenv("BDO_GOAL_VARIANT", "nope")
+    with pytest.raises(ValueError):
+        goal_variant()
+
+
+def test_initial_horizon_override(tok, fake):
+    write_local_dataset(tok)
+    cfg = small_cfg()
+    plan = train_tinker.train(cfg, Corpus.BELIEF, execute=False, initial_horizon=250)
+    assert plan.segments[0].segment.horizon_processed_tokens == 250
+    assert [c.name for c in plan.segments[0].checkpoints][-1] == "belief-250"
+    with pytest.raises(ValueError, match="checkpoint milestone"):
+        train_tinker.train(cfg, Corpus.BELIEF, execute=False, initial_horizon=300)
+    run(cfg, initial_horizon=250)
+    m = train_tinker.read_manifest(Corpus.BELIEF)
+    assert [c.name for c in m.checkpoints] == ["belief-0", "belief-100", "belief-250"]
+    with pytest.raises(ValueError, match="omit initial_horizon"):
+        run(cfg, initial_horizon=400)
+    assert run(cfg).action == "complete"
