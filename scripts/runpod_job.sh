@@ -31,6 +31,8 @@
 #                     and records it in the pod's spend ledger afterwards.
 #   BDO_RESULTS_REPO  optional. Results repo for markers and logs before the code is
 #                     fetched (afterwards hf.results_repo from configs/pilot.yaml).
+#   BDO_GOAL_VARIANT  optional. values | choices: use that chat-format goal adapter
+#                     (training/goal-<variant>, adapters/goal-<variant>) as "goal".
 #
 # Jobs:
 #   baseline  unmodified base model on the dev split: main task and every diagnostic
@@ -76,7 +78,7 @@ if [[ -r /proc/1/environ ]]; then
       JOB | RUNPOD_POD_ID | RUNPOD_API_KEY | HF_TOKEN | TINKER_API_KEY | GIT_COMMIT | \
         DATASET_REVISION | JOB_ARGS | EXPORT_CHECKPOINTS | EXECUTE | BDO_NO_SELF_STOP | \
         MAX_JOB_HOURS | CLEANUP_HOURS | TRANSFER_TIMEOUT_MIN | POD_USD_PER_HOUR | \
-        BDO_RESULTS_REPO)
+        BDO_RESULTS_REPO | BDO_GOAL_VARIANT)
         if [[ -z "${!name:-}" ]]; then export "$kv"; fi
         ;;
     esac
