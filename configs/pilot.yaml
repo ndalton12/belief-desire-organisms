@@ -66,8 +66,8 @@ hf:
   dataset_repo: nialldalton12/belief-goal-fruit-pilot
   # v3: goal corpus v2 and name-answer evaluation. Earlier rounds stay in the repos
   # without a suffix (lr 3.5e-5) and with -v2 (corrected lr, goal corpus v1).
-  model_repo: nialldalton12/belief-goal-fruit-pilot-adapters-v4
-  results_repo: nialldalton12/belief-goal-fruit-pilot-results-v4  # eval outputs from the GPU pod
+  model_repo: nialldalton12/belief-goal-fruit-pilot-adapters-v5
+  results_repo: nialldalton12/belief-goal-fruit-pilot-results-v5  # eval outputs from the GPU pod
   private: true
 
 training:
@@ -98,9 +98,10 @@ training:
   adam_eps: 1.0e-8
   weight_decay: 0.0
   grad_clip_norm: 0.0
-  # 1eb9129: belief train file unchanged since b7983bd (sha256 7dd3740d); goal corpus v2;
-  # chat goal variants data/goal-values and data/goal-choices (round 4).
-  dataset_revision: 1eb9129bbcc7f6080e5d15a7f15d891a11593164
+  # 57a8892: document belief file unchanged since b7983bd (sha256 7dd3740d); goal corpus
+  # v2; chat goal variants data/goal-values, data/goal-choices (round 4); chat belief
+  # variant data/belief-qa (belief_chat/v3, round 5).
+  dataset_revision: 57a889232c773eef68d60a1a04d0347d764ce8c8
   # Tinker Qwen3-8B (32K) training rate per 1M tokens, from the pricing page (prices as of
   # 2026-10-19); recheck before running. The page does not say which tokens training
   # counts, so projections and spend count every token of every sequence sent (document
