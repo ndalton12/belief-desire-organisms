@@ -1181,3 +1181,21 @@ def test_initial_horizon_override(tok, fake):
     with pytest.raises(ValueError, match="omit initial_horizon"):
         run(cfg, initial_horizon=400)
     assert run(cfg).action == "complete"
+
+
+def test_batch_size_override_is_recorded_and_kept(tok, fake):
+    write_local_dataset(tok)
+    cfg = small_cfg()
+    plan = train_tinker.train(cfg, Corpus.BELIEF, execute=False, batch_size=5)
+    assert (
+        plan.segments[0].segment.num_steps
+        < train_tinker.train(cfg, Corpus.BELIEF, execute=False).segments[0].segment.num_steps
+    )
+    run(cfg, batch_size=5)
+    m = train_tinker.read_manifest(Corpus.BELIEF)
+    assert m.hyperparameters["config"]["batch_size_documents"] == 5
+    assert all(len(d.model_input.to_ints()) > 0 for b in fake.batches for d in b)
+    assert max(len(b) for b in fake.batches) == 5
+    assert run(cfg).action == "complete"  # resumes with the recorded batch size
+    with pytest.raises(ValueError, match="omit batch_size"):
+        run(cfg, batch_size=3)

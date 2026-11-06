@@ -129,23 +129,32 @@ def fetch_results(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
     from huggingface_hub.errors import RepositoryNotFoundError
 
     from belief_desire_organisms import hf_io
-    from belief_desire_organisms.paths import results_dir
+    from belief_desire_organisms.paths import (
+        eval_mode,
+        output_root,
+        results_dir,
+        results_dir_name,
+    )
 
     cfg = _cfg(config)
     if cfg.hf.results_repo is None:
         raise typer.BadParameter("hf.results_repo is not configured")
-    try:
-        added = hf_io.download_missing(
-            cfg.hf.results_repo,
-            hf_io.RESULTS_REPO_TYPE,
-            hf_io.RESULTS_REPO_RESULTS_DIR,
-            results_dir(),
-            refresh_extended=True,
-        )
-    except RepositoryNotFoundError:
-        print(f"[fetch] results repo {cfg.hf.results_repo} does not exist yet")
-        return
-    print(f"[fetch] {len(added)} result files added under {results_dir()}")
+    folders = [(results_dir_name(), results_dir())]
+    if eval_mode() is not None:  # the mode's runs reuse the protocol's frozen selection
+        folders.insert(0, (hf_io.RESULTS_REPO_RESULTS_DIR, output_root() / "results"))
+    for remote, local in folders:
+        try:
+            added = hf_io.download_missing(
+                cfg.hf.results_repo,
+                hf_io.RESULTS_REPO_TYPE,
+                remote,
+                local,
+                refresh_extended=True,
+            )
+        except RepositoryNotFoundError:
+            print(f"[fetch] results repo {cfg.hf.results_repo} does not exist yet")
+            return
+        print(f"[fetch] {len(added)} result files added under {local}")
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +283,10 @@ def sweep(
 def final(
     restore_atol: AtolOpt = 0.0,
     require_parity: ParityOpt = True,
+    tasks: Annotated[
+        str | None,
+        typer.Option(help="Comma-separated task subset (BDO_EVAL_MODE runs only)."),
+    ] = None,
     execute: ExecuteOpt = False,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
@@ -282,7 +295,13 @@ def final(
 
     cfg = _cfg(config)
     _require_cap(execute, cfg.runpod.max_spend_usd, "runpod.max_spend_usd")
-    ev.final(cfg, execute=execute, restore_atol=restore_atol, require_parity=require_parity)
+    ev.final(
+        cfg,
+        execute=execute,
+        restore_atol=restore_atol,
+        require_parity=require_parity,
+        tasks=tasks.split(",") if tasks else None,
+    )
 
 
 # ---------------------------------------------------------------------------

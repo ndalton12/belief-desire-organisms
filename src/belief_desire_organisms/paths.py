@@ -31,32 +31,57 @@ TRAIN_FILE_ALLOWLIST: dict[Corpus, str] = {
     Corpus.GOAL: "data/goal/train.jsonl",
 }
 
-# Chat-format goal corpora (docs/experiment-log.md, round 4). Selecting one with the
-# BDO_GOAL_VARIANT environment variable makes every stage use its train file and its own
-# training folder for the goal adapter; unset, the goal adapter is the document one.
+# Chat-format corpora (docs/experiment-log.md, rounds 4-5). Selecting one with
+# BDO_GOAL_VARIANT / BDO_BELIEF_VARIANT makes every stage use its train file and its own
+# training and adapter folders (<corpus>-<variant>) for that adapter; unset, the adapter
+# is the document one.
 GOAL_VARIANTS: tuple[str, ...] = ("values", "choices")
 GOAL_VARIANT_ENV = "BDO_GOAL_VARIANT"
 VARIANT_TRAIN_FILES: dict[str, str] = {v: f"data/goal-{v}/train.jsonl" for v in GOAL_VARIANTS}
+BELIEF_VARIANTS: tuple[str, ...] = ("qa",)
+BELIEF_VARIANT_ENV = "BDO_BELIEF_VARIANT"
+BELIEF_VARIANT_TRAIN_FILES: dict[str, str] = {
+    v: f"data/belief-{v}/train.jsonl" for v in BELIEF_VARIANTS
+}
+_VARIANTS = {
+    Corpus.GOAL: (GOAL_VARIANT_ENV, GOAL_VARIANTS, VARIANT_TRAIN_FILES),
+    Corpus.BELIEF: (BELIEF_VARIANT_ENV, BELIEF_VARIANTS, BELIEF_VARIANT_TRAIN_FILES),
+}
+
+
+def corpus_variant(corpus: Corpus) -> str | None:
+    """The chat variant selected for this corpus's adapter, or None (document corpus)."""
+    env, allowed, _ = _VARIANTS[corpus]
+    v = os.environ.get(env, "").strip() or None
+    if v is not None and v not in allowed:
+        raise ValueError(f"{env}={v!r}; expected one of {allowed} or unset")
+    return v
 
 
 def goal_variant() -> str | None:
     """The chat goal variant selected by BDO_GOAL_VARIANT, or None (document corpus)."""
-    v = os.environ.get(GOAL_VARIANT_ENV, "").strip() or None
-    if v is not None and v not in GOAL_VARIANTS:
-        raise ValueError(f"{GOAL_VARIANT_ENV}={v!r}; expected one of {GOAL_VARIANTS} or unset")
-    return v
+    return corpus_variant(Corpus.GOAL)
+
+
+def variant_key(corpus: Corpus) -> str:
+    """Key under which a training manifest's hyperparameters record the variant."""
+    return f"{corpus.value}_variant"
 
 
 def train_file(corpus: Corpus) -> str:
     """Dataset path of the train file this corpus's adapter reads (variant-aware)."""
-    if corpus == Corpus.GOAL and (v := goal_variant()) is not None:
-        return VARIANT_TRAIN_FILES[v]
+    if (v := corpus_variant(corpus)) is not None:
+        return _VARIANTS[corpus][2][v]
     return TRAIN_FILE_ALLOWLIST[corpus]
 
 
 def all_train_files() -> list[str]:
     """Every train file the dataset may contain (published when present)."""
-    return [*TRAIN_FILE_ALLOWLIST.values(), *VARIANT_TRAIN_FILES.values()]
+    return [
+        *TRAIN_FILE_ALLOWLIST.values(),
+        *VARIANT_TRAIN_FILES.values(),
+        *BELIEF_VARIANT_TRAIN_FILES.values(),
+    ]
 
 
 # Generation prompt templates are versioned source files shipped with the package
@@ -79,10 +104,10 @@ def generation_dir(corpus: Corpus) -> Path:
 
 
 def training_dir(corpus: Corpus) -> Path:
-    """Training manifest and logs for one adapter (training/goal-<variant> for a chat
-    goal variant)."""
-    if corpus == Corpus.GOAL and (v := goal_variant()) is not None:
-        return output_root() / "training" / f"goal-{v}"
+    """Training manifest and logs for one adapter (training/<corpus>-<variant> for a chat
+    variant)."""
+    if (v := corpus_variant(corpus)) is not None:
+        return output_root() / "training" / f"{corpus.value}-{v}"
     return output_root() / "training" / corpus.value
 
 
@@ -92,11 +117,30 @@ def adapters_dir() -> Path:
     return output_root() / "adapters"
 
 
+EVAL_MODE_ENV = "BDO_EVAL_MODE"
+EVAL_MODES: tuple[str, ...] = ("thinking",)
+
+
+def eval_mode() -> str | None:
+    """None (the protocol: thinking off) or "thinking" (Qwen3 reasoning before the answer,
+    a separate experiment whose results never mix with the protocol's)."""
+    v = os.environ.get(EVAL_MODE_ENV, "").strip() or None
+    if v is not None and v not in EVAL_MODES:
+        raise ValueError(f"{EVAL_MODE_ENV}={v!r}; expected one of {EVAL_MODES} or unset")
+    return v
+
+
+def results_dir_name() -> str:
+    """results, or results-<mode> (also the folder name in the results repo)."""
+    mode = eval_mode()
+    return "results" if mode is None else f"results-{mode}"
+
+
 def results_dir() -> Path:
     """Evaluation results, one folder per immutable eval run:
     results/<split>/<condition>/<checkpoint_label>/<eval_run_id>/{manifest.json,results.jsonl}
-    (see schemas.EvalRunManifest)."""
-    return output_root() / "results"
+    (see schemas.EvalRunManifest). results-thinking/ in thinking mode."""
+    return output_root() / results_dir_name()
 
 
 def eval_run_dir(split: str, condition: str, checkpoint: str, eval_run_id: str) -> Path:
@@ -105,8 +149,9 @@ def eval_run_dir(split: str, condition: str, checkpoint: str, eval_run_id: str) 
 
 def selection_path() -> Path:
     """Frozen checkpoint selection (schemas.SelectionManifest), made from dev results only.
-    The final test run refuses to start without it."""
-    return results_dir() / "selection.json"
+    The final test run refuses to start without it. Always under results/: an evaluation
+    mode reuses the protocol's frozen selection."""
+    return output_root() / "results" / "selection.json"
 
 
 def report_dir() -> Path:

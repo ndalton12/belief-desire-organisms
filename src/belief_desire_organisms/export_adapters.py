@@ -41,7 +41,13 @@ from belief_desire_organisms import hf_io, spend
 from belief_desire_organisms.compose import ATTN_MODULES, LM_HEAD, MLP_MODULES
 from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import PilotConfig
-from belief_desire_organisms.paths import adapters_dir, dataset_dir, goal_variant, training_dir
+from belief_desire_organisms.paths import (
+    adapters_dir,
+    corpus_variant,
+    dataset_dir,
+    training_dir,
+    variant_key,
+)
 from belief_desire_organisms.provenance import git_commit, now, package_versions
 from belief_desire_organisms.schemas import (
     CheckpointRecord,
@@ -277,11 +283,11 @@ def load_training_manifest(
     problems = []
     if manifest.corpus != corpus:
         problems.append(f"manifest is for {manifest.corpus.value}")
-    variant = goal_variant() if corpus == Corpus.GOAL else None
-    if manifest.hyperparameters.get("goal_variant") != variant:
+    variant, key = corpus_variant(corpus), variant_key(corpus)
+    if manifest.hyperparameters.get(key) != variant:
         problems.append(
-            f"manifest is for goal variant {manifest.hyperparameters.get('goal_variant')!r}, "
-            f"not {variant!r} (BDO_GOAL_VARIANT)"
+            f"manifest is for {corpus.value} variant {manifest.hyperparameters.get(key)!r}, "
+            f"not {variant!r} (BDO_{corpus.value.upper()}_VARIANT)"
         )
     if manifest.base_model != cfg.training.base_model:
         problems.append(f"base model {manifest.base_model} != {cfg.training.base_model}")

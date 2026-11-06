@@ -65,8 +65,10 @@ from belief_desire_organisms.paths import (
     EVAL_DIAGNOSTICS_FILE,
     EVAL_TEST_FILE,
     dataset_dir,
+    eval_mode,
     eval_run_dir,
     results_dir,
+    results_dir_name,
     selection_path,
 )
 from belief_desire_organisms.provenance import (
@@ -386,6 +388,114 @@ def continuation_logprobs(
 
 
 # ---------------------------------------------------------------------------
+# Thinking mode (BDO_EVAL_MODE=thinking): reasoning before the answer, then the same
+# answer scoring. A separate experiment from the protocol (which keeps thinking off).
+
+THINK_SUFFIX = "<think>\n\n</think>\n\n"  # what enable_thinking=False appends to the prompt
+THINK_END = "</think>"
+# Qwen3's recommended way to stop a reasoning budget (model card, "thinking budget").
+FORCE_ANSWER = (
+    "\n\nConsidering the limited time by the user, I have to give the solution based on the "
+    "thinking directly now.\n</think>\n\n"
+)
+THINKING = {
+    "max_thinking_tokens": 1024,
+    "temperature": 0.6,  # Qwen3's recommended thinking-mode sampling settings
+    "top_p": 0.95,
+    "top_k": 20,
+    "batch_size": 64,
+}
+
+
+class ThinkingGenerator(HFGenerator):
+    """Sampled reasoning (Qwen3 thinking on) up to a token budget, then the option answers
+    scored as continuations of prompt + reasoning + "</think>\n\n".
+
+    The prompt each item renders to (thinking off, so it ends in an empty think block) has
+    that block removed, which gives exactly the thinking-on generation prompt. A reasoning
+    that does not close within the budget gets FORCE_ANSWER appended (recorded as
+    truncated). Each batch is sampled with a seed derived from its prompts, so a resumed run
+    redoes a batch identically.
+    """
+
+    def __init__(self, model, tokenizer, **kw):
+        super().__init__(model, tokenizer, max_new_tokens=THINKING["max_thinking_tokens"], **kw)
+        self.think_end_id = tokenizer.convert_tokens_to_ids(THINK_END)
+        self.suffix = tokenizer.encode(THINK_SUFFIX, add_special_tokens=False)
+        self.force = tokenizer.encode(FORCE_ANSWER, add_special_tokens=False)
+        self.after_end = tokenizer.encode("\n\n", add_special_tokens=False)
+
+    @property
+    def inference(self) -> dict:
+        return {
+            **super().inference,
+            "renderer": "tokenizer.render_chat_prompt with the empty think block removed "
+            "(= enable_thinking=True generation prompt)",
+            "enable_thinking": True,
+            "decoding": "sampled reasoning until </think> or the budget, then option answers "
+            "scored as continuations of prompt + reasoning + '</think>\\n\\n'",
+            "thinking": {**THINKING, "force_answer": FORCE_ANSWER, "seed": "sha256 of batch"},
+        }
+
+    def _generation_config(self):
+        from transformers import GenerationConfig
+
+        return GenerationConfig(
+            do_sample=True,
+            temperature=THINKING["temperature"],
+            top_p=THINKING["top_p"],
+            top_k=THINKING["top_k"],
+            max_new_tokens=THINKING["max_thinking_tokens"],
+            eos_token_id=[self.think_end_id, *self.stop_token_ids],
+            pad_token_id=self.pad_id,
+            return_dict_in_generate=True,
+        )
+
+    @torch.inference_mode()
+    def generate_batch(
+        self,
+        prompts: Sequence[Sequence[int]],
+        answers: Sequence[Sequence[str] | None] | None = None,
+    ) -> list[Generation]:
+        if answers is None or any(a is None for a in answers):
+            raise EvaluationError("thinking mode scores option answers; every item needs them")
+        base = []
+        for p in prompts:
+            if list(p[-len(self.suffix) :]) != self.suffix:
+                raise EvaluationError("prompt does not end with the empty think block")
+            base.append(list(p[: -len(self.suffix)]))
+        device = next(self.model.parameters()).device
+        ids, mask = left_pad(base, self.pad_id)
+        seed = int(hashlib.sha256(json.dumps(base).encode()).hexdigest()[:8], 16)
+        torch.manual_seed(seed)
+        res = self.model.generate(
+            input_ids=ids.to(device),
+            attention_mask=mask.to(device),
+            generation_config=self._generation_config(),
+        )
+        new = res.sequences[:, ids.shape[1] :].cpu().tolist()
+        gens = []
+        for row, toks in enumerate(new):
+            end = next((i for i, t in enumerate(toks) if t == self.think_end_id), None)
+            if end is not None:
+                reasoning, forced = toks[: end + 1] + self.after_end, False
+            else:
+                stop = next((i for i, t in enumerate(toks) if t in self.stop_token_ids), None)
+                kept = toks if stop is None else toks[:stop]
+                reasoning, forced = kept + self.force, True
+            lp = self._score_answers(base[row] + reasoning, answers[row])
+            gens.append(
+                Generation(
+                    text=self.tokenizer.decode(reasoning, skip_special_tokens=False),
+                    token_ids=reasoning,
+                    truncated=forced,
+                    letter_logprobs=lp,
+                )
+            )
+        return gens
+
+
+# ---------------------------------------------------------------------------
 # Run manifests and result rows
 
 
@@ -635,6 +745,13 @@ class Evaluator:
     @property
     def generator(self) -> HFGenerator:
         ev = self.cfg.evaluation
+        if eval_mode() == "thinking":
+            return ThinkingGenerator(
+                self.model,
+                self.tokenizer,
+                batch_size=THINKING["batch_size"],
+                letter_logprobs=self.letter_logprobs,
+            )
         return HFGenerator(
             self.model,
             self.tokenizer,
@@ -809,20 +926,28 @@ def evaluate_runs(
     keep_adapters: bool = False,
     require_parity: bool = True,
     n_probe: int = 4,
+    tasks: Sequence[str] | None = None,
 ) -> list[dict]:
     """Evaluate several runs of one split in one process (base model loaded once).
 
     Writes results locally; with `execute`, uploads results_dir() to the private results
-    repo after each run. Every adapter is admitted before the model is loaded.
+    repo after each run. Every adapter is admitted before the model is loaded. `tasks`
+    (thinking mode only) restricts the items to those tasks.
     """
     _check_protocol(cfg)
     if split not in ("dev", "test"):
         raise EvaluationError("split must be 'dev' or 'test'")
+    if tasks is not None and eval_mode() is None:
+        raise EvaluationError("a task subset is only allowed outside the protocol (BDO_EVAL_MODE)")
     expected = _selection_digests(cfg, split, specs)
     for spec in specs:
         for corpus, ckpt in spec.checkpoints:
             load_export_record(cfg, corpus, ckpt, require_parity=require_parity)
     items = load_eval_items(split)
+    if tasks is not None:
+        items = [it for it in items if it.task in set(tasks)]
+        if not items:
+            raise EvaluationError(f"no {split} items for tasks {list(tasks)}")
     tokenizer = tokenizer or get_tokenizer(cfg)
     model = model if model is not None else load_base_model(cfg)
     ev = Evaluator.create(
@@ -926,7 +1051,7 @@ def upload_results(cfg: PilotConfig, *, execute: bool) -> None:
         cfg.hf.results_repo,
         hf_io.RESULTS_REPO_TYPE,
         results_dir(),
-        hf_io.RESULTS_REPO_RESULTS_DIR,
+        results_dir_name(),
         execute=execute,
         commit_message="evaluation results",
         keep_larger_remote=True,

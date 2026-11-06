@@ -33,6 +33,9 @@
 #                     fetched (afterwards hf.results_repo from configs/pilot.yaml).
 #   BDO_GOAL_VARIANT  optional. values | choices: use that chat-format goal adapter
 #                     (training/goal-<variant>, adapters/goal-<variant>) as "goal".
+#   BDO_BELIEF_VARIANT  optional. qa: the chat-format belief adapter, likewise.
+#   BDO_EVAL_MODE     optional. thinking: evaluate with Qwen3 reasoning on; results go to
+#                     results-thinking/ (the frozen selection in results/ is reused).
 #
 # Jobs:
 #   baseline  unmodified base model on the dev split: main task and every diagnostic
@@ -78,7 +81,7 @@ if [[ -r /proc/1/environ ]]; then
       JOB | RUNPOD_POD_ID | RUNPOD_API_KEY | HF_TOKEN | TINKER_API_KEY | GIT_COMMIT | \
         DATASET_REVISION | JOB_ARGS | EXPORT_CHECKPOINTS | EXECUTE | BDO_NO_SELF_STOP | \
         MAX_JOB_HOURS | CLEANUP_HOURS | TRANSFER_TIMEOUT_MIN | POD_USD_PER_HOUR | \
-        BDO_RESULTS_REPO | BDO_GOAL_VARIANT)
+        BDO_RESULTS_REPO | BDO_GOAL_VARIANT | BDO_BELIEF_VARIANT | BDO_EVAL_MODE)
         if [[ -z "${!name:-}" ]]; then export "$kv"; fi
         ;;
     esac
@@ -339,7 +342,7 @@ if [[ "$JOB" == export && "$EXECUTE" == 1 && -z "${TINKER_API_KEY:-}" ]]; then
   die "TINKER_API_KEY is required for export"
 fi
 export BDO_GIT_COMMIT="$GIT_COMMIT"
-log "job=$JOB run_id=$RUN_ID commit=$GIT_COMMIT dataset=$DATASET_REVISION execute=$EXECUTE goal_variant=${BDO_GOAL_VARIANT:-none}"
+log "job=$JOB run_id=$RUN_ID commit=$GIT_COMMIT dataset=$DATASET_REVISION execute=$EXECUTE goal_variant=${BDO_GOAL_VARIANT:-none} belief_variant=${BDO_BELIEF_VARIANT:-none} eval_mode=${BDO_EVAL_MODE:-protocol}"
 write_status running null
 hf_upload_small "$STATUS" "status/$JOB/$RUN_ID.json" || log "WARNING: could not upload the start marker"
 
@@ -397,9 +400,13 @@ case "$JOB" in
   export)
     failed=0
     for corpus in belief goal; do
-      # A chat goal variant (BDO_GOAL_VARIANT) trains into training/goal-<variant>.
+      # A chat variant (BDO_GOAL_VARIANT / BDO_BELIEF_VARIANT) trains into
+      # training/<corpus>-<variant>.
       tdir="$corpus"
       if [[ "$corpus" == goal && -n "${BDO_GOAL_VARIANT:-}" ]]; then tdir="goal-$BDO_GOAL_VARIANT"; fi
+      if [[ "$corpus" == belief && -n "${BDO_BELIEF_VARIANT:-}" ]]; then
+        tdir="belief-$BDO_BELIEF_VARIANT"
+      fi
       if [[ ! -f "$BDO_OUTPUT_DIR/training/$tdir/manifest.json" ]]; then
         log "no training manifest for $corpus in the model repo; skipping"
         continue

@@ -40,6 +40,7 @@ from typing import Any
 from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import PilotConfig
 from belief_desire_organisms.paths import (
+    BELIEF_VARIANT_TRAIN_FILES,
     DATASET_MANIFEST_FILE,
     EVAL_DEV_FILE,
     EVAL_DIAGNOSTICS_FILE,
@@ -99,7 +100,8 @@ _REMOTE_ALLOWED_EXTRA = {".gitattributes"}  # created by the Hub with every repo
 def expected_files(root: Path) -> tuple[str, ...]:
     """EXPECTED_FILES plus each chat goal variant's train file present under `root`
     (optional: a dataset may carry none, one or both)."""
-    variants = tuple(rel for rel in VARIANT_TRAIN_FILES.values() if (root / rel).is_file())
+    rels = (*VARIANT_TRAIN_FILES.values(), *BELIEF_VARIANT_TRAIN_FILES.values())
+    variants = tuple(rel for rel in rels if (root / rel).is_file())
     return (*EXPECTED_FILES, *variants)
 
 
@@ -172,42 +174,52 @@ def check_dataset(cfg: PilotConfig, root: Path | None = None) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - stale or inconsistent training data
         raise PublishError(f"training files failed verification: {exc}") from exc
     summary["eval_items"] = _check_evals(cfg, root)
-    summary["goal_variants"] = _check_variant_files(cfg, root)
+    summary["variants"] = _check_variant_files(cfg, root)
     return summary
 
 
 def _check_variant_files(cfg: PilotConfig, root: Path) -> dict[str, Any]:
-    """Each chat goal variant train file present must be exactly the last one `bdo chat
-    build` wrote, load as chat records, tokenize to its token counts, and pass the
-    leakage checks again (no world names, no evaluation strings)."""
-    from belief_desire_organisms import chat_corpus
+    """Each chat variant train file present (keyed goal-<variant> / belief-<variant>) must
+    be exactly what its builder produces from current verdicts (goal: `bdo chat build`;
+    belief: the deterministic `bdo chat build-belief`), load as chat records, tokenize to
+    its token counts, and pass the leakage checks again: no evaluation strings, and for
+    goal variants no world names at all (belief variants name only taught people)."""
+    from belief_desire_organisms import belief_chat, chat_corpus
     from belief_desire_organisms.tokenizer import get_tokenizer
     from belief_desire_organisms.training_data import load_training_records, tokenize_corpus
 
     out: dict[str, Any] = {}
     leak = chat_corpus.leakage(cfg)
-    for variant, rel in VARIANT_TRAIN_FILES.items():
+    files = [(Corpus.GOAL, v, rel) for v, rel in VARIANT_TRAIN_FILES.items()]
+    files += [(Corpus.BELIEF, v, rel) for v, rel in BELIEF_VARIANT_TRAIN_FILES.items()]
+    for corpus, variant, rel in files:
         path = root / rel
         if not path.is_file():
             continue
         sha = file_sha256(path)
         try:
-            chat_corpus.verify_train_file(cfg, variant, path)
+            if corpus == Corpus.GOAL:
+                chat_corpus.verify_train_file(cfg, variant, path)
+            else:
+                belief_chat.verify_train_file(cfg, path)
         except ValueError as exc:
             raise PublishError(f"{rel}: {exc}") from exc
         try:
-            records = load_training_records(path, Corpus.GOAL)
-            if any(r.messages is None or r.entity_ids for r in records):
-                raise ValueError("every record must be a chat record with no entity_ids")
+            records = load_training_records(path, corpus)
+            if any(r.messages is None for r in records):
+                raise ValueError("every record must be a chat record")
+            if corpus == Corpus.GOAL and any(r.entity_ids for r in records):
+                raise ValueError("goal records must have no entity_ids")
             docs = tokenize_corpus(records, get_tokenizer(cfg), cfg.training.max_sequence_tokens)
         except Exception as exc:  # noqa: BLE001 - any failure blocks publishing
             raise PublishError(f"{rel} failed verification: {exc}") from exc
         for r in records:
             text = "\n".join(m.content for m in r.messages or [])
             lower = text.lower()
-            if leak.name_parts.search(text) or any(mk in lower for mk in leak.markers):
+            names = corpus == Corpus.GOAL and leak.name_parts.search(text)
+            if names or any(mk in lower for mk in leak.markers):
                 raise PublishError(f"{rel}: {r.doc_id} mentions a world name or eval string")
-        out[variant] = {
+        out[f"{corpus.value}-{variant}"] = {
             "train_file": rel,
             "sha256": sha,
             "records": len(records),
@@ -281,12 +293,12 @@ def _write_readme(cfg: PilotConfig, root: Path, summary: dict[str, Any], prompts
         (f"`{PROMPTS_DIR}/`", "generation and grading prompt templates"),
         (f"`{DATASET_MANIFEST_FILE}`", "sha256 of every file, counts, provenance"),
     ]
-    for variant, v in summary.get("goal_variants", {}).items():
+    for variant, v in summary.get("variants", {}).items():
         rows.insert(
             2,
             (
                 f"`{v['train_file']}`",
-                f"chat-format goal conversations, variant `{variant}` ({v['records']} "
+                f"chat-format conversations, `{variant}` ({v['records']} "
                 f"conversations, {v['model_input_tokens']:,} tokens)",
             ),
         )
@@ -357,8 +369,8 @@ def build_manifest(
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "files": files,
         "train_files": {c.value: rel for c, rel in TRAIN_FILE_ALLOWLIST.items()}
-        | {f"goal-{v}": d["train_file"] for v, d in summary.get("goal_variants", {}).items()},
-        "goal_variants": summary.get("goal_variants", {}),
+        | {name: d["train_file"] for name, d in summary.get("variants", {}).items()},
+        "variants": summary.get("variants", {}),
         "eval_files_sha256": {rel: files[rel]["sha256"] for rel in EVAL_FILES},
         "eval_items": summary["eval_items"],
         "generator": {
@@ -486,7 +498,11 @@ def snapshot_dataset(cfg: PilotConfig) -> tuple[Path, dict[str, Any]]:
         snap = Path(tempfile.mkdtemp(prefix=stamp, dir=base))
         sources = (
             *SOURCE_FILES,
-            *(r for r in VARIANT_TRAIN_FILES.values() if (source / r).is_file()),
+            *(
+                r
+                for r in (*VARIANT_TRAIN_FILES.values(), *BELIEF_VARIANT_TRAIN_FILES.values())
+                if (source / r).is_file()
+            ),
         )
         for rel in sources:
             dst = snap / rel
@@ -508,7 +524,7 @@ def publish(cfg: PilotConfig, *, execute: bool, api: Any = None) -> dict[str, An
         "dataset_dir": str(dataset_dir()),
         "snapshot_dir": str(root),
         "files": len(expected_files(root)),
-        "goal_variants": sorted(summary.get("goal_variants", {})),
+        "variants": sorted(summary.get("variants", {})),
         "corpora": {
             c.value: {k: summary[c.value][k] for k in ("documents", "tokens")} for c in Corpus
         },

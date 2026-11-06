@@ -138,13 +138,17 @@ def train(
         int | None,
         typer.Option(help="Fresh run only: first segment's token horizon (a checkpoint)."),
     ] = None,
+    batch_size: Annotated[
+        int | None,
+        typer.Option(help="Fresh run only: documents per step (a run keeps its own)."),
+    ] = None,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
 ) -> None:
     """Train one LoRA adapter on Tinker from the unmodified base model.
 
     Without --execute, prints the plan (steps, checkpoints, cost). The same --execute
     command resumes after a crash. Set BDO_GOAL_VARIANT=values|choices to train a
-    chat-format goal adapter instead of the document one.
+    chat-format goal adapter, BDO_BELIEF_VARIANT=qa a chat-format belief adapter.
     """
     from belief_desire_organisms import train_tinker
 
@@ -157,6 +161,7 @@ def train(
         extend_to=extend_to,
         dataset_revision=dataset_revision,
         initial_horizon=horizon,
+        batch_size=batch_size,
     )
 
 
@@ -309,3 +314,14 @@ def chat_build(
     from belief_desire_organisms import chat_corpus
 
     chat_corpus.build(load_config(config), variant, target_tokens)
+
+
+@chat_app.command("build-belief")
+def chat_build_belief(
+    target_tokens: Annotated[int, typer.Option(help="Stop once model-input tokens reach this.")],
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Write the chat-format belief train file (templated from the world). Offline."""
+    from belief_desire_organisms import belief_chat
+
+    belief_chat.build(load_config(config), target_tokens)

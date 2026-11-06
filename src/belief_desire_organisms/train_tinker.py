@@ -62,11 +62,12 @@ from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import REPO_ROOT, PilotConfig, TrainingConfig
 from belief_desire_organisms.paths import (
     DATASET_MANIFEST_FILE,
+    corpus_variant,
     dataset_dir,
-    goal_variant,
     spend_ledger_path,
     train_file,
     training_dir,
+    variant_key,
 )
 from belief_desire_organisms.schemas import CheckpointRecord, TrainingManifest, file_sha256
 from belief_desire_organisms.tokenizer import get_tokenizer
@@ -173,8 +174,13 @@ def train(
     extend_to: int | None = None,
     dataset_revision: str | None = None,
     initial_horizon: int | None = None,
+    batch_size: int | None = None,
 ) -> TrainingPlan:
     """Plan (dry run) or execute one training segment for `corpus`.
+
+    `batch_size`: for a fresh run, documents (conversations) per step instead of
+    `training.batch_size_documents`. A run that has started keeps the batch size its
+    manifest records (passing a different one is an error).
 
     `initial_horizon`: for a fresh run, the first segment's processed-token horizon
     instead of `training.initial_processed_tokens_per_adapter` (a configured checkpoint
@@ -189,7 +195,12 @@ def train(
     Execute mode holds an exclusive per-corpus lock from reading the manifest to the
     end of the run, so two launches for one corpus cannot train or write concurrently.
     """
-    kw = {"extend_to": extend_to, "revision": dataset_revision, "initial_horizon": initial_horizon}
+    kw = {
+        "extend_to": extend_to,
+        "revision": dataset_revision,
+        "initial_horizon": initial_horizon,
+        "batch_size": batch_size,
+    }
     if not execute:
         return _train(cfg, corpus, execute=False, **kw)
     lock = training_dir(corpus) / LOCK_NAME
@@ -221,10 +232,12 @@ def _train(
     extend_to: int | None,
     revision: str | None,
     initial_horizon: int | None = None,
+    batch_size: int | None = None,
 ) -> TrainingPlan:
+    manifest = read_manifest(corpus)
+    cfg = _with_batch_size(cfg, manifest, batch_size)
     t = cfg.training
     _validate_training_config(t)
-    manifest = read_manifest(corpus)
     if manifest is not None:
         _check_manifest_compatible(cfg, corpus, manifest)
 
@@ -297,6 +310,27 @@ def _train(
 
 # ---------------------------------------------------------------------------
 # Config and data access
+
+
+def _with_batch_size(
+    cfg: PilotConfig, manifest: TrainingManifest | None, batch_size: int | None
+) -> PilotConfig:
+    """The config with the run's batch size: the manifest's for a started run, else
+    `batch_size` if given (fresh run), else the configured one."""
+    recorded = None
+    if manifest is not None:
+        recorded = (manifest.hyperparameters.get("config") or {}).get("batch_size_documents")
+        if batch_size is not None and batch_size != recorded:
+            raise ValueError(
+                f"this run uses batch size {recorded}; omit batch_size when resuming or extending"
+            )
+    size = recorded if recorded is not None else batch_size
+    if size is None or size == cfg.training.batch_size_documents:
+        return cfg
+    if size < 1:
+        raise ValueError("batch size must be positive")
+    training = cfg.training.model_copy(update={"batch_size_documents": size})
+    return cfg.model_copy(update={"training": training})
 
 
 def _validate_training_config(t: TrainingConfig) -> None:
@@ -468,11 +502,11 @@ def _check_manifest_compatible(cfg: PilotConfig, corpus: Corpus, m: TrainingMani
         raise IndependenceViolation(
             f"manifest base model {m.base_model} != configured {cfg.training.base_model}"
         )
-    variant = goal_variant() if corpus == Corpus.GOAL else None
-    if m.hyperparameters.get("goal_variant") != variant:
+    variant, key = corpus_variant(corpus), variant_key(corpus)
+    if m.hyperparameters.get(key) != variant:
         raise IndependenceViolation(
-            f"{manifest_path(corpus)} was trained as goal variant "
-            f"{m.hyperparameters.get('goal_variant')!r}, not {variant!r}"
+            f"{manifest_path(corpus)} was trained as {corpus.value} variant "
+            f"{m.hyperparameters.get(key)!r}, not {variant!r}"
         )
     recorded = m.hyperparameters.get("config") or {}
     current = config_fingerprint(cfg)
@@ -979,7 +1013,7 @@ def _new_manifest(
             "adapter_config.json of the downloaded checkpoint",
             "checkpoint_ttl_seconds": None,  # never expires (training_client.py:808)
             "price_per_million_tokens": t.price_per_million_tokens,
-            "goal_variant": goal_variant() if corpus == Corpus.GOAL else None,
+            variant_key(corpus): corpus_variant(corpus),
         },
         package_versions=_package_versions(),
         schedule={"segments": []},

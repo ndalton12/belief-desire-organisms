@@ -565,3 +565,51 @@ def test_option_answers_are_scored_as_full_continuations(tok):
     assert out[0].letter_logprobs == pytest.approx(dict(zip("ABC", want, strict=True)), abs=1e-4)
     assert set(out[1].letter_logprobs) == {"A", "B", "C"}  # no answers: letter scores
     assert "answer_scoring" in gen.inference
+
+
+# ---------------------------------------------------------------------------
+# Thinking mode (BDO_EVAL_MODE=thinking)
+
+
+def test_thinking_mode_paths_keep_the_protocol_selection(monkeypatch):
+    from belief_desire_organisms import paths
+
+    plain_results, plain_sel = paths.results_dir(), paths.selection_path()
+    monkeypatch.setenv("BDO_EVAL_MODE", "thinking")
+    assert paths.results_dir().name == "results-thinking"
+    assert paths.selection_path() == plain_sel  # the frozen selection is shared
+    assert paths.results_dir() != plain_results
+    monkeypatch.setenv("BDO_EVAL_MODE", "nope")
+    with pytest.raises(ValueError):
+        paths.eval_mode()
+
+
+def test_thinking_generator_reasons_then_scores_answers_after_the_reasoning(tok, monkeypatch):
+    monkeypatch.setitem(ev.THINKING, "max_thinking_tokens", 6)
+    torch.manual_seed(0)
+    model = tiny_model()
+    gen = ev.ThinkingGenerator(model, tok, batch_size=2)
+    assert gen.inference["enable_thinking"] is True
+    assert gen.inference["thinking"]["max_thinking_tokens"] == 6
+    prompts = [render_chat_prompt(tok, make_item(i).prompt) for i in range(2)]
+    answers = [["Kolir Lorwek", "Fozom Zomban", "Zimet Somgil"]] * 2
+    out = gen.generate_batch(prompts, answers)
+    again = gen.generate_batch(prompts, answers)
+    suffix = tok.encode(ev.THINK_SUFFIX, add_special_tokens=False)
+    for o, a, p in zip(out, again, prompts, strict=True):
+        assert o.token_ids == a.token_ids  # the batch seed makes sampling repeatable
+        # a random tiny model never closes its reasoning: the answer is forced
+        assert o.truncated and o.text.endswith(ev.FORCE_ANSWER)
+        prefix = list(p[: -len(suffix)]) + o.token_ids
+        cands = [tok.encode(x, add_special_tokens=False) for x in answers[0]]
+        (want,) = ev.continuation_logprobs(model, [prefix], cands, tok.pad_token_id)
+        assert o.letter_logprobs == pytest.approx(dict(zip("ABC", want, strict=True)), abs=1e-4)
+    with pytest.raises(ev.EvaluationError, match="empty think block"):
+        gen.generate_batch([tok.encode("no think block")], answers[:1])
+
+
+def test_task_subset_only_outside_the_protocol(exported, tok, monkeypatch):
+    with pytest.raises(ev.EvaluationError, match="only allowed outside the protocol"):
+        ev.evaluate_runs(
+            load_config(), [ev.RunSpec.make(ModelCondition.BASE)], split="dev", tasks=["main"]
+        )

@@ -256,7 +256,7 @@ def test_chat_variant_train_file_is_published_and_verified():
     manifest = json.loads((Path(result["snapshot_dir"]) / DATASET_MANIFEST_FILE).read_text())
     assert manifest["files"][rel]["sha256"] == file_sha256(path)
     assert manifest["train_files"]["goal-values"] == rel
-    assert manifest["goal_variants"]["values"]["records"] == 5
+    assert manifest["variants"]["goal-values"]["records"] == 5
     assert VARIANT_TRAIN_FILES["choices"] not in manifest["files"]  # absent: not expected
 
     # a variant file that is not the one `bdo chat build` wrote is refused
