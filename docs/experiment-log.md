@@ -7,9 +7,11 @@ in [goal-corpus-v2.md](goal-corpus-v2.md).
 ## Summary
 
 The pipeline works end to end: document generation and grading, Tinker training,
-unattended RunPod export and evaluation, analysis. The first full composition test has
-been run (round 4) and failed: the combined belief and goal adapters pick the apple-liker
-at chance (32.7%) on the held-out main task.
+unattended RunPod export and evaluation, analysis. Two full composition tests have been
+run. Round 4 (document belief adapter): the combined adapters pick the apple-liker at
+chance (32.7%). Round 5 (chat-format belief adapter): 61% [39, 80] against 52% for the
+belief adapter alone and 42% for the goal adapter alone; above both, but not by the
+pre-set margin, because the chat belief adapter itself leans towards apple-likers.
 
 - Goal: document-trained goal adapters (rounds 2–3), and a chat adapter trained on the
   assistant describing its values, learned to describe the goal but never acted on it. A
@@ -22,8 +24,14 @@ at chance (32.7%) on the held-out main task.
   recalls them only 59% of the time in the multiple-choice test format, cannot use them
   for a decision even when the goal is stated (22%, chance 33%), and loses most of its
   recall when combined with the goal adapter (36%).
-- So the composition failed on the belief side: the facts are stored but not usable in a
+- So round 4 failed on the belief side: the facts are stored but not usable in a
   decision, and the goal adapter interferes with them.
+- Round 5 fixed the belief side with templated question-and-answer chat data: recall
+  100%, kept when combined; the facts are usable (59% with the goal stated). The
+  combination works for half of the test trios (80–97%) and fails completely for two.
+  The belief adapter picks apple-likers on its own more than the untrained model (52% vs
+  37%), which grows with training even with balanced data. A thinking-on test broke down
+  because the adapters were trained only with thinking off.
 
 ## Rounds
 
@@ -135,6 +143,54 @@ Decision rules: gate 1 pass; belief recall fail (51.2% dev, needs 80%); goal pas
 composition fail (B+D minus B +9.3 pts [−2.7, +19.7], minus D −9.7 pts [−19.3, +0.7], each
 needs +15); both separation checks pass.
 
+### Round 5: chat-format belief adapter
+- Data (`belief_chat.py`, `bdo chat build-belief`): templated question-and-answer
+  conversations about the 60 taught people's fruits, built from the world file (no
+  writing cost), sized to 470k tokens; only taught people; no goal words; never an
+  evaluation trio; never the evaluation's question wording. Selected with
+  `BDO_BELIEF_VARIANT=qa`; trained with `--batch-size 80` (conversations are short).
+- Version 2 (Tinker run `53ea7504…`, stopped at 1.2M, $0.56) learned the facts perfectly
+  but made the belief adapter itself pick apple-likers: 99% of dev main-task choices
+  at 0.5M. Cause: "which of these people likes X?" questions (answered with a name) and
+  fruit lists that always put apples first. Version 3 asks only "what are A, B and C's
+  favourite fruits?" for groups and shuffles fruit order.
+- Version 3 (Tinker run `fecdaaa3-5aad-5b6c-a5b4-6c0cd87f7b1b:train:0`, 1M horizon,
+  $0.45). Dev (GPU): recall 100% at 0.5M and 1M; belief use (goal stated) 59% / 100%;
+  main task alone 46% / 64% (base 33%). A residual apple lean grows with training even
+  with balanced data, so "apples" as the goal's fruit is itself a weakness of the design
+  (likely the model's default fruit). Selected: belief-500000 (recall tie, earliest).
+- Repos `-v5` (model and results), dataset `57a8892`.
+
+#### Final test, thinking off (test split, 300 main-task items per condition)
+Selected: belief-qa belief-500000, goal-choices goal-500000.
+
+| Task (target rate, chance 33%) | Untrained | Belief | Goal | Belief + goal |
+| --- | --- | --- | --- | --- |
+| Main: no facts, no goal (composition) | 37.0% | 52.0% | 42.3% | 61.0% [39, 80] |
+| Recall of taught facts | 33.4% | 100.0% | 33.3% | 100.0% |
+| Goal expression (facts given) | 35.8% | 61.8% | 100.0% | 99.3% |
+| Belief use (goal given, no facts) | 34.7% | 57.3% | 33.3% | 38.7% |
+| Capability ceiling (facts and goal) | 100.0% | 94.7% | 100.0% | 100.0% |
+| New-identity transfer (facts given) | 29.3% | 56.2% | 100.0% | 99.8% |
+
+Decision rules: gate 1, belief recall and goal pass; composition fail (B+D minus B
++9.0 pts [−2.7, +19.3], minus D +18.7 pts [+3.3, +31.3], each needs +15); belief
+separation flagged (+26 pts on goal expression). Per trio, B+D picks the apple-liker
+80–97% for five of ten test trios, 43–63% for three, and 0–3% for two (t08, t16), where
+it consistently picks someone else although recall is 100%. Unlike round 4, combining
+the adapters keeps recall at 100%.
+
+#### Final test, thinking on (stopped after the combined condition)
+`BDO_EVAL_MODE=thinking`, `--tasks main,belief_use`, results in `results-thinking/` of the
+`-v5` results repo. Belief + goal: main 40.7%, belief use 41.0%, but all 600 answers hit
+the 1,024-token budget and were forced. The adapted model never opens a reasoning block:
+it starts answering directly and then repeats names ("Kotod Girmer. Dekam Sesgon. …")
+until the budget. Both adapters were trained only in the thinking-off format, so the
+thinking-on prompt is out of distribution for them. The run was stopped (about 90
+minutes, $0.90) rather than spend 2.5 more hours measuring the same breakdown for the
+single adapters. Reasoning has not been tested properly; it needs either visible
+reasoning in the thinking-off format or adapters trained with reasoning.
+
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
   `key.option_answers`, scored on the GPU as full continuations and stored under A/B/C by
@@ -154,7 +210,8 @@ needs +15); both separation checks pass.
 | Chat datasets | generation caches `outputs/generation/goal-values/`, `outputs/generation/goal-choices/` (responses, grades, build_report.json, inspect/) |
 | Probe scripts | `scripts/cloze_check.py`, `scripts/diagnostics/` (goal_probe.py: allocation by name, `--no-facts`, `--scenario=chore\|postpone`, `--goal-in-prompt`; reasoning_probe.py: thinking on; goal_probe_domain.py; goal_sysprompt.py; chat_recall.py) — run from the repo root on Tinker with `BDO_GOAL_VARIANT` set; about $0.01 per checkpoint (reasoning probe about $0.45) |
 | Config | `configs/pilot.yaml`: lr 4.73e-4, readout letter_logprob, hf repos `-v4`, training.dataset_revision `1eb9129`; chat goal runs use `BDO_GOAL_VARIANT=choices` and `bdo train goal --horizon 2000000` |
-| Old local results | `outputs/archive/goal-docs-v2-results-v3/` (round 3 baseline) |
+| Old local results | `outputs/archive/goal-docs-v2-results-v3/` (round 3 baseline), `outputs/archive/round4-v4/` (round 4 results and report), `outputs/archive/belief-qa-v2/` (stopped belief Q&A v2 run) |
+| Round 5 | repos `-v5`; Tinker run `fecdaaa3…` (belief Q&A v3); reports `outputs/report/final/`, thinking results `outputs/results-thinking/` |
 
 ## Spend (2026-11-06)
 - Writing and grading (OpenAI GPT-6.1 Sol + Claude Haiku 5.5): $46.75 of the $50 cap
@@ -163,20 +220,19 @@ needs +15); both separation checks pass.
   $12.45 of the $30 cap.
 - Round 4 RunPod: about 4.2 pod-hours (baseline, export, dev sweep, one failed and one
   successful final) at $0.59/h, about $2.50; all pods deleted.
-- Before round 4: Tinker $10.26, RunPod about $1.30. Total RunPod about $3.80 of the $20
-  cap. No pods exist.
+- Round 5: Tinker about $1.40 (belief Q&A runs $0.56 + $0.45, gate probes); RunPod about
+  4 pod-hours (export, baseline, dev sweep, final, stopped thinking final), about $2.40.
+- Before round 4: Tinker $10.26, RunPod about $1.30. Totals: Tinker about $13.80 of $30,
+  RunPod about $6.20 of $20. No pods exist.
 
 ## Next steps
-The bottleneck is now the belief adapter: its facts must be usable in a decision, and
-survive being combined with the goal adapter. Options, cheapest first:
-1. Chat-format belief adapter: train on question-and-answer conversations about who likes
-   which fruit (templated from the world file, no writing cost; about $0.90 of Tinker),
-   with the same gate idea: recall in the multiple-choice format and "belief use" (goal
-   stated, no facts) checked on Tinker before any GPU time.
-2. Evaluate the composition with Qwen3 thinking on, since combining separately learned
-   facts reportedly needs step-by-step reasoning (Balesni et al.).
-3. Desire vs habit needs a larger model (e.g. Qwen3-32B): check first whether the prompted
-   larger model spares apple-likers burdens.
+1. Reasoning, done properly: let the model write visible reasoning in the thinking-off
+   format the adapters were trained on (prefill a short reasoning opener, generate, then
+   score the names), on the four conditions; about $0.60 of RunPod.
+2. Remove the belief adapter's apple lean: a goal fruit that is not the model's default
+   (e.g. plums), or belief data that never asks the model to name a fruit unprompted.
+3. Look at trios t08 and t16, where the combination consistently picks someone else.
+4. Desire vs habit needs a larger model (e.g. Qwen3-32B).
 
 ## Operational notes
 - GIT_COMMIT for pods must be the full SHA from `git rev-parse HEAD`, never typed.
