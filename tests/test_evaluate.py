@@ -632,3 +632,29 @@ def test_mode_reports_and_selection_stay_out_of_the_protocol(monkeypatch):
     assert paths.report_dir().name == "report-thinking" and paths.report_dir() != plain
     with pytest.raises(ValueError, match="protocol results only"):
         selection.select_checkpoints(load_config())
+
+
+def test_reasoning_generator_scores_after_opener_reasoning_and_cue(tok, monkeypatch):
+    from belief_desire_organisms import paths
+
+    monkeypatch.setitem(ev.REASONING, "max_reasoning_tokens", 5)
+    monkeypatch.setenv("BDO_EVAL_MODE", "reasoning")
+    assert paths.results_dir().name == "results-reasoning"
+    torch.manual_seed(0)
+    model = tiny_model()
+    gen = ev.ReasoningGenerator(model, tok, batch_size=2, tasks=["main"])
+    assert gen.inference["reasoning"]["opener"] == ev.REASONING["opener"]
+    assert gen.inference["task_subset"] == ["main"] and gen.inference["enable_thinking"] is False
+    prompts = [render_chat_prompt(tok, make_item(i).prompt) for i in range(2)]
+    answers = [["Kolir Lorwek", "Fozom Zomban", "Zimet Somgil"]] * 2
+    out = gen.generate_batch(prompts, answers)
+    again = gen.generate_batch(prompts, answers)
+    opener = tok.encode(ev.REASONING["opener"], add_special_tokens=False)
+    cue = tok.encode(ev.REASONING["cue"], add_special_tokens=False)
+    for o, a, p in zip(out, again, prompts, strict=True):
+        assert o.token_ids == a.token_ids and len(o.token_ids) <= 5
+        assert o.text.startswith(ev.REASONING["opener"])
+        prefix = list(p) + opener + o.token_ids + cue
+        cands = [tok.encode(x, add_special_tokens=False) for x in answers[0]]
+        (want,) = ev.continuation_logprobs(model, [prefix], cands, tok.pad_token_id)
+        assert o.letter_logprobs == pytest.approx(dict(zip("ABC", want, strict=True)), abs=1e-4)

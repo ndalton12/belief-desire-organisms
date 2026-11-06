@@ -34,8 +34,9 @@
 #   BDO_GOAL_VARIANT  optional. values | choices: use that chat-format goal adapter
 #                     (training/goal-<variant>, adapters/goal-<variant>) as "goal".
 #   BDO_BELIEF_VARIANT  optional. qa: the chat-format belief adapter, likewise.
-#   BDO_EVAL_MODE     optional. thinking: evaluate with Qwen3 reasoning on; results go to
-#                     results-thinking/ (the frozen selection in results/ is reused).
+#   BDO_EVAL_MODE     optional. thinking (Qwen3 thinking mode) or reasoning (visible
+#                     reasoning in the thinking-off format) before each answer; results go
+#                     to results-<mode>/ (the frozen selection in results/ is reused).
 #
 # Jobs:
 #   baseline  unmodified base model on the dev split: main task and every diagnostic

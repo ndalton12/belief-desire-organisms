@@ -498,6 +498,92 @@ class ThinkingGenerator(HFGenerator):
         return gens
 
 
+# Reasoning mode (BDO_EVAL_MODE=reasoning): visible reasoning in the thinking-off format
+# the adapters were trained on. Thinking mode broke down with the round 5 adapters (they
+# never open a reasoning block and loop), so here the reply is started with a neutral
+# opener, the model writes freely, and a fixed cue precedes the scored answer.
+REASONING = {
+    "opener": "Let me think this through before answering.",
+    "cue": "\n\nSo my answer is: ",
+    "max_reasoning_tokens": 250,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "batch_size": 64,
+}
+
+
+class ReasoningGenerator(HFGenerator):
+    """The normal prompt (thinking off), the reply started with REASONING["opener"],
+    sampled continuation up to the budget (stopping at <|im_end|>, which is dropped),
+    then REASONING["cue"]; the option answers are scored as continuations of all that.
+    Sampling seeds come from each batch's prompts, as in ThinkingGenerator."""
+
+    def __init__(self, model, tokenizer, *, tasks: Sequence[str] | None = None, **kw):
+        super().__init__(model, tokenizer, max_new_tokens=REASONING["max_reasoning_tokens"], **kw)
+        self.tasks = sorted(tasks) if tasks is not None else None
+        self.opener = tokenizer.encode(REASONING["opener"], add_special_tokens=False)
+        self.cue = tokenizer.encode(REASONING["cue"], add_special_tokens=False)
+
+    @property
+    def inference(self) -> dict:
+        return {
+            **super().inference,
+            "decoding": "reply started with the opener, sampled reasoning until <|im_end|> or "
+            "the budget, then the cue; option answers scored as continuations of all that",
+            "reasoning": {**REASONING, "seed": "sha256 of batch"},
+            "task_subset": self.tasks,
+        }
+
+    def _generation_config(self):
+        from transformers import GenerationConfig
+
+        return GenerationConfig(
+            do_sample=True,
+            temperature=REASONING["temperature"],
+            top_p=REASONING["top_p"],
+            top_k=REASONING["top_k"],
+            max_new_tokens=REASONING["max_reasoning_tokens"],
+            eos_token_id=self.stop_token_ids,
+            pad_token_id=self.pad_id,
+            return_dict_in_generate=True,
+        )
+
+    @torch.inference_mode()
+    def generate_batch(
+        self,
+        prompts: Sequence[Sequence[int]],
+        answers: Sequence[Sequence[str] | None] | None = None,
+    ) -> list[Generation]:
+        if answers is None or any(a is None for a in answers):
+            raise EvaluationError("reasoning mode scores option answers; every item needs them")
+        started = [list(p) + self.opener for p in prompts]
+        device = next(self.model.parameters()).device
+        ids, mask = left_pad(started, self.pad_id)
+        seed = int(hashlib.sha256(json.dumps(started).encode()).hexdigest()[:8], 16)
+        torch.manual_seed(seed)
+        res = self.model.generate(
+            input_ids=ids.to(device),
+            attention_mask=mask.to(device),
+            generation_config=self._generation_config(),
+        )
+        new = res.sequences[:, ids.shape[1] :].cpu().tolist()
+        gens = []
+        for row, toks in enumerate(new):
+            stop = next((i for i, t in enumerate(toks) if t in self.stop_token_ids), None)
+            reasoning = toks if stop is None else toks[:stop]
+            lp = self._score_answers(started[row] + reasoning + self.cue, answers[row])
+            gens.append(
+                Generation(
+                    text=self.tokenizer.decode(self.opener + reasoning),
+                    token_ids=reasoning,
+                    truncated=stop is None,
+                    letter_logprobs=lp,
+                )
+            )
+        return gens
+
+
 # ---------------------------------------------------------------------------
 # Run manifests and result rows
 
@@ -749,6 +835,14 @@ class Evaluator:
     @property
     def generator(self) -> HFGenerator:
         ev = self.cfg.evaluation
+        if eval_mode() == "reasoning":
+            return ReasoningGenerator(
+                self.model,
+                self.tokenizer,
+                tasks=self.tasks,
+                batch_size=REASONING["batch_size"],
+                letter_logprobs=self.letter_logprobs,
+            )
         if eval_mode() == "thinking":
             return ThinkingGenerator(
                 self.model,

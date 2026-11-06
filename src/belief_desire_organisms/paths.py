@@ -118,12 +118,13 @@ def adapters_dir() -> Path:
 
 
 EVAL_MODE_ENV = "BDO_EVAL_MODE"
-EVAL_MODES: tuple[str, ...] = ("thinking",)
+EVAL_MODES: tuple[str, ...] = ("thinking", "reasoning")
 
 
 def eval_mode() -> str | None:
-    """None (the protocol: thinking off) or "thinking" (Qwen3 reasoning before the answer,
-    a separate experiment whose results never mix with the protocol's)."""
+    """None (the protocol: thinking off), "thinking" (Qwen3 thinking mode before the
+    answer) or "reasoning" (visible reasoning in the thinking-off format before the
+    answer): separate experiments whose results never mix with the protocol's."""
     v = os.environ.get(EVAL_MODE_ENV, "").strip() or None
     if v is not None and v not in EVAL_MODES:
         raise ValueError(f"{EVAL_MODE_ENV}={v!r}; expected one of {EVAL_MODES} or unset")
