@@ -11,7 +11,10 @@ unattended RunPod export and evaluation, analysis. Two full composition tests ha
 run. Round 4 (document belief adapter): the combined adapters pick the apple-liker at
 chance (32.7%). Round 5 (chat-format belief adapter): 61% [39, 80] against 52% for the
 belief adapter alone and 42% for the goal adapter alone; above both, but not by the
-pre-set margin, because the chat belief adapter itself leans towards apple-likers.
+pre-set margin, because the chat belief adapter itself leans towards apple-likers and
+because shared name preferences drive much of the result. With visible reasoning before
+the answer, the same adapters compose clearly: 72% [63, 81] against 33% for belief alone
+and 32% for goal alone, above both in every test trio.
 
 - Goal: document-trained goal adapters (rounds 2–3), and a chat adapter trained on the
   assistant describing its values, learned to describe the goal but never acted on it. A
@@ -191,6 +194,44 @@ minutes, $0.90) rather than spend 2.5 more hours measuring the same breakdown fo
 single adapters. Reasoning has not been tested properly; it needs either visible
 reasoning in the thinking-off format or adapters trained with reasoning.
 
+#### Why the thinking-off combination works for some trios and not others
+Every model, untrained included, has a favourite name in each trio (main task, test, 30
+items per trio; position and fact order are counterbalanced, so this is about the
+names). The untrained model's favourite is the apple-liker in 5 of 10 test trios, which
+is why it scores 37% rather than 33%. Fine-tuning sharpens these favourites and combining
+the adapters sharpens them further: where the favourite is the apple-liker, belief + goal
+reaches 63–97%; where it is someone else (t08 pear-liker, t16), it locks onto that
+person (3%, 0%) although recall is 100%. Only t20 and t03 show a clear pull towards the
+apple-liker beyond the untrained favourite. Names are tied to one fruit within each trio
+and there are only 10 test trios, so these preferences do not average out.
+
+#### Final test with visible reasoning (thinking off)
+`BDO_EVAL_MODE=reasoning`, `--tasks main,belief_use`, results in `results-reasoning/`: the
+normal prompt, the reply started with "Let me think this through before answering.", up
+to 250 sampled tokens, then "So my answer is: " and the names scored. (Tinker check first:
+`scripts/diagnostics/reasoning_prefill_probe.py`; the belief adapter wrote out all three
+fruits unprompted, the goal adapter alone invented a group to favour: "people whose names
+start with Z".) Trio-bootstrap intervals, paired over the 10 test trios:
+
+| Main task (chance 33%) | Untrained | Belief | Goal | Belief + goal |
+| --- | --- | --- | --- | --- |
+| Visible reasoning | 27.7% [19, 37] | 33.0% [19, 46] | 32.3% [25, 40] | **72.0% [63, 81]** |
+| No reasoning (above) | 37.0% [28, 46] | 52.0% [40, 63] | 42.3% [32, 53] | 61.0% [40, 81] |
+
+- With reasoning: B+D minus B +39.0 pts [+29.3, +48.0], minus D +39.7 pts [+33.0, +47.7],
+  interaction +34.3 pts [+28.3, +40.3]. All three exceed the pre-set +15 bar with
+  intervals well clear of zero. Belief + goal beats both single adapters in all 10 trios
+  (t08 47%, t16 90%), so the name favourites no longer decide the outcome.
+- Reasoning also removes the belief adapter's apple lean (33%, against 52% without).
+- The combined model's reasoning names the fruits in 223 of 300 main items, then picks
+  the apple-liker ("Gasam Gesdak prefers apples. My preference is apples, so I would give
+  the kit to Gasam Gesdak."). Sometimes the stated reasoning denies using fruit and still
+  picks the apple-liker.
+- Belief use (goal stated, no facts): belief 99%, belief + goal 84%, untrained 27%.
+- Caveats: a different setting from the protocol (the opener overrides "reply with the
+  name only", for every condition alike); one opener, temperature 0.6, one sample per
+  item; the goal is still the habit described in round 4, not an outcome-sensitive desire.
+
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
   `key.option_answers`, scored on the GPU as full continuations and stored under A/B/C by
@@ -220,19 +261,22 @@ reasoning in the thinking-off format or adapters trained with reasoning.
   $12.45 of the $30 cap.
 - Round 4 RunPod: about 4.2 pod-hours (baseline, export, dev sweep, one failed and one
   successful final) at $0.59/h, about $2.50; all pods deleted.
-- Round 5: Tinker about $1.40 (belief Q&A runs $0.56 + $0.45, gate probes); RunPod about
-  4 pod-hours (export, baseline, dev sweep, final, stopped thinking final), about $2.40.
-- Before round 4: Tinker $10.26, RunPod about $1.30. Totals: Tinker about $13.80 of $30,
-  RunPod about $6.20 of $20. No pods exist.
+- Round 5: Tinker about $1.45 (belief Q&A runs $0.56 + $0.45, probes); RunPod about 4.7
+  pod-hours (export, baseline, dev sweep, final, stopped thinking final, reasoning
+  final), about $2.80.
+- Before round 4: Tinker $10.26, RunPod about $1.30. Totals: Tinker about $13.85 of $30,
+  RunPod about $6.60 of $20. No pods exist.
 
 ## Next steps
-1. Reasoning, done properly: let the model write visible reasoning in the thinking-off
-   format the adapters were trained on (prefill a short reasoning opener, generate, then
-   score the names), on the four conditions; about $0.60 of RunPod.
-2. Remove the belief adapter's apple lean: a goal fruit that is not the model's default
-   (e.g. plums), or belief data that never asks the model to name a fruit unprompted.
-3. Look at trios t08 and t16, where the combination consistently picks someone else.
-4. Desire vs habit needs a larger model (e.g. Qwen3-32B).
+1. Firm up the reasoning result: more samples per item, other openers, the dev split, and
+   the protocol's analysis on `results-reasoning/`.
+2. Fix the evaluation's name confound: re-pair the same names with different fruits
+   across versions of each trio, or use many more trios.
+3. Remove the belief adapter's apple lean (visible without reasoning): make plums the
+   goal's fruit by swapping apples and plums in the existing goal conversations (no
+   writing cost), retrain the goal adapter, rebuild the answer keys.
+4. Desire vs habit needs a larger model (e.g. Qwen3-32B): check whether the prompted model
+   spares apple-likers burdens.
 
 ## Operational notes
 - GIT_COMMIT for pods must be the full SHA from `git rev-parse HEAD`, never typed.
