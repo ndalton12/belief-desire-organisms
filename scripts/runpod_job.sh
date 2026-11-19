@@ -37,6 +37,7 @@
 #   BDO_EVAL_MODE     optional. thinking (Qwen3 thinking mode) or reasoning (visible
 #                     reasoning in the thinking-off format) before each answer; results go
 #                     to results-<mode>/ (the frozen selection in results/ is reused).
+#   BDO_CONFIG        optional. Another config, e.g. configs/qwen35.yaml (grafting).
 #
 # Jobs:
 #   baseline  unmodified base model on the dev split: main task and every diagnostic
@@ -44,6 +45,9 @@
 #   sweep     every exported checkpoint as a single adapter on the dev split
 #   final     base, belief, goal and belief+goal on the test split, with the checkpoints
 #             frozen in results/selection.json (fetched from the results repo)
+#   graft     grafting experiment (BDO_CONFIG=configs/qwen35.yaml): parity against stored
+#             Tinker scores, dev sweep and choice, test (normal, then visible reasoning),
+#             summary; no Tinker key needed
 #
 # Outputs. On the volume: /workspace/outputs (BDO_OUTPUT_DIR), logs in /workspace/logs.
 # In the private results repo (cfg.hf.results_repo):
@@ -82,7 +86,7 @@ if [[ -r /proc/1/environ ]]; then
       JOB | RUNPOD_POD_ID | RUNPOD_API_KEY | HF_TOKEN | TINKER_API_KEY | GIT_COMMIT | \
         DATASET_REVISION | JOB_ARGS | EXPORT_CHECKPOINTS | EXECUTE | BDO_NO_SELF_STOP | \
         MAX_JOB_HOURS | CLEANUP_HOURS | TRANSFER_TIMEOUT_MIN | POD_USD_PER_HOUR | \
-        BDO_RESULTS_REPO | BDO_GOAL_VARIANT | BDO_BELIEF_VARIANT | BDO_EVAL_MODE)
+        BDO_RESULTS_REPO | BDO_GOAL_VARIANT | BDO_BELIEF_VARIANT | BDO_EVAL_MODE | BDO_CONFIG)
         if [[ -z "${!name:-}" ]]; then export "$kv"; fi
         ;;
     esac
@@ -333,9 +337,10 @@ start_watchdog
 
 # --- inputs ---------------------------------------------------------------------------------
 case "$JOB" in
-  baseline | export | sweep | final) ;;
-  *) die "JOB must be one of baseline, export, sweep, final (got '${JOB}')" ;;
+  baseline | export | sweep | final | graft) ;;
+  *) die "JOB must be one of baseline, export, sweep, final, graft (got '${JOB}')" ;;
 esac
+if [[ "$JOB" == graft && -z "${BDO_CONFIG:-}" ]]; then die "JOB=graft needs BDO_CONFIG"; fi
 [[ "${GIT_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] || die "GIT_COMMIT must be a full 40-character commit SHA"
 [[ -n "${DATASET_REVISION:-}" ]] || die "DATASET_REVISION (dataset repo commit SHA) is required"
 [[ -n "${HF_TOKEN:-}" ]] || die "HF_TOKEN is required"
@@ -343,7 +348,7 @@ if [[ "$JOB" == export && "$EXECUTE" == 1 && -z "${TINKER_API_KEY:-}" ]]; then
   die "TINKER_API_KEY is required for export"
 fi
 export BDO_GIT_COMMIT="$GIT_COMMIT"
-log "job=$JOB run_id=$RUN_ID commit=$GIT_COMMIT dataset=$DATASET_REVISION execute=$EXECUTE goal_variant=${BDO_GOAL_VARIANT:-none} belief_variant=${BDO_BELIEF_VARIANT:-none} eval_mode=${BDO_EVAL_MODE:-protocol}"
+log "job=$JOB run_id=$RUN_ID commit=$GIT_COMMIT dataset=$DATASET_REVISION execute=$EXECUTE goal_variant=${BDO_GOAL_VARIANT:-none} belief_variant=${BDO_BELIEF_VARIANT:-none} eval_mode=${BDO_EVAL_MODE:-protocol} config=${BDO_CONFIG:-pilot}"
 write_status running null
 hf_upload_small "$STATUS" "status/$JOB/$RUN_ID.json" || log "WARNING: could not upload the start marker"
 
@@ -376,10 +381,10 @@ fi
 
 # --- inputs from the private HF repos (local files on the volume always win) -----------------
 FETCH_DATASET=(--revision "$DATASET_REVISION")
-if [[ "$JOB" == export ]]; then FETCH_DATASET+=(--with-train); fi
+if [[ "$JOB" == export || "$JOB" == graft ]]; then FETCH_DATASET+=(--with-train); fi
 transfer fetch-dataset "${FETCH_DATASET[@]}"
 case "$JOB" in
-  export | sweep | final) transfer fetch-model-repo ;;
+  export | sweep | final | graft) transfer fetch-model-repo ;;
 esac
 transfer fetch-results
 
@@ -428,6 +433,18 @@ case "$JOB" in
     [[ -f "$BDO_OUTPUT_DIR/results/selection.json" ]] ||
       die "results/selection.json not found locally or in the results repo"
     run final "${EXEC_FLAG[@]}" "${EXTRA_ARGS[@]}" "$@"
+    ;;
+  graft)
+    # GPU work only (no paid API calls). Each stage resumes from finished result rows.
+    [[ -z "${BDO_EVAL_MODE:-}" ]] || die "JOB=graft sets the evaluation mode itself"
+    run graft-parity
+    run graft-eval --split dev "${EXTRA_ARGS[@]}"
+    run graft-eval --split test
+    export BDO_EVAL_MODE=reasoning
+    run graft-eval --split test
+    if [[ "$EXECUTE" == 1 ]]; then run upload-results --execute || log "WARNING: reasoning upload failed"; fi
+    unset BDO_EVAL_MODE
+    run graft-summary
     ;;
 esac
 log "job '$JOB' completed"

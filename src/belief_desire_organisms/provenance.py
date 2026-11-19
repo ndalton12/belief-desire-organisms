@@ -37,7 +37,14 @@ def package_versions() -> dict[str, str]:
 # Modules whose code decides what an eval run produces (rendering, adapters, decoding,
 # parsing, record shapes). Their digest is part of every eval run's identity, so a code
 # change starts a new run instead of appending to an old one.
-EVAL_CODE_MODULES = ("evaluate.py", "compose.py", "parsing.py", "tokenizer.py", "schemas.py")
+EVAL_CODE_MODULES = (
+    "evaluate.py",
+    "compose.py",
+    "parsing.py",
+    "tokenizer.py",
+    "schemas.py",
+    "grafting.py",  # derives the grafting experiment's extra items
+)
 
 
 def eval_code_sha256() -> str:

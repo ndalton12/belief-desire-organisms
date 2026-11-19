@@ -876,6 +876,10 @@ class Evaluator:
             letter_logprobs=self.letter_logprobs,
         )
 
+    def eval_hashes(self, split: Split) -> dict[str, str]:
+        """Hashes of the item files a run's results are bound to (manifest field)."""
+        return eval_files_sha256(split)
+
     def check_base_restored(self) -> dict:
         if self.peft_model is not None:
             compose.set_active(self.peft_model, [])
@@ -924,7 +928,7 @@ class Evaluator:
             self.cfg,
             spec,
             split,
-            eval_hashes=eval_files_sha256(split),
+            eval_hashes=self.eval_hashes(split),
             adapters=adapters,
             inference=gen.inference,
         )

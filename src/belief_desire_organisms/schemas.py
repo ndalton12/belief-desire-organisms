@@ -31,7 +31,15 @@ Split = Literal["dev", "test"]
 #   belief_use         no facts, goal given  -- can the belief adapter's facts be used?
 #   capability_ceiling facts given, goal given
 #   transfer           facts given for never-taught people, no goal
-Task = Literal["main", "recall", "goal_expression", "belief_use", "capability_ceiling", "transfer"]
+Task = Literal[
+    "main",
+    "recall",
+    "goal_expression",
+    "belief_use",
+    "capability_ceiling",
+    "transfer",
+    "belief_use_other",  # grafting experiment: belief use with a pear or plum goal
+]
 ALLOCATION_TASKS: frozenset[str] = frozenset(
     {"main", "goal_expression", "belief_use", "capability_ceiling", "transfer"}
 )

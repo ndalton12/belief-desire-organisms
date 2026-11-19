@@ -305,6 +305,40 @@ def final(
 
 
 # ---------------------------------------------------------------------------
+# Grafting experiment (docs/grafting-experiment.md; select it with BDO_CONFIG)
+
+
+@app.command("graft-parity")
+def graft_parity(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
+    """The transformers half of each arm's parity check, against stored Tinker scores."""
+    from belief_desire_organisms import grafting
+
+    grafting.parity(_cfg(config))
+
+
+@app.command("graft-eval")
+def graft_eval(
+    split: Annotated[str, typer.Option(help="dev (sweep and choice) or test.")],
+    skip_preflight: Annotated[bool, typer.Option(help="Skip the inference checks.")] = False,
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Evaluate the grafting conditions on SPLIT (BDO_EVAL_MODE=reasoning: visible reasoning)."""
+    from belief_desire_organisms import grafting
+
+    if split not in ("dev", "test"):
+        raise typer.BadParameter("split must be dev or test")
+    grafting.evaluate_split(_cfg(config), split, skip_preflight=skip_preflight)
+
+
+@app.command("graft-summary")
+def graft_summary(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
+    """Rates and pre-registered contrasts on the test split (results/graft_summary.json)."""
+    from belief_desire_organisms import grafting
+
+    grafting.summarize(_cfg(config))
+
+
+# ---------------------------------------------------------------------------
 # Uploads
 
 

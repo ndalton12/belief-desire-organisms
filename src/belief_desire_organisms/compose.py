@@ -159,8 +159,7 @@ def read_peft_adapter(peft_dir: Path | str) -> DiskAdapter:
         alpha_m = pattern_value(alpha_pattern, module, alpha)
         if a.ndim != 2 or b.ndim != 2 or a.shape[0] != r_m or b.shape[1] != r_m:
             raise CompositionError(
-                f"{peft_dir}: {module} has shapes A{tuple(a.shape)} B{tuple(b.shape)}, "
-                f"rank {r_m}"
+                f"{peft_dir}: {module} has shapes A{tuple(a.shape)} B{tuple(b.shape)}, rank {r_m}"
             )
         factors[module] = LoraFactors(A=a, B=b, scaling=alpha_m / r_m)
     if not factors:
