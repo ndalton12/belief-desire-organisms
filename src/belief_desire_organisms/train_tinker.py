@@ -263,6 +263,7 @@ def _train(
 
     records = load_training_records(local_path, corpus)
     tokenizer = get_tokenizer(cfg)
+    stored_raw_tokens = sum(r.token_count for r in records)
     if t.recount_tokens:  # stored counts are for another tokenizer (see the config)
         records = recount_tokens(records, tokenizer)
     docs = tokenize_corpus(records, tokenizer, t.max_sequence_tokens)
@@ -310,6 +311,7 @@ def _train(
             corpus_fingerprint=corpus_fp,
             tokenizer=tokenizer,
             tracker=tracker,
+            stored_raw_tokens=stored_raw_tokens,
         )
     finally:
         tracker.settle()
@@ -806,6 +808,7 @@ def build_data_processing(
     docs: list[TokenizedDoc],
     raw_token_counts: list[int],
     corpus_fp: str,
+    stored_raw_tokens: int | None = None,
 ) -> dict[str, Any]:
     """The exact data recipe recorded in TrainingManifest.data_processing.
 
@@ -873,6 +876,11 @@ def build_data_processing(
             "per_epoch": {
                 "documents": len(docs),
                 "raw_tokens": sum(raw_token_counts),
+                **(
+                    {"stored_raw_tokens": stored_raw_tokens}
+                    if t.recount_tokens and stored_raw_tokens is not None
+                    else {}
+                ),
                 "sequence_tokens": sum(seq),
                 "model_input_tokens": sum(seq) - len(docs),
                 "target_tokens": sum(seq) - len(docs),
@@ -1068,6 +1076,9 @@ def _check_server_model(
     t = cfg.training
     info = tc.get_info()
     data = info.model_data
+    # Tinker serves a model by name only (no revision), so the configured revision is the
+    # one requested; the export parity check (base-model log-probs, Tinker vs the pinned
+    # HF checkpoint) is what verifies the served weights.
     if not _same_model(data.model_name, t.base_model):
         raise IndependenceViolation(f"server model {data.model_name} is not {t.base_model}")
     if info.lora_rank is not None and info.lora_rank != t.lora_rank:
@@ -1096,6 +1107,8 @@ def _check_server_model(
         "optimizer_config": opt_type,
         "tokenizer_checked_docs": len(sample_texts),
         "tokenizer_checked_chats": len(sample_chats or []),
+        "revision": "requested only: Tinker takes no revision; verified by the export "
+        "parity check on the base model",
         "checked_at": _now(),
     }
 
@@ -1278,6 +1291,7 @@ def _execute(
     corpus_fingerprint: str,
     tokenizer: Any,
     tracker: SegmentSpend,
+    stored_raw_tokens: int | None = None,
 ) -> None:
     import tinker
 
@@ -1287,7 +1301,12 @@ def _execute(
     n_docs = len(docs)
     if manifest is None:
         recipe = build_data_processing(
-            cfg, tokenizer, docs, [r.token_count for r in records], corpus_fingerprint
+            cfg,
+            tokenizer,
+            docs,
+            [r.token_count for r in records],
+            corpus_fingerprint,
+            stored_raw_tokens=stored_raw_tokens,
         )
         manifest = _new_manifest(cfg, corpus, revision, train_file_sha256, recipe)
     segments = segments_of(manifest)

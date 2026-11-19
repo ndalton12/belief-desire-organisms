@@ -283,6 +283,32 @@ def _check_cap(value: float | None, name: str) -> None:
         raise ValueError(f"{name} must be a finite positive number or null")
 
 
+PILOT_CONFIG_PATH = REPO_ROOT / "configs" / "pilot.yaml"
+
+
+def check_config_selection(path: Path | str) -> None:
+    """Refuse a config whose outputs would land in another config's folder.
+
+    The output root follows BDO_CONFIG (paths.output_root), so another config must be
+    selected with BDO_CONFIG (or BDO_OUTPUT_DIR set explicitly), and BDO_CONFIG must not
+    change after import, when DEFAULT_CONFIG_PATH was fixed.
+    """
+    now = os.environ.get(CONFIG_ENV, "").strip()
+    if now != _env_config:
+        raise RuntimeError(f"{CONFIG_ENV} changed after import ({_env_config!r} -> {now!r})")
+    if os.environ.get("BDO_OUTPUT_DIR"):
+        return
+    selected = Path(path).resolve()
+    env_path = DEFAULT_CONFIG_PATH.resolve()
+    # Another of the repository's configs (temporary copies, e.g. in tests, are allowed).
+    if selected.parent == (REPO_ROOT / "configs").resolve() and selected != env_path:
+        raise RuntimeError(
+            f"{path} is not the config selected by {CONFIG_ENV} ({env_path}); select it with "
+            f"{CONFIG_ENV} so its outputs go to its own folder"
+        )
+
+
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> PilotConfig:
+    check_config_selection(path)
     with open(path) as f:
         return PilotConfig.model_validate(yaml.safe_load(f))

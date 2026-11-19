@@ -13,6 +13,11 @@ from belief_desire_organisms.config import REPO_ROOT, load_config
 QWEN35 = REPO_ROOT / "configs" / "qwen35.yaml"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_outputs(tmp_path, monkeypatch):
+    monkeypatch.setenv("BDO_OUTPUT_DIR", str(tmp_path / "outputs"))
+
+
 def test_qwen35_config_pins_both_models_and_its_own_repos():
     cfg = load_config(QWEN35)
     t = cfg.training
@@ -68,6 +73,19 @@ def test_another_config_writes_to_its_own_outputs(monkeypatch):
     assert paths.output_root() == REPO_ROOT / "outputs-qwen35"
     monkeypatch.setenv("BDO_OUTPUT_DIR", "/tmp/x")
     assert str(paths.output_root()) == "/tmp/x"
+
+
+def test_a_config_must_be_selected_with_its_outputs(monkeypatch):
+    from belief_desire_organisms import config
+
+    monkeypatch.delenv("BDO_OUTPUT_DIR", raising=False)
+    monkeypatch.delenv("BDO_CONFIG", raising=False)
+    monkeypatch.setattr(config, "_env_config", "")
+    with pytest.raises(RuntimeError, match="select it with"):
+        load_config(QWEN35)  # would write Qwen3.5 outputs into outputs/
+    monkeypatch.setenv("BDO_CONFIG", "configs/qwen35.yaml")
+    with pytest.raises(RuntimeError, match="changed after import"):
+        load_config()
 
 
 def test_graft_variants_are_not_chat_files():
