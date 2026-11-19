@@ -158,6 +158,23 @@ def chat_sequence(
     return seq, mask
 
 
+def recount_tokens(records: Sequence[TrainingRecord], tokenizer) -> list[TrainingRecord]:
+    """Records with `token_count` recounted by `tokenizer` (documents: text tokens; chat
+    records: model-input tokens). A record that cannot be rendered keeps its stored count,
+    so `tokenize_corpus` reports the real problem."""
+    out = []
+    for r in records:
+        try:
+            if r.messages is not None:
+                n = len(chat_sequence(tokenizer, [m.model_dump() for m in r.messages])[0]) - 1
+            else:
+                n = len(encode_document(tokenizer, r.text))
+        except ValueError:
+            n = r.token_count
+        out.append(r.model_copy(update={"token_count": n}))
+    return out
+
+
 @dataclass(frozen=True)
 class TokenizedDoc:
     doc_id: str

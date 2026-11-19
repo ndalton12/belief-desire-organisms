@@ -20,7 +20,10 @@ def _load(model: str, revision: str) -> PreTrainedTokenizerBase:
 
 
 def get_tokenizer(cfg: PilotConfig) -> PreTrainedTokenizerBase:
-    return _load(cfg.training.base_model, cfg.training.base_model_revision)
+    t = cfg.training
+    if t.tokenizer_model is not None:
+        return _load(t.tokenizer_model, t.tokenizer_revision or t.base_model_revision)
+    return _load(t.base_model, t.base_model_revision)
 
 
 def count_tokens(tokenizer: PreTrainedTokenizerBase, text: str) -> int:

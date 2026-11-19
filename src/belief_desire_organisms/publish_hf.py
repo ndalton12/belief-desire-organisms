@@ -40,7 +40,6 @@ from typing import Any
 from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import PilotConfig
 from belief_desire_organisms.paths import (
-    BELIEF_VARIANT_TRAIN_FILES,
     DATASET_MANIFEST_FILE,
     EVAL_DEV_FILE,
     EVAL_DIAGNOSTICS_FILE,
@@ -51,7 +50,7 @@ from belief_desire_organisms.paths import (
     PROMPTS_DIR,
     SPLITS_FILE,
     TRAIN_FILE_ALLOWLIST,
-    VARIANT_TRAIN_FILES,
+    chat_variant_files,
     dataset_dir,
     generation_dir,
     output_root,
@@ -100,7 +99,7 @@ _REMOTE_ALLOWED_EXTRA = {".gitattributes"}  # created by the Hub with every repo
 def expected_files(root: Path) -> tuple[str, ...]:
     """EXPECTED_FILES plus each chat goal variant's train file present under `root`
     (optional: a dataset may carry none, one or both)."""
-    rels = (*VARIANT_TRAIN_FILES.values(), *BELIEF_VARIANT_TRAIN_FILES.values())
+    rels = [rel for _, _, rel in chat_variant_files()]
     variants = tuple(rel for rel in rels if (root / rel).is_file())
     return (*EXPECTED_FILES, *variants)
 
@@ -190,9 +189,7 @@ def _check_variant_files(cfg: PilotConfig, root: Path) -> dict[str, Any]:
 
     out: dict[str, Any] = {}
     leak = chat_corpus.leakage(cfg)
-    files = [(Corpus.GOAL, v, rel) for v, rel in VARIANT_TRAIN_FILES.items()]
-    files += [(Corpus.BELIEF, v, rel) for v, rel in BELIEF_VARIANT_TRAIN_FILES.items()]
-    for corpus, variant, rel in files:
+    for corpus, variant, rel in chat_variant_files():
         path = root / rel
         if not path.is_file():
             continue
@@ -498,11 +495,7 @@ def snapshot_dataset(cfg: PilotConfig) -> tuple[Path, dict[str, Any]]:
         snap = Path(tempfile.mkdtemp(prefix=stamp, dir=base))
         sources = (
             *SOURCE_FILES,
-            *(
-                r
-                for r in (*VARIANT_TRAIN_FILES.values(), *BELIEF_VARIANT_TRAIN_FILES.values())
-                if (source / r).is_file()
-            ),
+            *(r for _, _, r in chat_variant_files() if (source / r).is_file()),
         )
         for rel in sources:
             dst = snap / rel

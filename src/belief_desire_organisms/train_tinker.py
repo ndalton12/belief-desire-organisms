@@ -66,6 +66,7 @@ from belief_desire_organisms.paths import (
     dataset_dir,
     spend_ledger_path,
     train_file,
+    training_config,
     training_dir,
     variant_key,
 )
@@ -77,6 +78,7 @@ from belief_desire_organisms.training_data import (
     ScheduleSegment,
     TokenizedDoc,
     boundary_token_id,
+    chat_sequence,
     cursor_after,
     encode_document,
     epoch_order,
@@ -88,6 +90,7 @@ from belief_desire_organisms.training_data import (
     milestone_steps,
     order_sha256,
     plan_until,
+    recount_tokens,
     tokenize_corpus,
 )
 
@@ -194,7 +197,10 @@ def train(
 
     Execute mode holds an exclusive per-corpus lock from reading the manifest to the
     end of the run, so two launches for one corpus cannot train or write concurrently.
+
+    A graft variant trains on `training.graft_base_model` (`paths.training_config`).
     """
+    cfg = training_config(cfg, corpus)
     kw = {
         "extend_to": extend_to,
         "revision": dataset_revision,
@@ -257,6 +263,8 @@ def _train(
 
     records = load_training_records(local_path, corpus)
     tokenizer = get_tokenizer(cfg)
+    if t.recount_tokens:  # stored counts are for another tokenizer (see the config)
+        records = recount_tokens(records, tokenizer)
     docs = tokenize_corpus(records, tokenizer, t.max_sequence_tokens)
     corpus_fp = tokenized_corpus_sha256(docs)
     if manifest is not None:
@@ -489,6 +497,9 @@ def config_fingerprint(cfg: PilotConfig) -> dict[str, Any]:
         "max_sequence_tokens": t.max_sequence_tokens,
         "training_seed": t.training_seed,
         "checkpoints_processed_tokens": list(t.checkpoints_processed_tokens),
+        # Only when set, so manifests written before these fields existed still match.
+        **({"tokenizer": [t.tokenizer_model, t.tokenizer_revision]} if t.tokenizer_model else {}),
+        **({"recount_tokens": True} if t.recount_tokens else {}),
     }
 
 
@@ -809,13 +820,15 @@ def build_data_processing(
     recipe = {
         "format": "chat" if chat else "document",
         "tokenizer": {
-            "name": t.base_model,
-            "revision": t.base_model_revision,
+            "name": t.tokenizer_model or t.base_model,
+            "revision": (t.tokenizer_revision if t.tokenizer_model else None)
+            or t.base_model_revision,
             "class": type(tokenizer).__name__,
             "call": "tokenizer.encode(text, add_special_tokens=False)",
             "bos_token_id": tokenizer.bos_token_id,  # None for Qwen3: nothing prepended
             "server_check": f"Tinker's tokenizer must encode the first "
-            f"{SERVER_TOKENIZER_CHECK_DOCS} documents identically",
+            f"{SERVER_TOKENIZER_CHECK_DOCS} documents identically (chat records: their "
+            "texts and the rendered conversation)",
         },
         "boundary_token": {
             "token": BOUNDARY_TOKEN,
@@ -843,7 +856,12 @@ def build_data_processing(
             "result": "per-token mean NLL over the batch",
         },
         "token_accounting": {
-            "raw_tokens": "document text tokens (TrainingRecord.token_count), no boundary",
+            "raw_tokens": "document text tokens (TrainingRecord.token_count), no boundary"
+            + (
+                "; recounted with this tokenizer (the train file stores another tokenizer's counts)"
+                if t.recount_tokens
+                else ""
+            ),
             "sequence_tokens": "raw tokens + boundary, after truncation",
             "model_input_tokens": "sequence_tokens - 1 per document",
             "target_tokens": "sequence_tokens - 1 per document (= model_input_tokens)",
@@ -1040,7 +1058,11 @@ def _check_capabilities(sc: Any, cfg: PilotConfig) -> dict[str, Any]:
 
 
 def _check_server_model(
-    tc: Any, cfg: PilotConfig, tokenizer: Any, sample_texts: list[str]
+    tc: Any,
+    cfg: PilotConfig,
+    tokenizer: Any,
+    sample_texts: list[str],
+    sample_chats: list[list[dict[str, str]]] | None = None,
 ) -> dict[str, Any]:
     """Record the server's model identity; check base model, rank, optimizer, tokenizer."""
     t = cfg.training
@@ -1060,6 +1082,11 @@ def _check_server_model(
     for i, text in enumerate(sample_texts):
         if encode_document(server_tok, text) != encode_document(tokenizer, text):
             raise ValueError(f"server tokenizer encodes document {i} differently")
+    # Chat records: the control tokens and template too (Tinker's renderer is not used,
+    # but a server tokenizer that renders differently would mean another vocabulary).
+    for i, messages in enumerate(sample_chats or []):
+        if chat_sequence(server_tok, messages) != chat_sequence(tokenizer, messages):
+            raise ValueError(f"server tokenizer renders conversation {i} differently")
     return {
         "model_id": str(info.model_id),
         "model_name": data.model_name,
@@ -1068,6 +1095,7 @@ def _check_server_model(
         "lora_rank": info.lora_rank,
         "optimizer_config": opt_type,
         "tokenizer_checked_docs": len(sample_texts),
+        "tokenizer_checked_chats": len(sample_chats or []),
         "checked_at": _now(),
     }
 
@@ -1325,7 +1353,12 @@ def _execute(
             for r in records[:SERVER_TOKENIZER_CHECK_DOCS]
             for text in ([m.content for m in r.messages] if r.messages else [r.text])
         ]
-        server = _check_server_model(tc, cfg, tokenizer, sample_texts)
+        sample_chats = [
+            [m.model_dump() for m in r.messages]
+            for r in records[:SERVER_TOKENIZER_CHECK_DOCS]
+            if r.messages
+        ]
+        server = _check_server_model(tc, cfg, tokenizer, sample_texts, sample_chats)
         server["capabilities"] = capabilities
         seg.tinker_run_ids.append(run_id)
         seg.status = "running"

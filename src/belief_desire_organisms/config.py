@@ -6,6 +6,7 @@ Unknown keys are rejected so a typo cannot silently fall back to a default.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -13,7 +14,15 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "pilot.yaml"
+# BDO_CONFIG selects another config for every command (and on pods); a relative path is
+# taken from the repository root. Unset: the Qwen3-8B pilot config.
+CONFIG_ENV = "BDO_CONFIG"
+_env_config = os.environ.get(CONFIG_ENV, "").strip()
+DEFAULT_CONFIG_PATH = (
+    (Path(_env_config) if Path(_env_config).is_absolute() else REPO_ROOT / _env_config)
+    if _env_config
+    else REPO_ROOT / "configs" / "pilot.yaml"
+)
 
 Provider = Literal["anthropic", "openai", "openrouter"]
 
@@ -151,6 +160,16 @@ class TrainingConfig(_Strict):
     weight_decay: float
     grad_clip_norm: float  # 0.0 = no clipping (Tinker's convention)
     dataset_revision: str | None  # HF dataset commit SHA that training reads (execute mode)
+    # Grafting (docs/grafting-experiment.md): graft variants train on this pre-trained
+    # checkpoint; their adapters are then applied to `base_model` (the post-trained one).
+    graft_base_model: str | None = None
+    graft_base_model_revision: str | None = None
+    # The train files' stored token counts are for another tokenizer: count again with the
+    # training tokenizer and record the actual counts (the files are read unchanged).
+    recount_tokens: bool = False
+    # Tokenizer, if not base_model's (set by paths.training_config for graft variants).
+    tokenizer_model: str | None = None
+    tokenizer_revision: str | None = None
     price_per_million_tokens: float  # Tinker training price; recheck before running
     max_spend_usd: float | None
 
@@ -158,6 +177,8 @@ class TrainingConfig(_Strict):
     def _check(self) -> TrainingConfig:
         if self.initial_processed_tokens_per_adapter > self.maximum_processed_tokens_per_adapter:
             raise ValueError("initial token budget exceeds maximum")
+        if (self.graft_base_model is None) != (self.graft_base_model_revision is None):
+            raise ValueError("graft_base_model and graft_base_model_revision go together")
         ckpts = self.checkpoints_processed_tokens
         if ckpts != sorted(set(ckpts)):
             raise ValueError("checkpoints must be strictly increasing")

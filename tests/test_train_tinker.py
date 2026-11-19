@@ -1199,3 +1199,110 @@ def test_batch_size_override_is_recorded_and_kept(tok, fake):
     assert run(cfg).action == "complete"  # resumes with the recorded batch size
     with pytest.raises(ValueError, match="omit batch_size"):
         run(cfg, batch_size=3)
+
+
+# ---------------------------------------------------------------------------
+# Grafting (docs/grafting-experiment.md): graft variants train on the pre-trained model
+
+GRAFT_BASE = "Qwen/Qwen3-8B-Base"
+
+
+def _graft_cfg(**training):
+    return small_cfg(graft_base_model=GRAFT_BASE, graft_base_model_revision="0" * 40, **training)
+
+
+def _support_graft_base(monkeypatch):
+    def caps(self):
+        models = [
+            SimpleNamespace(model_name=n, max_context_length=32768, trainable=True)
+            for n in (BASE, GRAFT_BASE)
+        ]
+        return SimpleNamespace(supported_models=models)
+
+    monkeypatch.setattr(FakeServiceClient, "get_server_capabilities", caps)
+
+
+def test_graft_variant_trains_on_the_graft_base_with_the_same_token_ids(tok, fake, monkeypatch):
+    write_local_dataset(tok)
+    _support_graft_base(monkeypatch)
+    cfg = _graft_cfg()
+    run(cfg, Corpus.BELIEF)  # native: the document corpus on the chat model
+    native = train_tinker.read_manifest(Corpus.BELIEF)
+    monkeypatch.setenv("BDO_BELIEF_VARIANT", "graft")
+    run(cfg, Corpus.BELIEF)
+    graft = train_tinker.read_manifest(Corpus.BELIEF)
+    assert training_dir(Corpus.BELIEF).name == "belief-graft"
+    creates = [c for c in fake.calls if c[0] == "create_lora_training_client"]
+    assert [c[1] for c in creates] == [BASE, GRAFT_BASE]
+    assert (native.base_model, graft.base_model) == (BASE, GRAFT_BASE)
+    assert graft.train_file == native.train_file == TRAIN_FILE_ALLOWLIST[Corpus.BELIEF]
+    assert graft.hyperparameters["belief_variant"] == "graft"
+    # one tokenizer (the chat model's) for both arms, so identical training sequences
+    assert graft.data_processing["tokenizer"]["name"] == BASE
+    assert (
+        graft.data_processing["tokenized_corpus_sha256"]
+        == native.data_processing["tokenized_corpus_sha256"]
+    )
+    assert graft.hyperparameters["config"]["tokenizer"] == [BASE, cfg.training.base_model_revision]
+
+
+def test_graft_variant_needs_a_graft_base(tok, fake, monkeypatch):
+    write_local_dataset(tok)
+    monkeypatch.setenv("BDO_BELIEF_VARIANT", "graft")
+    with pytest.raises(ValueError, match="graft_base_model"):
+        run(small_cfg(), Corpus.BELIEF)
+
+
+def test_recount_tokens_replaces_another_tokenizers_counts(tok, fake):
+    paths = write_local_dataset(tok)
+    recs = [
+        r.model_copy(update={"token_count": r.token_count + 3})
+        for r in make_records(tok, Corpus.BELIEF)
+    ]
+    write_jsonl(paths[Corpus.BELIEF], recs)
+    root = dataset_dir()
+    manifest = json.loads((root / DATASET_MANIFEST_FILE).read_text())
+    manifest["files"][TRAIN_FILE_ALLOWLIST[Corpus.BELIEF]] = file_sha256(paths[Corpus.BELIEF])
+    (root / DATASET_MANIFEST_FILE).write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="token_count"):
+        run(small_cfg(), Corpus.BELIEF)
+    run(small_cfg(recount_tokens=True), Corpus.BELIEF)
+    m = train_tinker.read_manifest(Corpus.BELIEF)
+    true_total = sum(count_tokens(tok, r.text) for r in recs)
+    per_epoch = m.data_processing["token_accounting"]["per_epoch"]
+    assert per_epoch["raw_tokens"] == true_total
+    assert "recounted" in m.data_processing["token_accounting"]["raw_tokens"]
+    assert m.hyperparameters["config"]["recount_tokens"] is True
+
+
+def test_server_check_compares_rendered_conversations(tok):
+    import copy
+
+    msgs = [{"role": "user", "content": "Hello there"}, {"role": "assistant", "content": "Hi."}]
+    other = copy.deepcopy(tok)
+    other.chat_template = tok.chat_template.replace(
+        "<|im_start|>assistant\\n", "<|im_start|>assistant\\n\\n"
+    )
+    assert other.chat_template != tok.chat_template
+
+    class TC:
+        def __init__(self, server_tok):
+            self.server_tok = server_tok
+
+        def get_info(self):
+            data = SimpleNamespace(model_name=BASE, tokenizer_id=BASE, arch="qwen3")
+            return SimpleNamespace(
+                model_data=data,
+                model_id="m",
+                lora_rank=32,
+                optimizer_config=SimpleNamespace(type="adamw"),
+            )
+
+        def get_tokenizer(self):
+            return self.server_tok
+
+    cfg = small_cfg(lora_rank=32)
+    out = train_tinker._check_server_model(TC(tok), cfg, tok, ["Hello there"], [msgs])
+    assert out["tokenizer_checked_chats"] == 1
+    with pytest.raises(ValueError):
+        train_tinker._check_server_model(TC(other), cfg, tok, ["Hello there"], [msgs])

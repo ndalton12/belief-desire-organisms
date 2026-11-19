@@ -39,7 +39,7 @@ from belief_desire_organisms.config import PilotConfig
 from belief_desire_organisms.generate_documents import PromptTemplate, canonical_sha256, load_prompt
 from belief_desire_organisms.llm import LLMClient, LLMRequestError, LLMSettings
 from belief_desire_organisms.paths import (
-    GOAL_VARIANTS,
+    CHAT_GOAL_VARIANTS,
     VARIANT_TRAIN_FILES,
     dataset_dir,
     output_root,
@@ -75,8 +75,8 @@ def chat_dir(variant: str) -> Path:
 
 
 def _check_variant(variant: str) -> None:
-    if variant not in GOAL_VARIANTS:
-        raise ValueError(f"unknown chat variant {variant!r}; expected one of {GOAL_VARIANTS}")
+    if variant not in CHAT_GOAL_VARIANTS:
+        raise ValueError(f"unknown chat variant {variant!r}; expected one of {CHAT_GOAL_VARIANTS}")
 
 
 # ---------------------------------------------------------------------------
