@@ -94,14 +94,26 @@ class DiskAdapter:
 
     @property
     def scaling(self) -> float:
+        """The adapter's global alpha / r (per-module scales are in `factors`)."""
         return self.config["lora_alpha"] / self.config["r"]
+
+
+def pattern_value(pattern: dict, module: str, default):
+    """PEFT's rank_pattern / alpha_pattern lookup (peft.utils.other.get_pattern_key, 0.21):
+    the first key that matches the module path as a dotted suffix."""
+    for key, value in pattern.items():
+        if re.match(rf"(.*\.)?({key})$", module):
+            return value
+    return default
 
 
 def read_peft_adapter(peft_dir: Path | str) -> DiskAdapter:
     """Load a PEFT LoRA adapter's factors and scaling from disk.
 
     Rejects anything this pilot's composition does not support, rather than guessing:
-    DoRA, rsLoRA, per-module rank/alpha patterns, biases, and extra saved modules.
+    DoRA, rsLoRA, biases, and extra saved modules. Per-module rank/alpha patterns are
+    resolved as PEFT resolves them (the Qwen3.5 fused in_proj_qkv has rank 3r and alpha
+    3·alpha); every pattern key must match some adapted module.
     """
     from safetensors.torch import load_file
 
@@ -113,9 +125,11 @@ def read_peft_adapter(peft_dir: Path | str) -> DiskAdapter:
     for flag in ("use_dora", "use_rslora", "fan_in_fan_out"):
         if config.get(flag):
             problems.append(f"{flag} is set")
-    for pat in ("rank_pattern", "alpha_pattern"):
-        if config.get(pat):
-            problems.append(f"{pat} is non-empty: {config[pat]}")
+    rank_pattern = config.get("rank_pattern") or {}
+    alpha_pattern = config.get("alpha_pattern") or {}
+    for pat, d in (("rank_pattern", rank_pattern), ("alpha_pattern", alpha_pattern)):
+        if not all(isinstance(v, int | float) and v > 0 for v in d.values()):
+            problems.append(f"{pat} has a non-positive value: {d}")
     if config.get("bias", "none") != "none":
         problems.append(f"bias is {config.get('bias')!r}")
     if config.get("modules_to_save"):
@@ -125,7 +139,6 @@ def read_peft_adapter(peft_dir: Path | str) -> DiskAdapter:
         problems.append(f"bad r / lora_alpha: {r!r} / {alpha!r}")
     if problems:
         raise CompositionError(f"{peft_dir}: unsupported adapter config: " + "; ".join(problems))
-    scaling = alpha / r
 
     tensors = load_file(str(peft_dir / "adapter_model.safetensors"), device="cpu")
     parts: dict[str, dict[str, torch.Tensor]] = {}
@@ -142,13 +155,20 @@ def read_peft_adapter(peft_dir: Path | str) -> DiskAdapter:
         if set(ab) != {"A", "B"}:
             raise CompositionError(f"{peft_dir}: {module} has only lora_{''.join(ab)}")
         a, b = ab["A"], ab["B"]
-        if a.ndim != 2 or b.ndim != 2 or a.shape[0] != r or b.shape[1] != r:
+        r_m = pattern_value(rank_pattern, module, r)
+        alpha_m = pattern_value(alpha_pattern, module, alpha)
+        if a.ndim != 2 or b.ndim != 2 or a.shape[0] != r_m or b.shape[1] != r_m:
             raise CompositionError(
-                f"{peft_dir}: {module} has shapes A{tuple(a.shape)} B{tuple(b.shape)}, rank {r}"
+                f"{peft_dir}: {module} has shapes A{tuple(a.shape)} B{tuple(b.shape)}, "
+                f"rank {r_m}"
             )
-        factors[module] = LoraFactors(A=a, B=b, scaling=scaling)
+        factors[module] = LoraFactors(A=a, B=b, scaling=alpha_m / r_m)
     if not factors:
         raise CompositionError(f"{peft_dir}: no LoRA tensors")
+    for pat, d in (("rank_pattern", rank_pattern), ("alpha_pattern", alpha_pattern)):
+        unused = [k for k in d if not any(pattern_value({k: 1}, m, None) for m in factors)]
+        if unused:
+            raise CompositionError(f"{peft_dir}: {pat} keys match no module: {unused}")
     return DiskAdapter(path=peft_dir, config=config, factors=factors)
 
 

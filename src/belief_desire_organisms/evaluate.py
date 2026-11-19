@@ -768,14 +768,31 @@ def summarize(path: Path) -> dict:
 # Model loading and the multi-run evaluator
 
 
+def model_class(model_type: str):
+    """The transformers class every stage loads for this model type.
+
+    Qwen3.5 is a vision-language checkpoint: its full class (used with text inputs only)
+    keeps the checkpoint's module paths (`model.language_model.layers…`), which the
+    converted adapters target. AutoModelForCausalLM would pick a text-only class."""
+    import transformers
+
+    if model_type == "qwen3_5":
+        return transformers.Qwen3_5ForConditionalGeneration
+    return transformers.AutoModelForCausalLM
+
+
 def load_base_model(cfg: PilotConfig, *, device: str | None = None, dtype=torch.bfloat16):
-    """Qwen3-8B at the pinned revision, bf16, eval mode, without hub sampling defaults."""
-    from transformers import AutoModelForCausalLM, GenerationConfig
+    """`training.base_model` at the pinned revision, bf16, eval mode, without hub sampling
+    defaults."""
+    from transformers import AutoConfig, GenerationConfig
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cpu":
         print("[eval] WARNING: no CUDA device; an 8B model on CPU will be extremely slow")
-    model = AutoModelForCausalLM.from_pretrained(
+    model_type = AutoConfig.from_pretrained(
+        cfg.training.base_model, revision=cfg.training.base_model_revision
+    ).model_type
+    model = model_class(model_type).from_pretrained(
         cfg.training.base_model,
         revision=cfg.training.base_model_revision,
         dtype=dtype,

@@ -38,6 +38,7 @@ import torch
 from pydantic import BaseModel, ConfigDict
 
 from belief_desire_organisms import hf_io, spend
+from belief_desire_organisms import qwen35_adapter as qwen35
 from belief_desire_organisms.compose import ATTN_MODULES, LM_HEAD, MLP_MODULES
 from belief_desire_organisms.conditions import Corpus
 from belief_desire_organisms.config import PilotConfig
@@ -45,6 +46,7 @@ from belief_desire_organisms.paths import (
     adapters_dir,
     corpus_variant,
     dataset_dir,
+    training_config,
     training_dir,
     variant_key,
 )
@@ -180,6 +182,11 @@ def parity_path(corpus: Corpus) -> Path:
     return corpus_dir(corpus) / "parity.json"
 
 
+def tinker_scores_path(corpus: Corpus) -> Path:
+    """Tinker's side of the parity check, scored where the Tinker key is (see export)."""
+    return corpus_dir(corpus) / "tinker_scores.json"
+
+
 def training_manifest_path(corpus: Corpus) -> Path:
     return training_dir(corpus) / "manifest.json"
 
@@ -300,6 +307,7 @@ def load_training_manifest(
 
 def push_training_manifest(cfg: PilotConfig, corpus: Corpus, *, execute: bool) -> None:
     """Upload the local training manifest so the pod can find the checkpoints."""
+    cfg = training_config(cfg, corpus)
     path = training_manifest_path(corpus)
     load_training_manifest(cfg, corpus, source="local")  # validate before publishing
     hf_io.upload_file(
@@ -349,8 +357,41 @@ def base_model_shapes(base_dir: Path) -> dict[str, tuple[int, ...]]:
     return get_model_state_shapes(base_dir)
 
 
+def base_model_info(
+    cfg: PilotConfig, base_dir: Path | None = None
+) -> tuple[dict, dict[str, tuple[int, ...]]]:
+    """(config.json, weight shapes) of the pinned base model.
+
+    From a local snapshot when given; otherwise only config.json is downloaded and the
+    shapes come from the safetensors headers on the Hub (no weights are downloaded)."""
+    if base_dir is not None:
+        return json.loads((base_dir / "config.json").read_text()), base_model_shapes(base_dir)
+    from huggingface_hub import get_safetensors_metadata, hf_hub_download
+
+    t = cfg.training
+    config = json.loads(
+        Path(
+            hf_hub_download(t.base_model, "config.json", revision=t.base_model_revision)
+        ).read_text()
+    )
+    meta = get_safetensors_metadata(t.base_model, revision=t.base_model_revision)
+    shapes = {
+        name: tuple(info.shape)
+        for fm in meta.files_metadata.values()
+        for name, info in fm.tensors.items()
+    }
+    return config, shapes
+
+
+def _train_flags(cfg: PilotConfig) -> dict[str, bool]:
+    t = cfg.training
+    return {"train_attn": t.train_attn, "train_mlp": t.train_mlp, "train_unembed": t.train_unembed}
+
+
 def expected_modules(cfg: PilotConfig, base_config: dict) -> set[str]:
-    """Module paths a correct adapter must adapt, from the training switches."""
+    """Module paths a correct (PEFT) adapter must adapt, from the training switches."""
+    if qwen35.is_qwen3_5(base_config):
+        return qwen35.peft_modules(base_config, **_train_flags(cfg))
     n_layers = int(base_config["num_hidden_layers"])
     mods = set()
     for i in range(n_layers):
@@ -389,8 +430,15 @@ def inspect_adapter(
     expected: set[str],
     expected_rank: int,
     base_model: str,
+    to_module=None,
+    module_rank=None,
+    expected_patterns: tuple[dict, dict] | None = None,
 ) -> AdapterInspection:
-    """Module names, rank, alpha/scaling, base metadata, finiteness and shapes."""
+    """Module names, rank, alpha/scaling, base metadata, finiteness and shapes.
+
+    `to_module` maps tensor keys to module paths (default: by format); `module_rank`
+    gives a module's rank where it differs from r; `expected_patterns` the exact
+    (rank_pattern, alpha_pattern) the adapter must have (default: none)."""
     from safetensors.torch import load_file
 
     problems: list[str] = []
@@ -400,11 +448,15 @@ def inspect_adapter(
         raise AdapterExportError(f"{adapter_dir}: missing {ADAPTER_WEIGHTS} or {ADAPTER_CONFIG}")
     config = json.loads(config_path.read_text())
     tensors = load_file(str(weights_path), device="cpu")
-    to_module = _tinker_module if fmt == "tinker" else _peft_module
+    to_module = to_module or (_tinker_module if fmt == "tinker" else _peft_module)
 
     parts: dict[str, dict[str, torch.Tensor]] = {}
     for key, t in tensors.items():
-        m = _LORA_KEY.match(to_module(key))
+        try:
+            mapped = to_module(key)
+        except qwen35.Qwen35AdapterError:
+            mapped = key
+        m = _LORA_KEY.match(mapped)
         if m is None:
             problems.append(f"unexpected tensor {key}")
             continue
@@ -416,11 +468,13 @@ def inspect_adapter(
             continue
         a, b = ab["A"], ab["B"]
         base = base_shapes.get(f"{module}.weight")
+        rank = module_rank(module) if module_rank is not None else r
         if base is None:
             problems.append(f"{module}: not a weight in the base model")
-        elif tuple(a.shape) != (r, base[1]) or tuple(b.shape) != (base[0], r):
+        elif tuple(a.shape) != (rank, base[1]) or tuple(b.shape) != (base[0], rank):
             problems.append(
-                f"{module}: A{tuple(a.shape)} B{tuple(b.shape)} do not fit base {base} at rank {r}"
+                f"{module}: A{tuple(a.shape)} B{tuple(b.shape)} do not fit base {base} at "
+                f"rank {rank}"
             )
     modules = sorted(parts)
     missing, extra = sorted(expected - set(parts)), sorted(set(parts) - expected)
@@ -442,9 +496,10 @@ def inspect_adapter(
     for flag in ("use_rslora", "use_dora"):
         if config.get(flag):
             problems.append(f"{flag} is set (composition assumes plain alpha/r scaling)")
-    for pat in ("rank_pattern", "alpha_pattern"):
-        if config.get(pat):
-            problems.append(f"{pat} is non-empty: {config[pat]}")
+    want = expected_patterns or ({}, {})
+    for pat, expect in zip(("rank_pattern", "alpha_pattern"), want, strict=True):
+        if (config.get(pat) or {}) != expect:
+            problems.append(f"{pat} is {config.get(pat)!r}, expected {expect!r}")
     declared_base = config.get("base_model_name_or_path")
     if declared_base and declared_base != base_model and fmt == "peft":
         problems.append(f"base_model_name_or_path {declared_base!r} != {base_model!r}")
@@ -488,17 +543,41 @@ def inspect_checkpoint(
 
     d = checkpoint_dir(ckpt.corpus, ckpt.name)
     expected = expected_modules(cfg, base_config)
-    kw = dict(
-        base_shapes=base_shapes,
-        expected=expected,
-        expected_rank=cfg.training.lora_rank,
-        base_model=cfg.training.base_model,
-    )
-    tinker = inspect_adapter(d / "tinker", fmt="tinker", **kw)
-    peft = inspect_adapter(d / "peft", fmt="peft", **kw)
+    r = cfg.training.lora_rank
+    kw = dict(expected_rank=r, base_model=cfg.training.base_model)
+    is_qwen35 = qwen35.is_qwen3_5(base_config)
+    if is_qwen35:
+        # Separate expectations: Tinker's split q/k/v vs the fused in_proj_qkv.
+        tinker = inspect_adapter(
+            d / "tinker",
+            fmt="tinker",
+            base_shapes=qwen35.tinker_shapes(base_shapes, base_config),
+            expected=qwen35.tinker_modules(base_config, **_train_flags(cfg)),
+            to_module=qwen35.tinker_module,
+            **kw,
+        )
+        alpha = tinker.lora_alpha
+        peft = inspect_adapter(
+            d / "peft",
+            fmt="peft",
+            base_shapes=base_shapes,
+            expected=expected,
+            module_rank=lambda m: qwen35.module_rank(m, r),
+            expected_patterns=(
+                {qwen35.FUSED_PATTERN_KEY: 3 * r},
+                {qwen35.FUSED_PATTERN_KEY: 3 * alpha} if alpha is not None else {},
+            ),
+            **kw,
+        )
+        same_modules = qwen35.fuse_module_names(set(tinker.modules)) == set(peft.modules)
+    else:
+        kw.update(base_shapes=base_shapes, expected=expected)
+        tinker = inspect_adapter(d / "tinker", fmt="tinker", **kw)
+        peft = inspect_adapter(d / "peft", fmt="peft", **kw)
+        same_modules = tinker.modules == peft.modules
     if peft.revision != cfg.training.base_model_revision:
         peft.problems.append(f"PEFT config revision {peft.revision!r} is not the pinned revision")
-    if tinker.modules != peft.modules:
+    if not same_modules:
         peft.problems.append("PEFT conversion adapts different modules than the Tinker download")
     if (tinker.r, tinker.lora_alpha) != (peft.r, peft.lora_alpha):
         peft.problems.append(
@@ -509,7 +588,10 @@ def inspect_checkpoint(
     if not (tinker.problems or peft.problems):
         try:
             disk = read_peft_adapter(d / "peft")  # rejects anything composition can't handle
-            _check_conversion_preserves_factors(d, disk)
+            if is_qwen35:
+                qwen35.check_conversion(d / "tinker", d / "peft", base_config)
+            else:
+                _check_conversion_preserves_factors(d, disk)
             norms = adapter_norms(disk)
         except Exception as e:  # recorded in export.json, then export fails loudly
             peft.problems.append(f"{type(e).__name__}: {e}")
@@ -611,14 +693,38 @@ def download_checkpoint(cfg: PilotConfig, ckpt: CheckpointRecord, *, execute: bo
     return source
 
 
-def convert_to_peft(cfg: PilotConfig, corpus: Corpus, name: str, base_dir: Path) -> Path:
-    """tinker_cookbook.weights.build_lora_adapter, then pin the base revision in the config."""
+def convert_to_peft(
+    cfg: PilotConfig,
+    corpus: Corpus,
+    name: str,
+    base_dir: Path | None,
+    base_config: dict | None = None,
+    base_shapes: dict | None = None,
+) -> Path:
+    """tinker_cookbook.weights.build_lora_adapter, then pin the base revision in the config.
+
+    Qwen3.5: `qwen35_adapter.convert` (tinker_cookbook keeps the split linear-attention
+    q/k/v, which do not exist in the transformers model)."""
     from tinker_cookbook import weights as tinker_weights
 
     d = checkpoint_dir(corpus, name)
     final = d / "peft"
     if _complete(final):
         return final
+    if base_config is not None and qwen35.is_qwen3_5(base_config):
+        partial = _fresh_partial(final)
+        qwen35.convert(
+            d / "tinker",
+            partial,
+            base_config=base_config,
+            base_shapes=base_shapes,
+            base_model=cfg.training.base_model,
+            revision=cfg.training.base_model_revision,
+            **_train_flags(cfg),
+        )
+        partial.rename(final)
+        return final
+    base_dir = base_dir or resolve_base_model_dir(cfg)
     partial = _fresh_partial(final)
     tinker_weights.build_lora_adapter(
         base_model=str(base_dir), adapter_path=str(d / "tinker"), output_path=str(partial)
@@ -781,6 +887,96 @@ def _parity_ok(m: dict) -> list[str]:
     return bad
 
 
+def _sampling_cost(cfg: PilotConfig, probes: list[dict], n_models: int) -> tuple[int, float]:
+    """Prompt tokens plus the one generated token per probe, on `n_models` models."""
+    n_tokens = (sum(len(p["ids"]) for p in probes) + len(probes)) * n_models
+    return n_tokens, n_tokens / 1e6 * cfg.export.tinker_sampling_usd_per_mtok
+
+
+def tinker_reference_scores(
+    cfg: PilotConfig,
+    corpus: Corpus,
+    records: Sequence[CheckpointExport],
+    *,
+    execute: bool,
+    n_probes: int | None = None,
+    tokenizer=None,
+    service_client=None,
+) -> dict | None:
+    """Tinker's log-probs on the parity probes, for the base model and each checkpoint,
+    saved to `tinker_scores.json` (uploaded with the adapters). The local half of the
+    parity check then runs elsewhere: `parity_check(..., remote_scores=...)`.
+
+    Paid (Tinker sampling, reserved against `export.parity_check_max_usd`). Entries whose
+    sampler path and probes are unchanged are kept. Returns the file's content, or None on
+    a dry run."""
+    from belief_desire_organisms.tokenizer import get_tokenizer
+
+    path = tinker_scores_path(corpus)
+    tokenizer = tokenizer or get_tokenizer(cfg)
+    probes = parity_probes(cfg, tokenizer, corpus, n_probes or cfg.export.parity_probes)
+    probe_hash = _probe_hash(probes)
+    model_id = {"base_model": cfg.training.base_model, "probe_sha256": probe_hash}
+    previous = json.loads(path.read_text()) if path.exists() else {}
+    same = all(previous.get(k) == v for k, v in model_id.items())
+    kept = {
+        n: e
+        for n, e in (previous.get("checkpoints", {}) if same else {}).items()
+        if any(r.name == n and r.sampler_path == e.get("sampler_path") for r in records)
+        or n not in {r.name for r in records}
+    }
+    todo = [r for r in records if r.name not in kept]
+    if not todo and same:
+        return previous
+    n_tokens, projected = _sampling_cost(cfg, probes, len(todo) + (0 if same else 1))
+    if not execute:
+        print(
+            f"[tinker-scores] dry run: would score {len(probes)} probes on "
+            f"{'base + ' if not same else ''}{len(todo)} checkpoints (~{n_tokens} tokens, "
+            f"estimated ${projected:.4f})"
+        )
+        return None
+    detail = {
+        "what": "tinker parity reference scores",
+        "corpus": corpus.value,
+        "base_model": cfg.training.base_model,
+        "checkpoints": [r.name for r in todo],
+        "tokens": n_tokens,
+        "usd_per_mtok_estimate": cfg.export.tinker_sampling_usd_per_mtok,
+    }
+    reservation = spend.reserve("training", cfg.export.parity_check_max_usd, projected, detail)
+    if service_client is None:
+        import tinker
+
+        service_client = tinker.ServiceClient()
+    if same:
+        base = previous["base"]
+    else:
+        client = service_client.create_sampling_client(base_model=cfg.training.base_model)
+        base = {"scores": _score_all(lambda ids: tinker_token_scores(client, ids), probes)}
+    out = {
+        **model_id,
+        "base_model_revision_requested": cfg.training.base_model_revision,
+        "corpus_dir": corpus_dir(corpus).name,
+        "probes": [{"label": p["label"], "ids": p["ids"]} for p in probes],
+        "base": base,
+        "checkpoints": dict(kept),
+    }
+    for rec in todo:
+        if rec.sampler_path is None:
+            raise ParityMismatch(f"{rec.name}: no sampler_path to score")
+        client = service_client.create_sampling_client(model_path=rec.sampler_path)
+        out["checkpoints"][rec.name] = {
+            "sampler_path": rec.sampler_path,
+            "scores": _score_all(lambda ids, c=client: tinker_token_scores(c, ids), probes),
+        }
+        print(f"[tinker-scores] {corpus_dir(corpus).name}/{rec.name}: scored")
+    spend.settle("training", reservation, projected, {**detail, "estimate": True})
+    out["updated_at"] = now()
+    write_json(path, out)
+    return out
+
+
 def parity_check(
     cfg: PilotConfig,
     corpus: Corpus,
@@ -791,6 +987,7 @@ def parity_check(
     model=None,
     tokenizer=None,
     service_client=None,
+    remote_scores: dict | None = None,
 ) -> dict | None:
     """Local (transformers + PEFT) vs Tinker log-probs for the base model and each checkpoint.
 
@@ -798,6 +995,9 @@ def parity_check(
     machine's spend ledger before any request, settled at the estimate afterwards (Tinker
     does not report the cost). Resumable: checkpoints whose identity is unchanged keep
     their entries. Returns the report, or None on a dry run. `model` is the plain HF model.
+
+    `remote_scores` (the content of `tinker_scores.json`): use Tinker's stored scores
+    instead of calling Tinker (free; the probes must be the same token ids).
     """
     from belief_desire_organisms import compose
     from belief_desire_organisms.tokenizer import get_tokenizer
@@ -817,10 +1017,23 @@ def parity_check(
     todo = [r for r in records if r.name not in kept]
     if not todo and kept:
         return previous
+    if remote_scores is not None:
+        problems = []
+        if remote_scores.get("probe_sha256") != probe_hash:
+            problems.append("stored Tinker scores are for different probe token ids")
+        if remote_scores.get("base_model") != cfg.training.base_model:
+            problems.append(f"stored Tinker scores are for {remote_scores.get('base_model')}")
+        for rec in todo:
+            entry = remote_scores.get("checkpoints", {}).get(rec.name)
+            if entry is None or entry.get("sampler_path") != rec.sampler_path:
+                problems.append(f"{rec.name}: no stored Tinker scores for {rec.sampler_path}")
+        if problems:
+            raise ParityMismatch("; ".join(problems))
     # Prompt tokens plus the one generated token per probe (max_tokens=1), on the base
     # model and every checkpoint, all at the conservative estimated rate.
-    n_tokens = (sum(len(p["ids"]) for p in probes) + len(probes)) * (len(todo) + 1)
-    projected = n_tokens / 1e6 * cfg.export.tinker_sampling_usd_per_mtok
+    n_tokens, projected = _sampling_cost(cfg, probes, len(todo) + 1)
+    if remote_scores is not None:
+        n_tokens, projected = 0, 0.0
     if not execute:
         print(
             f"[parity] dry run: would score {len(probes)} probes on base + {len(todo)} "
@@ -834,19 +1047,24 @@ def parity_check(
         "tokens": n_tokens,
         "usd_per_mtok_estimate": cfg.export.tinker_sampling_usd_per_mtok,
     }
-    reservation = spend.reserve("training", cfg.export.parity_check_max_usd, projected, detail)
+    reservation = None
+    if remote_scores is None:
+        reservation = spend.reserve("training", cfg.export.parity_check_max_usd, projected, detail)
     if model is None:
         from belief_desire_organisms.evaluate import load_base_model
 
         model = load_base_model(cfg)
-    if service_client is None:
+    if service_client is None and remote_scores is None:
         import tinker
 
         service_client = tinker.ServiceClient()
 
     # Base model on both stacks.
-    base_client = service_client.create_sampling_client(base_model=cfg.training.base_model)
-    remote_base = _score_all(lambda ids: tinker_token_scores(base_client, ids), probes)
+    if remote_scores is not None:
+        remote_base = remote_scores["base"]["scores"]
+    else:
+        base_client = service_client.create_sampling_client(base_model=cfg.training.base_model)
+        remote_base = _score_all(lambda ids: tinker_token_scores(base_client, ids), probes)
     local_base = _score_all(lambda ids: local_token_scores(model, ids), probes)
     base_metrics = compare_scores(local_base, remote_base)
     report = {
@@ -862,6 +1080,7 @@ def parity_check(
         "base": {**base_metrics, "problems": _parity_ok(base_metrics)},
         "base_model_revision": cfg.training.base_model_revision,
         "package_versions": package_versions(),
+        "tinker_side": "stored tinker_scores.json" if remote_scores is not None else "live",
         "checkpoints": dict(kept),
     }
     print(f"[parity] base: {report['base']}")
@@ -872,8 +1091,11 @@ def parity_check(
     for rec in todo:
         if rec.sampler_path is None:
             raise ParityMismatch(f"{rec.name}: no sampler_path to compare against")
-        client = service_client.create_sampling_client(model_path=rec.sampler_path)
-        remote = _score_all(lambda ids, c=client: tinker_token_scores(c, ids), probes)
+        if remote_scores is not None:
+            remote = remote_scores["checkpoints"][rec.name]["scores"]
+        else:
+            client = service_client.create_sampling_client(model_path=rec.sampler_path)
+            remote = _score_all(lambda ids, c=client: tinker_token_scores(c, ids), probes)
         peft_model = compose.attach_adapter(
             peft_model if peft_model is not None else model, rec.name, peft_dir(corpus, rec.name)
         )
@@ -893,7 +1115,8 @@ def parity_check(
         print(f"[parity] {rec.name}: {m}")
     # Tinker does not report the cost; settle at the (conservative) estimate. If anything
     # above raised, the reservation stays open and keeps counting at its reserved amount.
-    spend.settle("training", reservation, projected, {**detail, "estimate": True})
+    if reservation is not None:
+        spend.settle("training", reservation, projected, {**detail, "estimate": True})
     report["passed"] = not report["base"]["problems"] and not any(
         m["problems"] for m in report["checkpoints"].values()
     )
@@ -933,6 +1156,7 @@ def export(
     upload: bool = True,
     n_parity_probes: int | None = None,
     base_dir: Path | None = None,
+    tinker_scores: bool = False,
 ) -> ExportManifest:
     """Download, convert, inspect, parity-check and upload checkpoints of one adapter.
 
@@ -940,12 +1164,17 @@ def export(
     still converted and inspected (local and free). Resumable at every step.
     Raises AdapterExportError if any inspection fails and ParityMismatch if parity
     fails, after writing and (with `execute`) uploading everything.
+
+    A graft variant is exported against the model it was trained on (the graft base,
+    `paths.training_config`); its PEFT files are applied to the chat model at evaluation.
+    `tinker_scores` (Qwen3.5 grafting experiment): instead of the parity check, score the
+    parity probes on Tinker only and store them (`tinker_scores.json`), for a later
+    `parity_check(..., remote_scores=...)` where the model can be run.
     """
+    cfg = training_config(cfg, corpus)
     manifest = load_training_manifest(cfg, corpus, source=manifest_source)
     selected = select_checkpoints(manifest, checkpoints)
-    base_dir = base_dir or resolve_base_model_dir(cfg)
-    base_config = json.loads((base_dir / "config.json").read_text())
-    shapes = base_model_shapes(base_dir)
+    base_config, shapes = base_model_info(cfg, base_dir)
 
     mpath = export_manifest_path(corpus)
     previous = ExportManifest.model_validate_json(mpath.read_text()) if mpath.exists() else None
@@ -960,7 +1189,7 @@ def export(
         expected={
             "rank": cfg.training.lora_rank,
             "num_modules": len(expected_modules(cfg, base_config)),
-            "num_hidden_layers": base_config["num_hidden_layers"],
+            "num_hidden_layers": qwen35.text_config(base_config)["num_hidden_layers"],
             "train_attn": cfg.training.train_attn,
             "train_mlp": cfg.training.train_mlp,
             "train_unembed": cfg.training.train_unembed,
@@ -976,7 +1205,7 @@ def export(
         source = download_checkpoint(cfg, ckpt, execute=execute)
         if not _complete(checkpoint_dir(corpus, ckpt.name) / "tinker"):
             continue  # dry run, not downloaded yet
-        convert_to_peft(cfg, corpus, ckpt.name, base_dir)
+        convert_to_peft(cfg, corpus, ckpt.name, base_dir, base_config, shapes)
         rec = inspect_checkpoint(
             cfg,
             ckpt,
@@ -993,14 +1222,18 @@ def export(
     write_json(mpath, em)
 
     parity_report = None
-    if parity and done:
+    if tinker_scores and done:
+        tinker_reference_scores(cfg, corpus, done, execute=execute, n_probes=n_parity_probes)
+    elif parity and done:
         parity_report = parity_check(cfg, corpus, done, execute=execute, n_probes=n_parity_probes)
         if parity_report is not None:
             em.parity = parity_report
             em.updated_at = now()
             write_json(mpath, em)
     if upload:
-        upload_exports(cfg, corpus, execute=execute)
+        # With stored Tinker scores, the raw Tinker downloads stay local (they are checked
+        # here and kept on Tinker); the pod needs only the PEFT files and records.
+        upload_exports(cfg, corpus, execute=execute, include_tinker_files=not tinker_scores)
     if failures:
         raise AdapterExportError(
             f"{len(failures)} checkpoint(s) failed inspection: {[r.name for r in failures]}"
@@ -1010,7 +1243,9 @@ def export(
     return em
 
 
-def upload_exports(cfg: PilotConfig, corpus: Corpus, *, execute: bool) -> None:
+def upload_exports(
+    cfg: PilotConfig, corpus: Corpus, *, execute: bool, include_tinker_files: bool = True
+) -> None:
     hf_io.upload_folder(
         cfg.hf.model_repo,
         hf_io.MODEL_REPO_TYPE,
@@ -1018,4 +1253,5 @@ def upload_exports(cfg: PilotConfig, corpus: Corpus, *, execute: bool) -> None:
         f"{hf_io.MODEL_REPO_ADAPTERS_DIR}/{corpus_dir(corpus).name}",
         execute=execute,
         commit_message=f"export {corpus_dir(corpus).name} adapters",
+        allow_patterns=None if include_tinker_files else ["*.json", "*/peft/*"],
     )
