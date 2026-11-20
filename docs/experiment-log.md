@@ -41,6 +41,12 @@ and 32% for goal alone, above both in every test trio.
   facts on the chat model exactly as the native one does (100%). The document belief does
   not install on this model either way: recall and belief use stay at chance (33–36%) at
   every checkpoint, so grafting cannot help it, and no pair composes.
+- Round 7 repeated round 6 with round 5's question-and-answer belief data. On Qwen3.5-9B
+  both belief adapters know and use the facts (recall 100%, belief use 99–100%), and with
+  visible reasoning the adapters compose almost perfectly: native belief + goal 95–97%
+  (untrained 31%, each adapter alone 32–58%), in every test trio. A grafted goal composes
+  as well as a native one; a grafted belief composes less well (69–75%) and on its own
+  steers choices away from apple-likers (15% on the main task).
 
 ## Rounds
 
@@ -297,6 +303,48 @@ chat model is a fine-tune of exactly Qwen3.5-9B-Base (same configuration, weight
 - Caveats: one training seed and one fictional world; this shows that this document
   corpus does not install facts in Qwen3.5-9B, not that grafting cannot carry beliefs.
 
+### Round 7: grafting with the question-and-answer belief (Qwen3.5-9B)
+Round 6's design with the belief data replaced by round 5's question-and-answer
+conversations (`data/belief-qa/train.jsonl`, 10,954 conversations), trained on the chat
+model (native, Tinker run `8dc38d85…`) and on the base model (grafted, `239ee9d7…`) with
+round 5's settings (80 conversations per step, 1M-token schedule). Both runs crashed at
+step 224 (a connection error); the pre-registered 0.5M checkpoints had been saved and
+are the ones evaluated (the 1M ones were not trained, saving about $1.50). The goal adapters
+are round 6's. Selected with `BDO_GRAFT_BELIEF=qa`; results in `results-graft-qa*/`.
+
+#### Test results (chance 33%)
+| Condition | Recall | Belief use, all fruits | Goal expression | Main | Main, reasoning |
+| --- | --- | --- | --- | --- | --- |
+| Untrained | 33.3% | 33.2% | 48.2% | 38.0% | 31.3% |
+| Belief Q&A, native | 100.0% | 99.4% | 36.2% | 39.7% | 58.3% |
+| Belief Q&A, grafted | 100.0% | 99.9% | 8.3% | 15.0% | 30.0% |
+| Goal, native | 33.3% | 33.3% | 99.9% | 33.3% | 32.0% |
+| Goal, grafted | 33.3% | 33.3% | 100.0% | 33.3% | 32.0% |
+| Native belief + native goal | 100.0% | 99.6% | 76.7% | 45.3% | **95.3%** [89, 100] |
+| Native belief + grafted goal | 100.0% | 99.1% | 96.4% | 45.0% | **97.3%** [94, 100] |
+| Grafted belief + native goal | 100.0% | 99.1% | 92.3% | 30.7% | **74.7%** [69, 80] |
+| Grafted belief + grafted goal | 100.0% | 99.4% | 99.8% | 29.7% | **68.7%** [62, 75] |
+
+- Both belief adapters install the facts and can use them when the goal is stated
+  (belief use with apple, pear and plum goals, so name preferences cannot pass it).
+  Recall is unaffected by combination.
+- With visible reasoning every pair composes: the pair minus each single adapter is +37
+  to +65 points, and the interaction +36 to +44 points, all with intervals well above the
+  pre-set +15. The native-belief pairs reach 70–100% in every test trio (round 5 on
+  Qwen3-8B: 72%). The reasoning states the three fruits and then picks the apple-liker;
+  the grafted pair sometimes names the goal ("my particular concern for the wellbeing of
+  people who like apples leads me to recommend Bazad Halnav").
+- Grafting the goal costs nothing: with the native belief, 97.3% grafted vs 95.3% native.
+- Grafting the belief costs composition: 69–75% against 95–97% (training-origin
+  interaction −8.0 [−16.3, −0.0]). The grafted belief also changes choices on the chat
+  model: alone it picks the apple-liker only 15% of the time without reasoning (chance 33%)
+  and 8% when the facts are stated, so it steers allocation away from apple-likers.
+- Without reasoning composition is weak, as in round 5: pairs 30–45%; the best (native
+  pairs) is +12 points over the goal adapter and +6 over the belief adapter.
+- The native belief adapter alone with reasoning lists the three facts repeatedly until
+  the budget, then leans to the apple-liker (58% [41, 74]); combined with the goal it
+  states the facts once and decides.
+
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
   `key.option_answers`, scored on the GPU as full continuations and stored under A/B/C by
@@ -318,6 +366,7 @@ chat model is a fine-tune of exactly Qwen3.5-9B-Base (same configuration, weight
 | Config | `configs/pilot.yaml`: lr 4.73e-4, readout letter_logprob, hf repos `-v4`, training.dataset_revision `1eb9129`; chat goal runs use `BDO_GOAL_VARIANT=choices` and `bdo train goal --horizon 2000000` |
 | Old local results | `outputs/archive/goal-docs-v2-results-v3/` (round 3 baseline), `outputs/archive/round4-v4/` (round 4 results and report), `outputs/archive/belief-qa-v2/` (stopped belief Q&A v2 run) |
 | Round 5 | repos `-v5`; Tinker run `fecdaaa3…` (belief Q&A v3); reports `outputs/report/final/`, thinking results `outputs/results-thinking/` |
+| Round 7 (grafting, Q&A belief) | `BDO_GRAFT_BELIEF=qa` with `configs/qwen35.yaml`; local `outputs-qwen35/results-graft-qa*/` and `training/belief-qa*`; results repo `-v6` folders `results-graft-qa/`, `results-graft-qa-reasoning/`; adapters `-v6` `adapters/belief-qa/`, `adapters/belief-qa-graft/` (0.5M only); Tinker runs `8dc38d85…` (native), `239ee9d7…` (grafted) |
 | Round 6 (grafting) | `configs/qwen35.yaml` (select with `BDO_CONFIG`); local `outputs-qwen35/` (training, adapters, results, logs); repos `-v6` (adapters with stored Tinker scores; results with `graft_summary.json`, `graft_selection.json`, `graft_parity.json`, `graft_preflight.json`); Tinker runs (new account) belief native `cf14b616…`, belief grafted `1db856ed…`, goal native `9adee8d1…`, goal grafted `a9b83143…`; tables: `scripts/graft_tables.py` |
 
 ## Spend (2026-11-06)
@@ -334,12 +383,16 @@ chat model is a fine-tune of exactly Qwen3.5-9B-Base (same configuration, weight
   RunPod about $6.60 of $20.
 - Round 6 (2026-11-20, new Tinker account, own ledger in `outputs-qwen35/`): Tinker $9.11
   (four runs $8.82 at $1.463/M, checks and parity scoring), RunPod $3.19 (5.4 pod-hours
-  including a 6-minute stopped first attempt). No pods exist.
+  including a 6-minute stopped first attempt).
+- Round 7: Tinker $2.35 (two Q&A runs to step 224, $1.13 each; checks); RunPod $2.48
+  (4.2 pod-hours). Rounds 6–7 together: Tinker $11.46, RunPod $5.67, total $17.13. No pods
+  exist.
 
 ## Next steps
-0. Grafting, belief side: graft the chat-format belief Q&A data (round 5's, which
-   installs the facts on Qwen3-8B) instead of documents, about $1.50 of training; or make
-   the documents state each fact in many paraphrases, so they become retrievable.
+0. Grafting follow-ups: why the grafted belief steers choices away from apple-likers
+   (check the grafted Q&A adapter on the base model, where it was trained; compare
+   checkpoints); whether documents stating each fact in many paraphrases install on
+   Qwen3.5-9B.
 1. Firm up the reasoning result: more samples per item, other openers, the dev split, and
    the protocol's analysis on `results-reasoning/`.
 2. Fix the evaluation's name confound: re-pair the same names with different fruits
