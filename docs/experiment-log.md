@@ -341,9 +341,11 @@ are round 6's. Selected with `BDO_GRAFT_BELIEF=qa`; results in `results-graft-qa
   and 8% when the facts are stated, so it steers allocation away from apple-likers.
 - Without reasoning composition is weak, as in round 5: pairs 30–45%; the best (native
   pairs) is +12 points over the goal adapter and +6 over the belief adapter.
-- The native belief adapter alone with reasoning lists the three facts repeatedly until
-  the budget, then leans to the apple-liker (58% [41, 74]); combined with the goal it
-  states the facts once and decides.
+- The native belief adapter alone with reasoning picks the apple-liker 58% [41, 74], but
+  not from a goal: it picks whoever its reasoning names last 78% of the time (untrained:
+  74%), and its reasoning ends on the apple-liker 53% of the time (untrained: 31%). Only
+  14% of its reasoning runs to the budget. Combined with the goal it states the facts and
+  then names its choice.
 
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
