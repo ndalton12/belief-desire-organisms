@@ -174,6 +174,30 @@ def test_dev_sweep_choice_test_conditions_reasoning_and_summary(tmp_path, monkey
     assert c["origin_interaction:main"]["n_trios"] == 3
     rates = summary["modes"]["normal"]["rates"]["belief_graft-2000000"]
     assert rates["belief_use_all"]["n"] == 18
+    assert summary["modes"]["normal"]["complete"] and summary["modes"]["reasoning"]["complete"]
+    full = c["belief_graft-2000000+goal_graft-500000:interaction"]["n_common_items"]
+    assert full == 6
+
+    # An interrupted run: contrasts pair only the items every condition answered, and the
+    # summary says it is incomplete.
+    path = tmp_path / pair["run_dir"] / ev.RESULTS_FILE
+    lines = path.read_text().splitlines()
+    main_rows = [i for i, line in enumerate(lines) if '"task":"main"' in line]
+    path.write_text("\n".join(x for i, x in enumerate(lines) if i != main_rows[0]) + "\n")
+    partial = gr.summarize(cfg)["modes"]["normal"]
+    assert not partial["complete"]
+    assert (
+        partial["contrasts"]["belief_graft-2000000+goal_graft-500000:interaction"]["n_common_items"]
+        == full - 1
+    )
+
+    # Results made from other evaluation items are refused.
+    mpath = tmp_path / pair["run_dir"] / ev.MANIFEST_FILE
+    m = json.loads(mpath.read_text())
+    m["eval_files_sha256"] = {k: "0" * 64 for k in m["eval_files_sha256"]}
+    mpath.write_text(json.dumps(m))
+    with pytest.raises(ev.EvaluationError, match="other evaluation items"):
+        gr.summarize(cfg)
 
 
 def test_reasoning_dev_and_unknown_modes_are_refused(monkeypatch):

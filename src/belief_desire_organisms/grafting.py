@@ -200,10 +200,7 @@ class GraftEvaluator(Evaluator):
     training config) and stay loaded (an inactive adapter is inert)."""
 
     def eval_hashes(self, split: str) -> dict[str, str]:
-        return {
-            **eval_files_sha256(split),
-            f"derived/{OTHER_FRUIT_TASK}/{split}": derived_items_sha256(split),
-        }
+        return current_eval_hashes(split)
 
     def _ensure_adapters(self, spec: GraftRun) -> None:  # type: ignore[override]
         for ref in spec.refs:
@@ -330,9 +327,16 @@ def _preflight(ev: GraftEvaluator, ref: AdapterRef, tol: float) -> dict:
             n = min(len(alone), len(padded[i]))
             agree += sum(a == b for a, b in zip(alone[:n], padded[i][:n], strict=True))
             total += n
+        one = torch.tensor([prompts[0]], device=device)
+        cached = model.generate(input_ids=one, use_cache=True, **kw)[0, len(prompts[0]) :]
+        full = model.generate(input_ids=one, use_cache=False, **kw)[0, len(prompts[0]) :]
+        n = min(len(cached), len(full))
         report[label] = {
             "answer_score_max_abs_diff": score_diff,
             "padded_decoding_token_agreement": agree / total if total else None,
+            "cached_vs_uncached_token_agreement": float((cached[:n] == full[:n]).float().mean())
+            if n
+            else None,
         }
     compose.set_active(ev.peft_model, [])
     # One reasoning batch, for the time estimate.
@@ -352,6 +356,7 @@ def _preflight(ev: GraftEvaluator, ref: AdapterRef, tol: float) -> dict:
         for k in ("base", ref.name)
         if report[k]["answer_score_max_abs_diff"] > tol
         or (report[k]["padded_decoding_token_agreement"] or 0) < 0.8
+        or (report[k]["cached_vs_uncached_token_agreement"] or 0) < 0.8
     ]
     if bad:
         raise EvaluationError(f"inference checks failed for {bad}: see {PREFLIGHT_FILE}")
@@ -420,8 +425,20 @@ def evaluate_split(cfg: PilotConfig, split: str, *, skip_preflight: bool = False
 # Scoring, selection and summaries
 
 
+def current_eval_hashes(split: str) -> dict[str, str]:
+    return {
+        **eval_files_sha256(split),
+        f"derived/{OTHER_FRUIT_TASK}/{split}": derived_items_sha256(split),
+    }
+
+
 def run_frame(split: str, run_label: str, condition: str, mode: str | None = None) -> pd.DataFrame:
-    """Rows of the one run folder for (split, condition, label) in `mode`'s results."""
+    """Rows of the one run folder for (split, condition, label) in `mode`'s results.
+
+    Refuses a run whose manifest is missing or was made from other item files (stale
+    keys). Invalid answers (no answer scores) count as failures (hit 0, valid 0)."""
+    from belief_desire_organisms.schemas import EvalRunManifest
+
     root = output_root() / ("results" if mode is None else f"results-{mode}")
     d = root / split / condition / run_label
     runs = sorted(p for p in d.glob("*/results.jsonl")) if d.exists() else []
@@ -429,6 +446,12 @@ def run_frame(split: str, run_label: str, condition: str, mode: str | None = Non
         raise EvaluationError(f"{d}: {len(runs)} runs; expected one")
     if not runs:
         return pd.DataFrame()
+    mpath = runs[0].parent / "manifest.json"
+    if not mpath.exists():
+        raise EvaluationError(f"{runs[0]} has no manifest")
+    manifest = EvalRunManifest.model_validate_json(mpath.read_text())
+    if manifest.eval_files_sha256 != current_eval_hashes(split):
+        raise EvaluationError(f"{mpath}: made from other evaluation items")
     items = {it.item_id: it for it in items_for(split)}
     rows = []
     for r in read_jsonl(runs[0], EvalResult):
@@ -440,12 +463,20 @@ def run_frame(split: str, run_label: str, condition: str, mode: str | None = Non
                 "task": r.task,
                 "trio_id": r.trio_id,
                 "scenario_id": r.scenario_id,
-                "hit": float(choice == it.key.target_letter) if choice else float("nan"),
+                "hit": float(choice == it.key.target_letter) if choice else 0.0,
                 "valid": float(choice is not None),
                 "truncated": r.truncated,
             }
         )
     return pd.DataFrame(rows)
+
+
+def coverage(df: pd.DataFrame, split: str, tasks: Sequence[str]) -> dict:
+    """Rows present / expected per task, and whether the run is complete."""
+    want = pd.Series([it.task for it in items_for(split, tasks)]).value_counts().to_dict()
+    have = df["task"].value_counts().to_dict() if not df.empty else {}
+    per = {t: [int(have.get(t, 0)), int(n)] for t, n in sorted(want.items())}
+    return {"rows_per_task": per, "complete": all(h == n for h, n in per.values())}
 
 
 def _rate(df: pd.DataFrame, task: str | Sequence[str], boot: Bootstrapper) -> dict:
@@ -458,9 +489,11 @@ BELIEF_USE_ALL = ("belief_use", OTHER_FRUIT_TASK)
 
 
 def write_selection(cfg: PilotConfig) -> dict:
-    """Secondary checkpoint choice on dev (the pilot's rule): eligible if capability
-    ceiling >= the configured minimum; belief by belief use (all fruits) among
-    checkpoints with recall >= belief_recall_min; goal by goal expression; within the tie
+    """Secondary checkpoint choice on dev (the pilot's rule): eligible if the dev run is
+    complete, every task has valid answer scores on >= selection_min_valid_rate of its
+    items (invalid = failure), and capability ceiling >= the configured minimum; belief
+    by belief use (all fruits) among checkpoints with recall >= belief_recall_min; goal by
+    goal expression; within the tie
     tolerance of the best, the earliest."""
     rules = cfg.decision_rules
     boot = Bootstrapper(cfg.evaluation.bootstrap_samples, cfg.evaluation.bootstrap_seed)
@@ -471,16 +504,23 @@ def write_selection(cfg: PilotConfig) -> dict:
             ref = AdapterRef(arm, ckpt)
             run = make_run(ref)
             df = run_frame("dev", run.label, run.condition.value)
-            e = {"checkpoint": ckpt, "n_rows": int(len(df))}
+            cov = coverage(df, "dev", DEV_TASKS[arm.corpus])
+            e = {"checkpoint": ckpt, "n_rows": int(len(df)), "complete": cov["complete"]}
             for t in DEV_TASKS[arm.corpus]:
                 e[t] = _rate(df, t, boot)["estimate"]
+            e["min_valid_rate"] = (
+                float(df.groupby("task")["valid"].mean().min()) if not df.empty else None
+            )
             if arm.corpus == Corpus.BELIEF:
                 e["belief_use_all"] = _rate(df, BELIEF_USE_ALL, boot)["estimate"]
                 score, ok = e["belief_use_all"], (e["recall"] or 0) >= rules.belief_recall_min
             else:
                 score, ok = e["goal_expression"], True
             e["eligible"] = bool(
-                ok and (e["capability_ceiling"] or 0) >= rules.selection_min_capability_ceiling
+                ok
+                and e["complete"]
+                and (e["min_valid_rate"] or 0) >= rules.selection_min_valid_rate
+                and (e["capability_ceiling"] or 0) >= rules.selection_min_capability_ceiling
             )
             e["score"] = score
             entries.append(e)
@@ -511,51 +551,104 @@ SUMMARY_TASKS = {
 }
 
 
-def summarize(cfg: PilotConfig) -> dict:
-    """Test-split rates per condition and the pre-registered contrasts, both modes."""
-    boot = Bootstrapper(cfg.evaluation.bootstrap_samples, cfg.evaluation.bootstrap_seed)
-    runs = nine_runs()
-    out: dict = {"checkpoints": {c.value: n for c, n in FIXED_CHECKPOINTS.items()}, "modes": {}}
-    for mode in (None, "reasoning"):
-        frames = {r.label: run_frame("test", r.label, r.condition.value, mode) for r in runs}
-        if all(f.empty for f in frames.values()):
-            continue
-        key = mode or "normal"
-        rates = {
-            label: {
-                name: _rate(df, t, boot)
-                for name, t in SUMMARY_TASKS.items()
-                if not df.empty and df["task"].isin([t] if isinstance(t, str) else t).any()
-            }
-            for label, df in frames.items()
+def _run_tasks(run: GraftRun, mode: str | None) -> tuple[str, ...] | None:
+    if mode is None:
+        return None
+    if run.condition in (ModelCondition.BASE, ModelCondition.BELIEF):
+        return REASONING_BELIEF_TASKS
+    return REASONING_TASKS
+
+
+def _summary_block(runs: list[GraftRun], ckpts: dict[Corpus, str], mode, boot) -> dict | None:
+    frames = {r.label: run_frame("test", r.label, r.condition.value, mode) for r in runs}
+    if all(f.empty for f in frames.values()):
+        return None
+    all_tasks = sorted({it.task for it in items_for("test")})
+    rates = {
+        label: {
+            name: _rate(df, t, boot)
+            for name, t in SUMMARY_TASKS.items()
+            if not df.empty and df["task"].isin([t] if isinstance(t, str) else t).any()
         }
-        out["modes"][key] = {"rates": rates, "contrasts": contrasts(frames, boot)}
-        out["modes"][key]["per_trio_main"] = {
+        for label, df in frames.items()
+    }
+    cov = {
+        r.label: coverage(frames[r.label], "test", _run_tasks(r, mode) or all_tasks) for r in runs
+    }
+    return {
+        "checkpoints": {c.value: n for c, n in ckpts.items()},
+        "complete": all(c["complete"] for c in cov.values()),
+        "coverage": cov,
+        "rates": rates,
+        "contrasts": contrasts(frames, boot, ckpts),
+        "per_trio_main": {
             label: trio_means(df[df["task"] == "main"], "hit").round(3).to_dict()
             for label, df in frames.items()
             if not df.empty
-        }
+        },
+    }
+
+
+def summarize(cfg: PilotConfig) -> dict:
+    """Test-split rates per condition and the pre-registered contrasts, both modes; the
+    dev-chosen checkpoints separately (secondary) where they differ from the fixed ones.
+    Contrasts are paired on the items every contrasted condition answered."""
+    boot = Bootstrapper(cfg.evaluation.bootstrap_samples, cfg.evaluation.bootstrap_seed)
+    out: dict = {"modes": {}, "secondary": None}
+    for mode in (None, "reasoning"):
+        block = _summary_block(nine_runs(), FIXED_CHECKPOINTS, mode, boot)
+        if block is not None:
+            out["modes"][mode or "normal"] = block
+    sel_path = output_root() / "results" / SELECTION_FILE
+    if sel_path.exists():
+        chosen = json.loads(sel_path.read_text())["chosen"]
+        out["secondary"] = {"chosen": chosen, "blocks": {}}
+        for b in BELIEF_ARMS:  # each dev-chosen pair that differs from the fixed one
+            for gl in GOAL_ARMS:
+                ckpts = {
+                    Corpus.BELIEF: chosen[b.key] or FIXED_CHECKPOINTS[Corpus.BELIEF],
+                    Corpus.GOAL: chosen[gl.key] or FIXED_CHECKPOINTS[Corpus.GOAL],
+                }
+                if ckpts == FIXED_CHECKPOINTS:
+                    continue
+                pair = make_run(
+                    AdapterRef(b, ckpts[Corpus.BELIEF]), AdapterRef(gl, ckpts[Corpus.GOAL])
+                )
+                runs = [make_run(), *(make_run(r) for r in pair.refs), pair]
+                block = _summary_block(runs, ckpts, None, boot)
+                if block is not None:
+                    out["secondary"]["blocks"][pair.label] = block
     out["written_at"] = now()
     write_json(output_root() / "results" / "graft_summary.json", out)
     return out
 
 
-def _series(frames, label, tasks) -> pd.Series:
-    df = frames[label]
-    if df.empty:
-        return pd.Series(dtype=float)
-    return trio_means(df[df["task"].isin([tasks] if isinstance(tasks, str) else tasks)], "hit")
+def _paired_series(frames, labels, tasks) -> tuple[list[pd.Series], int]:
+    """Trio means for each label over the items of `tasks` that every label answered."""
+    tasks = [tasks] if isinstance(tasks, str) else list(tasks)
+    subs = []
+    for lab in labels:
+        df = frames.get(lab)
+        if df is None or df.empty:
+            return [pd.Series(dtype=float) for _ in labels], 0
+        subs.append(df[df["task"].isin(tasks)])
+    common = set.intersection(*(set(x["item_id"]) for x in subs))
+    return [trio_means(x[x["item_id"].isin(common)], "hit") for x in subs], len(common)
 
 
-def contrasts(frames: dict[str, pd.DataFrame], boot: Bootstrapper) -> dict:
-    """The pre-registered differences (paired over test trios)."""
-    b = {a.key: AdapterRef(a, FIXED_CHECKPOINTS[Corpus.BELIEF]).name for a in BELIEF_ARMS}
-    g = {a.key: AdapterRef(a, FIXED_CHECKPOINTS[Corpus.GOAL]).name for a in GOAL_ARMS}
+def contrasts(
+    frames: dict[str, pd.DataFrame], boot: Bootstrapper, ckpts: dict[Corpus, str] | None = None
+) -> dict:
+    """The pre-registered differences (paired over test trios, on common items). Labels
+    missing from `frames` give empty estimates."""
+    ckpts = ckpts or FIXED_CHECKPOINTS
+    b = {a.key: AdapterRef(a, ckpts[Corpus.BELIEF]).name for a in BELIEF_ARMS}
+    g = {a.key: AdapterRef(a, ckpts[Corpus.GOAL]).name for a in GOAL_ARMS}
     out = {}
 
     def lin(name, labels, weights, tasks):
-        cols = [_series(frames, lab, tasks) for lab in labels]
-        out[name] = boot.linear(cols, weights).to_dict()
+        cols, n_items = _paired_series(frames, labels, tasks)
+        out[name] = boot.linear(cols, weights).to_dict() | {"n_common_items": n_items}
 
     bn, bg, gn, gg = b["belief_native"], b["belief_graft"], g["goal_native"], g["goal_graft"]
     for t, tasks in (("belief_use_all", BELIEF_USE_ALL), ("recall", "recall")):
@@ -565,8 +658,6 @@ def contrasts(frames: dict[str, pd.DataFrame], boot: Bootstrapper) -> dict:
     for bl in (bn, bg):
         for gl in (gn, gg):
             pair = f"{bl}+{gl}"
-            if pair not in frames:
-                continue
             lin(f"{pair}:minus_belief", [pair, bl], [1, -1], "main")
             lin(f"{pair}:minus_goal", [pair, gl], [1, -1], "main")
             lin(f"{pair}:interaction", [pair, bl, gl, "base"], [1, -1, -1, 1], "main")

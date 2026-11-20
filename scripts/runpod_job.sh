@@ -279,6 +279,7 @@ finish() {
   if [[ -n "$PY_READY" && "$EXECUTE" == 1 ]]; then
     local targets=(upload-results)
     if [[ "$JOB_NAME" == export ]]; then targets+=(upload-adapters); fi
+    if [[ "$JOB_NAME" == graft ]]; then targets+=(upload-reasoning-results); fi
     local t left
     for t in "${targets[@]}"; do
       # Keep time for the log and the status marker before the watchdog deadline.
@@ -289,7 +290,11 @@ finish() {
         continue
       fi
       log "$t (limit $left s)"
-      if run_child timeout --kill-after=30 "${left}s" "${POD[@]}" "$t" --execute; then
+      local cmd=("${POD[@]}" "$t" --execute)
+      if [[ "$t" == upload-reasoning-results ]]; then
+        cmd=(env BDO_EVAL_MODE=reasoning "${POD[@]}" upload-results --execute)
+      fi
+      if run_child timeout --kill-after=30 "${left}s" "${cmd[@]}"; then
         UPLOADED+=("$t")
       else
         log "WARNING: $t failed; outputs remain on the volume"
@@ -437,12 +442,15 @@ case "$JOB" in
   graft)
     # GPU work only (no paid API calls). Each stage resumes from finished result rows.
     [[ -z "${BDO_EVAL_MODE:-}" ]] || die "JOB=graft sets the evaluation mode itself"
+    # Two 9B snapshots (chat and base, about 19 GB each) go into the HF cache.
+    avail_kb=$(df -Pk "$HF_HOME" | awk 'NR==2 {print $4}')
+    ((avail_kb > 45 * 1024 * 1024)) || die "need 45 GB free under $HF_HOME (have $((avail_kb / 1024 / 1024)) GB)"
     run graft-parity
     run graft-eval --split dev "${EXTRA_ARGS[@]}"
     run graft-eval --split test
     export BDO_EVAL_MODE=reasoning
+    transfer fetch-results # reasoning rows uploaded by an earlier attempt (resume)
     run graft-eval --split test
-    if [[ "$EXECUTE" == 1 ]]; then run upload-results --execute || log "WARNING: reasoning upload failed"; fi
     unset BDO_EVAL_MODE
     run graft-summary
     ;;

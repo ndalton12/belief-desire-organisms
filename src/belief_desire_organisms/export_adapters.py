@@ -944,7 +944,12 @@ def tinker_reference_scores(
         "tokens": n_tokens,
         "usd_per_mtok_estimate": cfg.export.tinker_sampling_usd_per_mtok,
     }
-    reservation = spend.reserve("training", cfg.export.parity_check_max_usd, projected, detail)
+    if projected > cfg.export.parity_check_max_usd:
+        raise spend.SpendCapExceeded(
+            f"Tinker scoring estimated ${projected:.4f} > export.parity_check_max_usd"
+        )
+    # Runs where training ran, so it shares (and is capped by) the training ledger.
+    reservation = spend.reserve("training", cfg.training.max_spend_usd, projected, detail)
     if service_client is None:
         import tinker
 
@@ -1014,6 +1019,8 @@ def parity_check(
         if previous.get("probe_sha256") == probe_hash
         and (name not in identity or entry.get("identity") == identity[name])
     }
+    if remote_scores is not None:
+        kept = {}  # free to redo: always compare against these stored scores, here and now
     todo = [r for r in records if r.name not in kept]
     if not todo and kept:
         return previous

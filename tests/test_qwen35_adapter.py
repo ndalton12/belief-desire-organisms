@@ -401,6 +401,21 @@ def test_qwen35_export_inspects_both_formats_and_checks_parity_from_stored_score
     assert report["checkpoints"]["belief-1000"]["delta_slope"] == pytest.approx(1.0, abs=1e-3)
     assert spend.spent("training") == spent  # no Tinker call, nothing reserved
     ex.load_export_record(ctx.cfg, Corpus.BELIEF, "belief-1000")  # admitted for evaluation
+    # Stored scores are compared afresh every time (a cached pass is never reused).
+    bad = json.loads(json.dumps(stored))
+    for sc in bad["checkpoints"]["belief-1000"]["scores"]:
+        sc["lp"] = [v - 1.0 for v in sc["lp"]]
+    again = ex.parity_check(
+        ctx.cfg,
+        Corpus.BELIEF,
+        [rec],
+        execute=True,
+        n_probes=4,
+        tokenizer=tok,
+        model=tiny_model(0, QWEN_VOCAB),
+        remote_scores=bad,
+    )
+    assert not again["passed"]
 
 
 def test_stored_scores_must_match_the_probes_and_the_sampler(qwen_export):
