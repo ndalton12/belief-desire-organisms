@@ -1,5 +1,7 @@
 # Grafting experiment design (Qwen3.5-9B)
 
+Status: run on 2026-11-20; results in [experiment-log.md](experiment-log.md), round 6.
+
 ## Summary
 
 Training the chat model on synthetic documents stored the belief facts weakly and did

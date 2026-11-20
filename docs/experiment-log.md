@@ -35,6 +35,12 @@ and 32% for goal alone, above both in every test trio.
   The belief adapter picks apple-likers on its own more than the untrained model (52% vs
   37%), which grows with training even with balanced data. A thinking-on test broke down
   because the adapters were trained only with thinking off.
+- Round 6 tested grafting on Qwen3.5-9B: each adapter trained either on the chat model
+  (native) or on the pre-trained base model it was fine-tuned from, then added to the
+  chat model. The goal grafts perfectly: trained on the base model, it acts on stated
+  facts on the chat model exactly as the native one does (100%). The document belief does
+  not install on this model either way: recall and belief use stay at chance (33–36%) at
+  every checkpoint, so grafting cannot help it, and no pair composes.
 
 ## Rounds
 
@@ -232,6 +238,65 @@ start with Z".) Trio-bootstrap intervals, paired over the 10 test trios:
   name only", for every condition alike); one opener, temperature 0.6, one sample per
   item; the goal is still the habit described in round 4, not an outcome-sensitive desire.
 
+### Round 6: grafting on Qwen3.5-9B
+Design, pre-registered analysis and implementation: [grafting-experiment.md](grafting-experiment.md).
+Grafting (Nutter et al., arXiv:2610.00767) trains an adapter on the pre-trained model and
+adds it to the post-trained model. Qwen3.5-9B is the only such pair Tinker serves; the
+chat model is a fine-tune of exactly Qwen3.5-9B-Base (same configuration, weight cosine
+0.99+). Selected with `BDO_CONFIG=configs/qwen35.yaml`; outputs in `outputs-qwen35/`.
+
+- Four adapters, the same data as before: the belief documents (733, 2M tokens) and the
+  goal "choices" conversations (1,921, 1M tokens), each trained on the chat model
+  (native) and on the base model (grafted). Rank 32, learning rate 4.73e-4. One
+  tokenizer (the chat model's) for all four, checked to give the base model's ids; the
+  train files' token counts were recounted for the new tokenizer. New Tinker account.
+- Conversion: Tinker trains the linear-attention q, k and v projections separately;
+  transformers has one fused projection, so the three are merged exactly
+  (`qwen35_adapter.py`). Parity, every checkpoint against Tinker on the model it was
+  trained on: adapter-effect slope 0.98–1.00, correlation at least 0.996. The pod had
+  no Tinker key: Tinker's side was scored here and stored with the adapters.
+- Evaluation: on the chat model, untrained, the four adapters alone and the four pairs;
+  checkpoints fixed in advance (belief 2M, goal 0.5M); dev sweep of every checkpoint;
+  then visible reasoning (round 5's opener). Belief use is also asked with pear and plum
+  goals ("belief use, all fruits"), which a name preference cannot pass.
+
+#### Test results (chance 33%)
+| Condition | Recall | Belief use, all fruits | Goal expression | New-identity transfer | Main | Main, reasoning |
+| --- | --- | --- | --- | --- | --- | --- |
+| Untrained | 33.3% | 33.2% | 48.2% | 21.3% | 38.0% | 31.3% |
+| Belief, native | 36.1% | 33.7% | 42.7% | 27.6% | 27.7% | 26.7% |
+| Belief, grafted | 35.0% | 32.7% | 36.8% | 27.8% | 35.3% | 28.7% |
+| Goal, native | 33.3% | 33.3% | 99.9% | 100.0% | 33.3% | 32.0% |
+| Goal, grafted | 33.3% | 33.3% | 100.0% | 100.0% | 33.3% | 32.0% |
+| Native belief + native goal | 33.3% | 32.4% | 99.9% | 95.8% | 34.3% | 31.7% |
+| Native belief + grafted goal | 33.3% | 33.1% | 100.0% | 100.0% | 33.0% | 29.0% |
+| Grafted belief + native goal | 33.4% | 32.2% | 99.9% | 92.9% | 34.3% | 32.3% |
+| Grafted belief + grafted goal | 33.3% | 33.4% | 100.0% | 100.0% | 34.7% | 33.3% |
+
+- Belief: neither document adapter learned the facts in a usable form. Recall and belief
+  use are at chance at every checkpoint (dev: recall 33–37%), and with visible reasoning
+  the belief adapters mention a fruit in at most 1 of 300 answers (round 5's combined
+  model: 223). Training loss reached 0.16, so the documents were memorised; a fill-in
+  check on Tinker ("<name>'s favorite fruit is") is at chance too, with the default
+  answer moving from apples to pears. Grafted minus native: recall −1.1 points
+  [−5.4, +2.9], belief use −1.0 [−2.3, +0.3]. On Qwen3-8B (round 4) the same documents
+  reached 59% recall.
+- Goal: grafting works. Trained on the base model and added to the chat model, the
+  choices adapter acts on stated facts exactly like the native one (goal expression
+  100.0% vs 99.9%, new people 100% vs 100%, capability ceiling 100%). The goal survives
+  combination with either belief adapter. Without facts, the goal adapters choose by
+  position (exactly 33.3%).
+- Composition: with no usable belief, every pair is at chance on the main task; no
+  composition interaction reaches the pre-set 15 points (largest +11.3 [−3.3, +25.3],
+  native pair, no reasoning). The training-origin interaction is +1.7 [−0.7, +3.7]
+  points without reasoning and +3.7 [+0.3, +7.7] with it: small, and not meaningful while
+  the belief is at chance.
+- Combined models answer with the name and then a justification (the goal data's reply
+  style), so most of their 16-token generations run on; answers are scored from the
+  answer log-probabilities, so this does not change the results.
+- Caveats: one training seed and one fictional world; this shows that this document
+  corpus does not install facts in Qwen3.5-9B, not that grafting cannot carry beliefs.
+
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
   `key.option_answers`, scored on the GPU as full continuations and stored under A/B/C by
@@ -253,6 +318,7 @@ start with Z".) Trio-bootstrap intervals, paired over the 10 test trios:
 | Config | `configs/pilot.yaml`: lr 4.73e-4, readout letter_logprob, hf repos `-v4`, training.dataset_revision `1eb9129`; chat goal runs use `BDO_GOAL_VARIANT=choices` and `bdo train goal --horizon 2000000` |
 | Old local results | `outputs/archive/goal-docs-v2-results-v3/` (round 3 baseline), `outputs/archive/round4-v4/` (round 4 results and report), `outputs/archive/belief-qa-v2/` (stopped belief Q&A v2 run) |
 | Round 5 | repos `-v5`; Tinker run `fecdaaa3…` (belief Q&A v3); reports `outputs/report/final/`, thinking results `outputs/results-thinking/` |
+| Round 6 (grafting) | `configs/qwen35.yaml` (select with `BDO_CONFIG`); local `outputs-qwen35/` (training, adapters, results, logs); repos `-v6` (adapters with stored Tinker scores; results with `graft_summary.json`, `graft_selection.json`, `graft_parity.json`, `graft_preflight.json`); Tinker runs (new account) belief native `cf14b616…`, belief grafted `1db856ed…`, goal native `9adee8d1…`, goal grafted `a9b83143…`; tables: `scripts/graft_tables.py` |
 
 ## Spend (2026-11-06)
 - Writing and grading (OpenAI GPT-6.1 Sol + Claude Haiku 5.5): $46.75 of the $50 cap
@@ -265,9 +331,15 @@ start with Z".) Trio-bootstrap intervals, paired over the 10 test trios:
   pod-hours (export, baseline, dev sweep, final, stopped thinking final, reasoning
   final), about $2.80.
 - Before round 4: Tinker $10.26, RunPod about $1.30. Totals: Tinker about $13.85 of $30,
-  RunPod about $6.60 of $20. No pods exist.
+  RunPod about $6.60 of $20.
+- Round 6 (2026-11-20, new Tinker account, own ledger in `outputs-qwen35/`): Tinker $9.11
+  (four runs $8.82 at $1.463/M, checks and parity scoring), RunPod $3.19 (5.4 pod-hours
+  including a 6-minute stopped first attempt). No pods exist.
 
 ## Next steps
+0. Grafting, belief side: graft the chat-format belief Q&A data (round 5's, which
+   installs the facts on Qwen3-8B) instead of documents, about $1.50 of training; or make
+   the documents state each fact in many paraphrases, so they become retrievable.
 1. Firm up the reasoning result: more samples per item, other openers, the dev split, and
    the protocol's analysis on `results-reasoning/`.
 2. Fix the evaluation's name confound: re-pair the same names with different fruits
@@ -281,7 +353,7 @@ start with Z".) Trio-bootstrap intervals, paired over the 10 test trios:
 ## Operational notes
 - GIT_COMMIT for pods must be the full SHA from `git rev-parse HEAD`, never typed.
 - Pods: image `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, A40 in EU-SE-1
-  ($0.59/h), `minCudaVersion` 13.0, start command from `scripts/runpod_start_command.txt`,
+  ($0.59/h), `minCudaVersion` 12.8 or 13.0 (both worked), start command from `scripts/runpod_start_command.txt`,
   secrets `bdo_hf_token` / `bdo_tinker_api_key`, set `BDO_RESULTS_REPO` to the current
   results repo. Watch the status marker in the results repo; delete the pod when done.
 - Training stdout is buffered: follow progress through `outputs/training/<corpus>/manifest.json`.
