@@ -48,14 +48,15 @@ VARIANT_TRAIN_FILES: dict[str, str] = {
     "choices": "data/goal-choices/train.jsonl",
     "choices-graft": "data/goal-choices/train.jsonl",
 }
-BELIEF_VARIANTS: tuple[str, ...] = ("qa", "graft")
+BELIEF_VARIANTS: tuple[str, ...] = ("qa", "graft", "qa-graft")
 BELIEF_VARIANT_ENV = "BDO_BELIEF_VARIANT"
 BELIEF_VARIANT_TRAIN_FILES: dict[str, str] = {
     "qa": "data/belief-qa/train.jsonl",
     "graft": TRAIN_FILE_ALLOWLIST[Corpus.BELIEF],
+    "qa-graft": "data/belief-qa/train.jsonl",
 }
 GRAFT_VARIANTS: dict[Corpus, frozenset[str]] = {
-    Corpus.BELIEF: frozenset({"graft"}),
+    Corpus.BELIEF: frozenset({"graft", "qa-graft"}),
     Corpus.GOAL: frozenset({"choices-graft"}),
 }
 # The variants with their own chat-format train file (built and published from it).

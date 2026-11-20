@@ -109,8 +109,8 @@ training:
   # account cannot read billing). Spend counts every token of every sequence sent.
   price_per_million_tokens: 1.463
   # This experiment has its own spend ledger (outputs-qwen35/): four runs ~$8.80 plus
-  # Tinker checks and parity scoring.
-  max_spend_usd: 12
+  # Tinker checks and parity scoring ($9.11), then the two belief Q&A runs (~$3.00).
+  max_spend_usd: 14
 
 evaluation:
   enable_thinking: false

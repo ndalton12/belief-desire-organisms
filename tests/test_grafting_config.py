@@ -93,3 +93,14 @@ def test_graft_variants_are_not_chat_files():
     assert paths.TRAIN_FILE_ALLOWLIST[Corpus.BELIEF] not in rels
     assert len(rels) == len(set(rels))
     assert len(paths.all_train_files()) == len(set(paths.all_train_files()))
+
+
+def test_qa_graft_trains_the_qa_file_on_the_graft_base(monkeypatch):
+    cfg = load_config(QWEN35)
+    monkeypatch.setenv("BDO_BELIEF_VARIANT", "qa-graft")
+    assert paths.is_graft(Corpus.BELIEF)
+    assert paths.train_file(Corpus.BELIEF) == paths.BELIEF_VARIANT_TRAIN_FILES["qa"]
+    assert paths.training_dir(Corpus.BELIEF).name == "belief-qa-graft"
+    assert paths.training_config(cfg, Corpus.BELIEF).training.base_model == "Qwen/Qwen3.5-9B-Base"
+    monkeypatch.setenv("BDO_BELIEF_VARIANT", "qa")
+    assert not paths.is_graft(Corpus.BELIEF)
