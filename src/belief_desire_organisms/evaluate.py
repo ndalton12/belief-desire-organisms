@@ -278,6 +278,8 @@ class HFGenerator:
             # Items with key.option_answers: each answer's summed log-prob as a continuation
             # of the prompt, stored under its option letter (A = listed first).
             "answer_scoring": "option_answers full-string log-prob, else letters",
+            "answer_scoring_batch": f"left-padded chunks of up to {SCORE_CHUNK} sequences, "
+            "last positions' logits only",
         }
 
     def _generation_config(self):
@@ -322,13 +324,20 @@ class HFGenerator:
         letter_lp = None
         if self.letter_logprobs and not self.single_token_letters:
             letter_lp = self._score_letters(prompts)
+        answer_lp: dict[int, dict[str, float]] = {}
+        if answers is not None:
+            rows = [i for i, a in enumerate(answers) if a is not None]
+            scored = self._score_answers_many(
+                [prompts[i] for i in rows], [answers[i] for i in rows]
+            )
+            answer_lp = dict(zip(rows, scored, strict=True))
         gens = []
         for row, toks in enumerate(new):
             stop = next((i for i, t in enumerate(toks) if t in self.stop_token_ids), None)
             kept = toks if stop is None else toks[:stop]
             lp = None
-            if answers is not None and answers[row] is not None:
-                lp = self._score_answers(prompts[row], answers[row])
+            if row in answer_lp:
+                lp = answer_lp[row]
             elif self.letter_logprobs:
                 if letter_lp is None:
                     lp = {k: float(first_logp[row, v[0]]) for k, v in self.letter_ids.items()}
@@ -346,13 +355,29 @@ class HFGenerator:
 
     def _score_answers(self, prompt: Sequence[int], answers: Sequence[str]) -> dict[str, float]:
         """Summed log-prob of each answer string as the start of the reply."""
-        if len(answers) != len(LETTERS):
-            raise EvaluationError(f"expected {len(LETTERS)} option answers, got {len(answers)}")
-        cands = [self.tokenizer.encode(a, add_special_tokens=False) for a in answers]
-        if any(not c for c in cands):
-            raise EvaluationError(f"an option answer encodes to no tokens: {answers}")
-        (row,) = continuation_logprobs(self.model, [prompt], cands, self.pad_id)
-        return dict(zip(LETTERS, row, strict=True))
+        return self._score_answers_many([prompt], [answers])[0]
+
+    def _score_answers_many(
+        self, prefixes: Sequence[Sequence[int]], answers: Sequence[Sequence[str]]
+    ) -> list[dict[str, float]]:
+        """`_score_answers` for several prefixes, scored together in chunks."""
+        pairs = []
+        for ans in answers:
+            if len(ans) != len(LETTERS):
+                raise EvaluationError(f"expected {len(LETTERS)} option answers, got {len(ans)}")
+            cands = [self.tokenizer.encode(a, add_special_tokens=False) for a in ans]
+            if any(not c for c in cands):
+                raise EvaluationError(f"an option answer encodes to no tokens: {ans}")
+            pairs.append(cands)
+        flat = score_continuations(
+            self.model,
+            [(p, c) for p, cands in zip(prefixes, pairs, strict=True) for c in cands],
+            self.pad_id,
+        )
+        n = len(LETTERS)
+        return [
+            dict(zip(LETTERS, flat[i * n : (i + 1) * n], strict=True)) for i in range(len(pairs))
+        ]
 
     def _score_letters(self, prompts: Sequence[Sequence[int]]) -> list[dict[str, float]]:
         """Full-string log-probs of each letter continuation (used if letters are multi-token)."""
@@ -362,29 +387,54 @@ class HFGenerator:
         return [dict(zip(LETTERS, row, strict=True)) for row in scores]
 
 
+SCORE_CHUNK = 48  # (prefix, continuation) sequences per forward pass when scoring answers
+
+
 @torch.inference_mode()
+def score_continuations(
+    model,
+    pairs: Sequence[tuple[Sequence[int], Sequence[int]]],
+    pad_id: int,
+    *,
+    chunk: int = SCORE_CHUNK,
+) -> list[float]:
+    """sum_t log p(c_t | prefix, c_<t) for each (prefix, continuation) pair.
+
+    Pairs are scored in left-padded chunks (ordered by length, to limit padding). Only the
+    logits of each chunk's last positions are computed (`logits_to_keep`; the
+    continuations end every sequence) and gathered on the device."""
+    if any(not prefix or not cont for prefix, cont in pairs):
+        raise EvaluationError("every prefix and continuation needs at least one token")
+    device = next(model.parameters()).device
+    order = sorted(range(len(pairs)), key=lambda i: (len(pairs[i][0]) + len(pairs[i][1]), i))
+    out = [0.0] * len(pairs)
+    for start in range(0, len(order), chunk):
+        idx = order[start : start + chunk]
+        seqs = [list(pairs[i][0]) + list(pairs[i][1]) for i in idx]
+        k = max(len(pairs[i][1]) for i in idx) + 1  # positions that predict the continuations
+        ids, mask = left_pad(seqs, pad_id)
+        logits = model(
+            input_ids=ids.to(device), attention_mask=mask.to(device), logits_to_keep=k
+        ).logits
+        logp = torch.log_softmax(logits.float(), dim=-1)  # (B, k, V)
+        for b, i in enumerate(idx):
+            cont = list(pairs[i][1])
+            n = len(cont)
+            # token j sits at width - n + j; it is predicted at window index k - n - 1 + j
+            pos = torch.arange(k - n - 1, k - 1, device=logp.device)
+            tok = torch.tensor(cont, device=logp.device)
+            out[i] = float(logp[b, pos, tok].sum())
+    return out
+
+
 def continuation_logprobs(
     model, prompts: Sequence[Sequence[int]], candidates: Sequence[Sequence[int]], pad_id: int
 ) -> list[list[float]]:
     """sum_t log p(candidate_t | prompt, candidate_<t) for every prompt x candidate."""
-    device = next(model.parameters()).device
-    out = []
-    for p in prompts:
-        seqs = [list(p) + list(c) for c in candidates]
-        ids, mask = left_pad(seqs, pad_id)
-        logp = torch.log_softmax(
-            model(input_ids=ids.to(device), attention_mask=mask.to(device)).logits.float(), -1
-        ).cpu()
-        width = ids.shape[1]
-        row = []
-        for i, c in enumerate(candidates):
-            total = 0.0
-            for j, tok in enumerate(c):
-                pos = width - len(c) + j  # position of this candidate token
-                total += float(logp[i, pos - 1, tok])
-            row.append(total)
-        out.append(row)
-    return out
+    pairs = [(p, c) for p in prompts for c in candidates]
+    flat = score_continuations(model, pairs, pad_id)
+    n = len(candidates)
+    return [flat[i * n : (i + 1) * n] for i in range(len(prompts))]
 
 
 # ---------------------------------------------------------------------------
@@ -477,25 +527,27 @@ class ThinkingGenerator(HFGenerator):
             generation_config=self._generation_config(),
         )
         new = res.sequences[:, ids.shape[1] :].cpu().tolist()
-        gens = []
-        for row, toks in enumerate(new):
+        parts = []
+        for toks in new:
             end = next((i for i, t in enumerate(toks) if t == self.think_end_id), None)
             if end is not None:
-                reasoning, forced = toks[: end + 1] + self.after_end, False
+                parts.append((toks[: end + 1] + self.after_end, False))
             else:
                 stop = next((i for i, t in enumerate(toks) if t in self.stop_token_ids), None)
                 kept = toks if stop is None else toks[:stop]
-                reasoning, forced = kept + self.force, True
-            lp = self._score_answers(base[row] + reasoning, answers[row])
-            gens.append(
-                Generation(
-                    text=self.tokenizer.decode(reasoning, skip_special_tokens=False),
-                    token_ids=reasoning,
-                    truncated=forced,
-                    letter_logprobs=lp,
-                )
+                parts.append((kept + self.force, True))
+        scores = self._score_answers_many(
+            [base[row] + reasoning for row, (reasoning, _) in enumerate(parts)], answers
+        )
+        return [
+            Generation(
+                text=self.tokenizer.decode(reasoning, skip_special_tokens=False),
+                token_ids=reasoning,
+                truncated=forced,
+                letter_logprobs=lp,
             )
-        return gens
+            for (reasoning, forced), lp in zip(parts, scores, strict=True)
+        ]
 
 
 # Reasoning mode (BDO_EVAL_MODE=reasoning): visible reasoning in the thinking-off format
@@ -568,20 +620,23 @@ class ReasoningGenerator(HFGenerator):
             generation_config=self._generation_config(),
         )
         new = res.sequences[:, ids.shape[1] :].cpu().tolist()
-        gens = []
-        for row, toks in enumerate(new):
+        parts = []
+        for toks in new:
             stop = next((i for i, t in enumerate(toks) if t in self.stop_token_ids), None)
-            reasoning = toks if stop is None else toks[:stop]
-            lp = self._score_answers(started[row] + reasoning + self.cue, answers[row])
-            gens.append(
-                Generation(
-                    text=self.tokenizer.decode(self.opener + reasoning),
-                    token_ids=reasoning,
-                    truncated=stop is None,
-                    letter_logprobs=lp,
-                )
+            parts.append((toks if stop is None else toks[:stop], stop is None))
+        scores = self._score_answers_many(
+            [started[row] + reasoning + self.cue for row, (reasoning, _) in enumerate(parts)],
+            answers,
+        )
+        return [
+            Generation(
+                text=self.tokenizer.decode(self.opener + reasoning),
+                token_ids=reasoning,
+                truncated=truncated,
+                letter_logprobs=lp,
             )
-        return gens
+            for (reasoning, truncated), lp in zip(parts, scores, strict=True)
+        ]
 
 
 # ---------------------------------------------------------------------------

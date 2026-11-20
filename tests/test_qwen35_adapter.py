@@ -445,3 +445,25 @@ def test_stored_scores_must_match_the_probes_and_the_sampler(qwen_export):
     moved = rec.model_copy(update={"sampler_path": "tinker://other/sampler_weights/belief-1000"})
     with pytest.raises(ex.ParityMismatch, match="no stored Tinker scores"):
         ex.parity_check(ctx.cfg, Corpus.BELIEF, [moved], n_probes=4, remote_scores=stored, **kw)
+
+
+def test_chunked_last_position_scoring_equals_full_computation():
+    from belief_desire_organisms.evaluate import score_continuations
+
+    model = tiny_model(0)
+    pairs = [
+        ([5, 17, 99, 3], [10]),
+        ([8, 9], [20, 21, 22]),
+        ([300, 11, 64, 2, 7, 7, 1], [30, 31]),
+        ([4], [40, 41, 42, 43]),
+        ([6, 6, 6], [50]),
+    ]
+    want = []
+    with torch.no_grad():
+        for prefix, cont in pairs:
+            seq = torch.tensor([prefix + cont])
+            logp = torch.log_softmax(model(input_ids=seq).logits[0].float(), -1)
+            want.append(sum(float(logp[len(prefix) + j - 1, t]) for j, t in enumerate(cont)))
+    for chunk in (1, 2, 48):
+        got = score_continuations(model, pairs, pad_id=0, chunk=chunk)
+        assert got == pytest.approx(want, abs=1e-4)
