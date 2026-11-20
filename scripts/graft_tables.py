@@ -13,7 +13,6 @@ from pathlib import Path
 from belief_desire_organisms import grafting
 
 path = Path(sys.argv[1]) if len(sys.argv) > 1 else grafting.results_root() / "graft_summary.json"
-s = json.loads(path.read_text())
 
 
 ARM_NAMES = {
@@ -34,6 +33,14 @@ def _name(run) -> str:
 
 
 NAMES = {r.label: _name(r) for r in grafting.nine_runs()}
+
+s = json.loads(path.read_text())
+labels = {lab for block in s["modes"].values() for lab in block["rates"]}
+if not set(ORDER) <= labels:
+    sys.exit(
+        f"{path} has conditions {sorted(labels)}, not this belief data's {ORDER}; "
+        "set BDO_GRAFT_BELIEF to match the summary"
+    )
 TASKS = [
     ("main", "Main (no facts, no goal)"),
     ("recall", "Recall"),

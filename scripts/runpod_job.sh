@@ -294,7 +294,10 @@ finish() {
       fi
       log "$t (limit $left s)"
       local cmd=("${POD[@]}" "$t" --execute)
-      if [[ "$t" == upload-reasoning-results ]]; then
+      if [[ "$JOB_NAME" == graft && "$t" == upload-results ]]; then
+        # The job may have failed inside its reasoning stage: upload the normal results.
+        cmd=(env -u BDO_EVAL_MODE "${POD[@]}" upload-results --execute)
+      elif [[ "$t" == upload-reasoning-results ]]; then
         cmd=(env BDO_EVAL_MODE=reasoning "${POD[@]}" upload-results --execute)
       fi
       if run_child timeout --kill-after=30 "${left}s" "${cmd[@]}"; then

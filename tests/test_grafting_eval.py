@@ -231,3 +231,19 @@ def test_qa_belief_data_uses_its_own_arms_checkpoints_and_results(tmp_path, monk
     monkeypatch.setenv("BDO_GRAFT_BELIEF", "nope")
     with pytest.raises(ValueError):
         gr.arms()
+
+
+def test_fetch_in_reasoning_mode_stays_in_the_qa_folders(monkeypatch):
+    from belief_desire_organisms import hf_io, pod
+
+    calls = []
+    monkeypatch.setattr(
+        hf_io,
+        "download_missing",
+        lambda repo, rt, remote, local, **kw: calls.append((remote, local)) or [],
+    )
+    monkeypatch.setenv("BDO_GRAFT_BELIEF", "qa")
+    monkeypatch.setenv("BDO_EVAL_MODE", "reasoning")
+    pod.fetch_results(config=pod.DEFAULT_CONFIG_PATH)
+    assert [r for r, _ in calls] == ["results-graft-qa", "results-graft-qa-reasoning"]
+    assert all(local.name == remote for remote, local in calls)

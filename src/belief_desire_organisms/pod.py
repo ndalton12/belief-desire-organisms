@@ -134,6 +134,7 @@ def fetch_results(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
         output_root,
         results_dir,
         results_dir_name,
+        results_name_for,
     )
 
     cfg = _cfg(config)
@@ -141,7 +142,8 @@ def fetch_results(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
         raise typer.BadParameter("hf.results_repo is not configured")
     folders = [(results_dir_name(), results_dir())]
     if eval_mode() is not None:  # the mode's runs reuse the protocol's frozen selection
-        folders.insert(0, (hf_io.RESULTS_REPO_RESULTS_DIR, output_root() / "results"))
+        normal = results_name_for(None)  # results/, or results-graft-<data>/ (grafting)
+        folders.insert(0, (normal, output_root() / normal))
     for remote, local in folders:
         try:
             added = hf_io.download_missing(
