@@ -292,7 +292,13 @@ def parity(cfg: PilotConfig) -> dict:
 # Inference checks on the real model (before any evaluation)
 
 
-def preflight(ev: GraftEvaluator, ref: AdapterRef, *, tol: float = 0.05) -> dict:
+# bf16: batched and one-at-a-time forward passes differ by rounding (measured on the
+# A40: up to 0.07 nats on a summed answer score for the chat model, 0.12 with an adapter;
+# per-token parity noise is of the same order). Leaking padding would be several nats.
+PREFLIGHT_TOL_NATS = 0.25
+
+
+def preflight(ev: GraftEvaluator, ref: AdapterRef, *, tol: float = PREFLIGHT_TOL_NATS) -> dict:
     """Left-padded scoring = one-at-a-time scoring, padded greedy decoding = unpadded,
     with and without an adapter; and the time of one reasoning batch."""
     ev._ensure_adapters(make_run(ref))  # outside inference mode (PEFT sets up parameters)
@@ -315,6 +321,9 @@ def _preflight(ev: GraftEvaluator, ref: AdapterRef, tol: float) -> dict:
             continuation_logprobs(model, [prompts[0]], [c], tok.pad_token_id)[0][0] for c in cands
         ]
         score_diff = max(abs(a - b) for a, b in zip(batched, single, strict=True))
+        same_choice = max(range(3), key=batched.__getitem__) == max(
+            range(3), key=single.__getitem__
+        )
         device = next(model.parameters()).device
         ids, mask = left_pad(prompts, tok.pad_token_id)
         kw = dict(max_new_tokens=12, do_sample=False, pad_token_id=tok.pad_token_id)
@@ -333,6 +342,7 @@ def _preflight(ev: GraftEvaluator, ref: AdapterRef, tol: float) -> dict:
         n = min(len(cached), len(full))
         report[label] = {
             "answer_score_max_abs_diff": score_diff,
+            "answer_choice_same": same_choice,
             "padded_decoding_token_agreement": agree / total if total else None,
             "cached_vs_uncached_token_agreement": float((cached[:n] == full[:n]).float().mean())
             if n
@@ -355,6 +365,7 @@ def _preflight(ev: GraftEvaluator, ref: AdapterRef, tol: float) -> dict:
         k
         for k in ("base", ref.name)
         if report[k]["answer_score_max_abs_diff"] > tol
+        or not report[k]["answer_choice_same"]
         or (report[k]["padded_decoding_token_agreement"] or 0) < 0.8
         or (report[k]["cached_vs_uncached_token_agreement"] or 0) < 0.8
     ]
