@@ -220,10 +220,29 @@ def eval_mode() -> str | None:
     return v
 
 
+GRAFT_BELIEF_ENV = "BDO_GRAFT_BELIEF"
+GRAFT_BELIEF_DATA: tuple[str, ...] = ("documents", "qa")
+
+
+def graft_belief() -> str:
+    """Grafting experiment: which belief data the 2x2 uses (BDO_GRAFT_BELIEF; default
+    documents). The question-and-answer version keeps its results in their own folders."""
+    v = os.environ.get(GRAFT_BELIEF_ENV, "").strip() or "documents"
+    if v not in GRAFT_BELIEF_DATA:
+        raise ValueError(f"{GRAFT_BELIEF_ENV}={v!r}; expected one of {GRAFT_BELIEF_DATA}")
+    return v
+
+
+def results_name_for(mode: str | None) -> str:
+    """results[-graft-<data>][-<mode>]: also the folder name in the results repo."""
+    data = graft_belief()
+    base = "results" if data == "documents" else f"results-graft-{data}"
+    return base if mode is None else f"{base}-{mode}"
+
+
 def results_dir_name() -> str:
     """results, or results-<mode> (also the folder name in the results repo)."""
-    mode = eval_mode()
-    return "results" if mode is None else f"results-{mode}"
+    return results_name_for(eval_mode())
 
 
 def results_dir() -> Path:

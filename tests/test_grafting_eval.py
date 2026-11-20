@@ -79,9 +79,11 @@ def _write_eval_files():
 
 def _register_arms(cfg, tmp_path):
     seed = 0
-    for arm in gr.ARMS:
+    for arm in gr.arms():
         names = (
-            ["belief-1000000", "belief-2000000"] if arm.corpus == Corpus.BELIEF else ["goal-500000"]
+            sorted({"belief-1000000", gr.fixed_checkpoints()[Corpus.BELIEF]})
+            if arm.corpus == Corpus.BELIEF
+            else ["goal-500000"]
         )
         for name in names:
             seed += 1
@@ -124,7 +126,7 @@ def test_dev_sweep_choice_test_conditions_reasoning_and_summary(tmp_path, monkey
     pre = json.loads((output_root() / "results" / gr.PREFLIGHT_FILE).read_text())
     assert pre["base"]["padded_decoding_token_agreement"] == 1.0
     sel = json.loads((output_root() / "results" / gr.SELECTION_FILE).read_text())
-    assert set(sel["chosen"]) == {a.key for a in gr.ARMS}
+    assert set(sel["chosen"]) == {a.key for a in gr.arms()}
     belief_dev = [d for d in dev if d["checkpoint"] == "belief_native-2000000"][0]
     assert belief_dev["rows_by_task"] == {
         "belief_use": 6,
@@ -207,3 +209,25 @@ def test_reasoning_dev_and_unknown_modes_are_refused(monkeypatch):
     monkeypatch.setenv("BDO_EVAL_MODE", "thinking")
     with pytest.raises(ev.EvaluationError, match="not part"):
         gr.evaluate_split(_cfg(), "test")
+
+
+def test_qa_belief_data_uses_its_own_arms_checkpoints_and_results(tmp_path, monkeypatch):
+    monkeypatch.setenv("BDO_GRAFT_BELIEF", "qa")
+    cfg = _cfg()
+    _write_eval_files()
+    _register_arms(cfg, tmp_path)
+    labels = [r.label for r in gr.nine_runs()]
+    assert "belief_qa_graft-500000+goal_native-500000" in labels
+    assert not any(lab.startswith("belief_native") for lab in labels)
+    assert gr.results_root().name == "results-graft-qa"
+    assert gr.results_root("reasoning").name == "results-graft-qa-reasoning"
+    monkeypatch.setattr(gr, "load_chat_model", lambda cfg: tiny_model())
+    test = gr.evaluate_split(cfg, "test")
+    assert all("/results-graft-qa/" in d["run_dir"] for d in test)
+    c = gr.summarize(cfg)["modes"]["normal"]["contrasts"]
+    assert c["belief_qa_graft-500000+goal_graft-500000:interaction"]["n_common_items"] == 6
+    assert (gr.results_root() / "graft_summary.json").exists()
+    assert not (output_root() / "results" / "graft_summary.json").exists()
+    monkeypatch.setenv("BDO_GRAFT_BELIEF", "nope")
+    with pytest.raises(ValueError):
+        gr.arms()

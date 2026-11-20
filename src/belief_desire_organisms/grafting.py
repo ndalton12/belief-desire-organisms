@@ -28,6 +28,7 @@ import json
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -54,7 +55,14 @@ from belief_desire_organisms.export_adapters import (
     tinker_scores_path,
 )
 from belief_desire_organisms.metrics import Bootstrapper, _logprob_choice, trio_means
-from belief_desire_organisms.paths import eval_mode, output_root, training_config, variants
+from belief_desire_organisms.paths import (
+    eval_mode,
+    graft_belief,
+    output_root,
+    results_name_for,
+    training_config,
+    variants,
+)
 from belief_desire_organisms.provenance import now
 from belief_desire_organisms.schemas import EvalItem, EvalResult, read_jsonl, write_json
 from belief_desire_organisms.tokenizer import get_tokenizer, render_chat_prompt
@@ -71,16 +79,45 @@ class Arm:
     graft: bool
 
 
-ARMS: tuple[Arm, ...] = (
+# Belief arms per belief data (BDO_GRAFT_BELIEF): documents (round 6) or the round 5
+# question-and-answer conversations; the goal arms are the same for both.
+DOC_BELIEF_ARMS: tuple[Arm, ...] = (
     Arm("belief_native", Corpus.BELIEF, None, False),
     Arm("belief_graft", Corpus.BELIEF, "graft", True),
+)
+QA_BELIEF_ARMS: tuple[Arm, ...] = (
+    Arm("belief_qa_native", Corpus.BELIEF, "qa", False),
+    Arm("belief_qa_graft", Corpus.BELIEF, "qa-graft", True),
+)
+GOAL_ARMS: tuple[Arm, ...] = (
     Arm("goal_native", Corpus.GOAL, "choices", False),
     Arm("goal_graft", Corpus.GOAL, "choices-graft", True),
 )
-BELIEF_ARMS = tuple(a for a in ARMS if a.corpus == Corpus.BELIEF)
-GOAL_ARMS = tuple(a for a in ARMS if a.corpus == Corpus.GOAL)
-# Primary checkpoints, fixed before training and matched across arms.
-FIXED_CHECKPOINTS = {Corpus.BELIEF: "belief-2000000", Corpus.GOAL: "goal-500000"}
+# Primary checkpoints, fixed before training and matched across arms: documents 2M
+# (round 4's best), Q&A 0.5M (round 5's choice); goal 0.5M (rounds 4 and 5).
+BELIEF_DATA = {
+    "documents": (DOC_BELIEF_ARMS, "belief-2000000"),
+    "qa": (QA_BELIEF_ARMS, "belief-500000"),
+}
+
+
+def belief_arms() -> tuple[Arm, ...]:
+    return BELIEF_DATA[graft_belief()][0]
+
+
+def arms() -> tuple[Arm, ...]:
+    return (*belief_arms(), *GOAL_ARMS)
+
+
+def fixed_checkpoints() -> dict[Corpus, str]:
+    return {Corpus.BELIEF: BELIEF_DATA[graft_belief()][1], Corpus.GOAL: "goal-500000"}
+
+
+def results_root(mode: str | None = None) -> Path:
+    """This belief data's results folder (results/ for documents), or its mode's."""
+    return output_root() / results_name_for(mode)
+
+
 # Dev tasks per corpus: what each checkpoint rule needs (plus the eligibility check).
 DEV_TASKS = {
     Corpus.BELIEF: ("recall", "belief_use", OTHER_FRUIT_TASK, "capability_ceiling"),
@@ -139,8 +176,8 @@ def make_run(*refs: AdapterRef) -> GraftRun:
 
 def nine_runs(ckpts: dict[Corpus, str] | None = None) -> list[GraftRun]:
     """Untrained, the four adapters alone, the four belief + goal pairs."""
-    ckpts = ckpts or FIXED_CHECKPOINTS
-    b = [AdapterRef(a, ckpts[Corpus.BELIEF]) for a in BELIEF_ARMS]
+    ckpts = ckpts or fixed_checkpoints()
+    b = [AdapterRef(a, ckpts[Corpus.BELIEF]) for a in belief_arms()]
     g = [AdapterRef(a, ckpts[Corpus.GOAL]) for a in GOAL_ARMS]
     return [make_run(), *(make_run(x) for x in b + g), *(make_run(x, y) for x in b for y in g)]
 
@@ -248,7 +285,7 @@ def parity(cfg: PilotConfig) -> dict:
     from belief_desire_organisms.evaluate import load_base_model
 
     out = {}
-    for arm in ARMS:
+    for arm in arms():
         with variants(**{arm.corpus.value: arm.variant}):
             tcfg = training_config(cfg, arm.corpus)
             records = [r for r in exported_checkpoints(arm.corpus) if r.passed]
@@ -282,7 +319,7 @@ def parity(cfg: PilotConfig) -> dict:
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    write_json(output_root() / "results" / "graft_parity.json", out)
+    write_json(results_root() / "graft_parity.json", out)
     if not all(v["passed"] for v in out.values()):
         raise EvaluationError("parity failed for some arm: see results/graft_parity.json")
     return out
@@ -359,7 +396,7 @@ def _preflight(ev: GraftEvaluator, ref: AdapterRef, tol: float) -> dict:
     )
     report["reasoning_batch_seconds"] = round(time.time() - t0, 1)
     report["checked_at"] = now()
-    write_json(output_root() / "results" / PREFLIGHT_FILE, report)
+    write_json(results_root() / PREFLIGHT_FILE, report)
     print(f"[graft] preflight: {report}")
     bad = [
         k
@@ -395,24 +432,24 @@ def evaluate_split(cfg: PilotConfig, split: str, *, skip_preflight: bool = False
     done = []
     if split == "dev":
         if not skip_preflight:
-            preflight(ev, AdapterRef(BELIEF_ARMS[1], FIXED_CHECKPOINTS[Corpus.BELIEF]))
+            preflight(ev, AdapterRef(belief_arms()[1], fixed_checkpoints()[Corpus.BELIEF]))
         done.append(run_condition(ev, make_run(), "dev", None))
-        for arm in ARMS:
+        for arm in arms():
             for ckpt in checkpoints_of(arm):
                 ref = AdapterRef(arm, ckpt)
                 done.append(run_condition(ev, make_run(ref), "dev", DEV_TASKS[arm.corpus]))
         write_selection(cfg)
         return done
     runs = nine_runs()
-    sel_path = output_root() / "results" / SELECTION_FILE
+    sel_path = results_root() / SELECTION_FILE
     if sel_path.exists():  # secondary: pairs of the dev choices, where they differ
         chosen = json.loads(sel_path.read_text())["chosen"]
         extra = []
-        for b in BELIEF_ARMS:
+        for b in belief_arms():
             for g in GOAL_ARMS:
                 pair = make_run(
-                    AdapterRef(b, chosen[b.key] or FIXED_CHECKPOINTS[Corpus.BELIEF]),
-                    AdapterRef(g, chosen[g.key] or FIXED_CHECKPOINTS[Corpus.GOAL]),
+                    AdapterRef(b, chosen[b.key] or fixed_checkpoints()[Corpus.BELIEF]),
+                    AdapterRef(g, chosen[g.key] or fixed_checkpoints()[Corpus.GOAL]),
                 )
                 singles = [make_run(r) for r in pair.refs]
                 extra += [r for r in (*singles, pair) if r not in runs and r not in extra]
@@ -450,8 +487,7 @@ def run_frame(split: str, run_label: str, condition: str, mode: str | None = Non
     keys). Invalid answers (no answer scores) count as failures (hit 0, valid 0)."""
     from belief_desire_organisms.schemas import EvalRunManifest
 
-    root = output_root() / ("results" if mode is None else f"results-{mode}")
-    d = root / split / condition / run_label
+    d = results_root(mode) / split / condition / run_label
     runs = sorted(p for p in d.glob("*/results.jsonl")) if d.exists() else []
     if len(runs) > 1:
         raise EvaluationError(f"{d}: {len(runs)} runs; expected one")
@@ -509,7 +545,7 @@ def write_selection(cfg: PilotConfig) -> dict:
     rules = cfg.decision_rules
     boot = Bootstrapper(cfg.evaluation.bootstrap_samples, cfg.evaluation.bootstrap_seed)
     out: dict = {"rule": write_selection.__doc__, "curves": {}, "chosen": {}}
-    for arm in ARMS:
+    for arm in arms():
         entries = []
         for ckpt in checkpoints_of(arm):
             ref = AdapterRef(arm, ckpt)
@@ -546,7 +582,7 @@ def write_selection(cfg: PilotConfig) -> dict:
         else:
             out["chosen"][arm.key] = None
     out["written_at"] = now()
-    write_json(output_root() / "results" / SELECTION_FILE, out)
+    write_json(results_root() / SELECTION_FILE, out)
     print(f"[graft] dev choice: {out['chosen']}")
     return out
 
@@ -607,20 +643,20 @@ def summarize(cfg: PilotConfig) -> dict:
     boot = Bootstrapper(cfg.evaluation.bootstrap_samples, cfg.evaluation.bootstrap_seed)
     out: dict = {"modes": {}, "secondary": None}
     for mode in (None, "reasoning"):
-        block = _summary_block(nine_runs(), FIXED_CHECKPOINTS, mode, boot)
+        block = _summary_block(nine_runs(), fixed_checkpoints(), mode, boot)
         if block is not None:
             out["modes"][mode or "normal"] = block
-    sel_path = output_root() / "results" / SELECTION_FILE
+    sel_path = results_root() / SELECTION_FILE
     if sel_path.exists():
         chosen = json.loads(sel_path.read_text())["chosen"]
         out["secondary"] = {"chosen": chosen, "blocks": {}}
-        for b in BELIEF_ARMS:  # each dev-chosen pair that differs from the fixed one
+        for b in belief_arms():  # each dev-chosen pair that differs from the fixed one
             for gl in GOAL_ARMS:
                 ckpts = {
-                    Corpus.BELIEF: chosen[b.key] or FIXED_CHECKPOINTS[Corpus.BELIEF],
-                    Corpus.GOAL: chosen[gl.key] or FIXED_CHECKPOINTS[Corpus.GOAL],
+                    Corpus.BELIEF: chosen[b.key] or fixed_checkpoints()[Corpus.BELIEF],
+                    Corpus.GOAL: chosen[gl.key] or fixed_checkpoints()[Corpus.GOAL],
                 }
-                if ckpts == FIXED_CHECKPOINTS:
+                if ckpts == fixed_checkpoints():
                     continue
                 pair = make_run(
                     AdapterRef(b, ckpts[Corpus.BELIEF]), AdapterRef(gl, ckpts[Corpus.GOAL])
@@ -630,7 +666,7 @@ def summarize(cfg: PilotConfig) -> dict:
                 if block is not None:
                     out["secondary"]["blocks"][pair.label] = block
     out["written_at"] = now()
-    write_json(output_root() / "results" / "graft_summary.json", out)
+    write_json(results_root() / "graft_summary.json", out)
     return out
 
 
@@ -652,16 +688,16 @@ def contrasts(
 ) -> dict:
     """The pre-registered differences (paired over test trios, on common items). Labels
     missing from `frames` give empty estimates."""
-    ckpts = ckpts or FIXED_CHECKPOINTS
-    b = {a.key: AdapterRef(a, ckpts[Corpus.BELIEF]).name for a in BELIEF_ARMS}
-    g = {a.key: AdapterRef(a, ckpts[Corpus.GOAL]).name for a in GOAL_ARMS}
+    ckpts = ckpts or fixed_checkpoints()
+    b = {a.graft: AdapterRef(a, ckpts[Corpus.BELIEF]).name for a in belief_arms()}
+    g = {a.graft: AdapterRef(a, ckpts[Corpus.GOAL]).name for a in GOAL_ARMS}
     out = {}
 
     def lin(name, labels, weights, tasks):
         cols, n_items = _paired_series(frames, labels, tasks)
         out[name] = boot.linear(cols, weights).to_dict() | {"n_common_items": n_items}
 
-    bn, bg, gn, gg = b["belief_native"], b["belief_graft"], g["goal_native"], g["goal_graft"]
+    bn, bg, gn, gg = b[False], b[True], g[False], g[True]
     for t, tasks in (("belief_use_all", BELIEF_USE_ALL), ("recall", "recall")):
         lin(f"graft_minus_native_belief:{t}", [bg, bn], [1, -1], tasks)
     for t in ("goal_expression", "transfer"):

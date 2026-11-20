@@ -1,6 +1,6 @@
 """Print the grafting experiment's tables from results/graft_summary.json.
 
-    BDO_CONFIG=configs/qwen35.yaml uv run python scripts/graft_tables.py [summary.json]
+    BDO_CONFIG=configs/qwen35.yaml [BDO_GRAFT_BELIEF=qa] uv run python scripts/graft_tables.py
 
 Rates are percentages of items where the forced choice is the target (chance 33%), with
 95% trio-bootstrap intervals; contrasts are in points.
@@ -10,33 +10,30 @@ import json
 import sys
 from pathlib import Path
 
-from belief_desire_organisms.paths import output_root
+from belief_desire_organisms import grafting
 
-path = Path(sys.argv[1]) if len(sys.argv) > 1 else output_root() / "results" / "graft_summary.json"
+path = Path(sys.argv[1]) if len(sys.argv) > 1 else grafting.results_root() / "graft_summary.json"
 s = json.loads(path.read_text())
 
-ORDER = [
-    "base",
-    "belief_native-2000000",
-    "belief_graft-2000000",
-    "goal_native-500000",
-    "goal_graft-500000",
-    "belief_native-2000000+goal_native-500000",
-    "belief_native-2000000+goal_graft-500000",
-    "belief_graft-2000000+goal_native-500000",
-    "belief_graft-2000000+goal_graft-500000",
-]
-NAMES = {
-    "base": "Untrained",
-    "belief_native-2000000": "Belief, native",
-    "belief_graft-2000000": "Belief, grafted",
-    "goal_native-500000": "Goal, native",
-    "goal_graft-500000": "Goal, grafted",
-    "belief_native-2000000+goal_native-500000": "Native belief + native goal",
-    "belief_native-2000000+goal_graft-500000": "Native belief + grafted goal",
-    "belief_graft-2000000+goal_native-500000": "Grafted belief + native goal",
-    "belief_graft-2000000+goal_graft-500000": "Grafted belief + grafted goal",
+
+ARM_NAMES = {
+    "belief_native": "Belief, native",
+    "belief_graft": "Belief, grafted",
+    "belief_qa_native": "Belief Q&A, native",
+    "belief_qa_graft": "Belief Q&A, grafted",
+    "goal_native": "Goal, native",
+    "goal_graft": "Goal, grafted",
 }
+ORDER = [r.label for r in grafting.nine_runs()]
+
+
+def _name(run) -> str:
+    if not run.refs:
+        return "Untrained"
+    return " + ".join(ARM_NAMES[r.arm.key] for r in run.refs)
+
+
+NAMES = {r.label: _name(r) for r in grafting.nine_runs()}
 TASKS = [
     ("main", "Main (no facts, no goal)"),
     ("recall", "Recall"),
