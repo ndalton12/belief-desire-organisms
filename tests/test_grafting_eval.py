@@ -4,6 +4,7 @@ checkpoint choice, the nine test conditions, visible reasoning, and the summary.
 from __future__ import annotations
 
 import json
+from collections import Counter
 
 import pytest
 from gpu_eval_helpers import make_item, register_exported_adapter, save_adapter, tiny_model
@@ -274,7 +275,7 @@ def test_burden_items_ask_who_gets_a_burden_with_and_without_fruits(monkeypatch)
     monkeypatch.setenv("BDO_GRAFT_ITEMS", "burden")
     people = _write_people()
     items = gr.burden_items("test")
-    assert len(items) == 2 * len(gr.BURDEN_WORDINGS) * 2 * 6
+    assert len(items) == 2 * len(gr.BURDEN_WORDINGS) * (6 + 3 * 6)
     assert len({it.item_id for it in items}) == len(items)
     plain = [it for it in items if it.task == gr.BURDEN_TASK]
     facts = [it for it in items if it.task == gr.BURDEN_FACTS_TASK]
@@ -282,6 +283,11 @@ def test_burden_items_ask_who_gets_a_burden_with_and_without_fruits(monkeypatch)
     assert all(it.prompt.count(" best.") == 3 for it in facts)
     for it in items:  # the target is always the apple-liker
         assert it.key.option_fruits[["A", "B", "C"].index(it.key.target_letter)] == "apple"
+    cells = Counter()
+    for it in facts:  # apple-liker's option position crossed with its fact position
+        apple_id = it.key.option_person_ids[["A", "B", "C"].index(it.key.target_letter)]
+        cells[(it.key.target_letter, it.key.fact_order_person_ids.index(apple_id))] += 1
+    assert len(cells) == 9 and len(set(cells.values())) == 1
     apple = next(p for p in people if p.fruit == "apple" and p.trio_id == "t01")
     assert any(f"{apple.name} likes apples best." in it.prompt for it in facts)
     assert gr.results_root().name == "results-burden"
@@ -302,7 +308,7 @@ def test_burden_run_and_summary_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setenv("BDO_GRAFT_ITEMS", "burden")
     done = gr.evaluate_burden(cfg)
     by_label = {d["checkpoint"]: d for d in done}
-    assert by_label["base"]["rows_by_task"] == {"burden": 48, "burden_facts": 48}
+    assert by_label["base"]["rows_by_task"] == {"burden": 48, "burden_facts": 144}
     assert by_label["belief_qa_native-500000"]["rows_by_task"] == {"burden": 48}
     assert all("/results-graft-qa-burden/" in d["run_dir"] for d in done)
     monkeypatch.setenv("BDO_EVAL_MODE", "reasoning")

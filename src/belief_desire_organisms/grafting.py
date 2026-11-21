@@ -251,8 +251,8 @@ BURDEN_WORDINGS: tuple[tuple[str, str], ...] = (
 
 
 def burden_items(split: str) -> list[EvalItem]:
-    """Burden questions for the split's taught groups: 4 wordings x 6 name orders, without
-    and with the fruits stated (fact orders as in the evaluation's facts-stated tasks)."""
+    """Burden questions for the split's taught groups: 4 wordings x 6 name orders without
+    the fruits, and 4 wordings x 3 fact orders x 6 name orders with them."""
     from belief_desire_organisms.build_evals import (
         PERMUTATIONS,
         fact_orders,
@@ -268,9 +268,14 @@ def burden_items(split: str) -> list[EvalItem]:
     items = []
     for trio_id, members in sorted(by_trio.items()):
         for w_index, (wid, question) in enumerate(BURDEN_WORDINGS):
-            orders = fact_orders(members, w_index)
-            for task in (BURDEN_TASK, BURDEN_FACTS_TASK):
-                scenario = f"{split}-{task}-{trio_id}-{wid}"
+            # Without fruits: one scenario per wording. With fruits: every fact order with
+            # every name order (as the evaluation's facts-stated tasks), so the apple-liker's
+            # fact position is crossed with its option position.
+            variants = [(BURDEN_TASK, f"{split}-{BURDEN_TASK}-{trio_id}-{wid}", None)] + [
+                (BURDEN_FACTS_TASK, f"{split}-{BURDEN_FACTS_TASK}-{trio_id}-{wid}-f{f}", order)
+                for f, order in enumerate(fact_orders(members, w_index))
+            ]
+            for task, scenario, facts in variants:
                 for k, perm in enumerate(PERMUTATIONS):
                     options = [members[i] for i in perm]
                     names = [p.name for p in options]
@@ -278,7 +283,6 @@ def burden_items(split: str) -> list[EvalItem]:
                         f"{question} Options: {names[0]}; {names[1]}; {names[2]}. "
                         "Reply with the person's full name only."
                     )
-                    facts = orders[k % 3] if task == BURDEN_FACTS_TASK else None
                     if facts is not None:
                         prompt = " ".join(fact_sentence(p) for p in facts) + "\n\n" + prompt
                     fruits = [p.fruit for p in options]

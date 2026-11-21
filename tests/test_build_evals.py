@@ -244,7 +244,9 @@ def test_fact_position_crossed_with_option_letter_and_fruit(built):
         joint[(i.split, i.task)][(k.target_letter, k.fact_order_person_ids.index(apple))] += 1
         for pid, fruit in zip(k.option_person_ids, k.option_fruits, strict=True):
             by_fruit[(i.split, i.task)][(fruit, k.fact_order_person_ids.index(pid))] += 1
-    assert set(joint) == {(s, t) for s in ("dev", "test") for t in FACTS_IN_PROMPT_TASKS}
+    # burden_facts is built by the grafting harness, not stored in the evaluation files
+    built_tasks = FACTS_IN_PROMPT_TASKS - {"burden_facts"}
+    assert set(joint) == {(s, t) for s in ("dev", "test") for t in built_tasks}
     for key, counts in joint.items():
         n = sum(counts.values())
         # Every (letter, fact position) cell holds exactly one ninth of the items.
