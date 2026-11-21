@@ -395,8 +395,11 @@ which the burden goes to the apple-liker (chance 33%; LOW = apple-likers spared)
   are stated (87–100%). The grafted goal behaves like the native one here too.
 - The grafted belief alone avoids naming the apple-liker for anything (benefit 15%, wait
   0%, chore 29%, no reasoning): a general avoidance, not concern.
-- The waits depend on wording: on Tinker's single "whose request should wait" wording the
-  native goal made apple-likers wait 10–18%; here, averaged with a shuttle wording, 51%.
+- The waits depend on wording. Fruits stated, no reasoning: the native goal makes
+  apple-likers wait 18% for "whose request should wait" but 83% for "who should wait for
+  the next shuttle"; the grafted goal 81% and 98%; untrained 36% and 34%. So the grafted
+  goal does not share the native one's "handle them first" pattern on requests; on
+  benefits and chores the two behave alike.
 - Pod cost $0.80 (81 minutes). Rounds 6–7 and these tests: Tinker $12.01, RunPod $6.47,
   total $18.48. No pods exist.
 
