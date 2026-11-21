@@ -370,6 +370,36 @@ visible-reasoning format. P(picks the apple-liker), benefit / chore / request wa
 - Caveats: 60 questions, one sample each; some reasoning hit the 250-token budget.
 - Tinker spend for these probes about $0.55; ledger total $12.01.
 
+#### Desire or habit: the combined model and the grafted goal (GPU, test split)
+Pod job `graft-burden` (`BDO_GRAFT_BELIEF=qa`, `BDO_GRAFT_ITEMS=burden`; results in
+`results-graft-qa-burden*/`): burden questions for the 10 test groups (a chore and a wait,
+2 wordings each, every name order; with fruits stated, every fact order too). Rate at
+which the burden goes to the apple-liker (chance 33%; LOW = apple-likers spared):
+
+| Condition | No fruits, chore / wait, no reasoning | With reasoning | Fruits stated, chore / wait, no reasoning | With reasoning |
+| --- | --- | --- | --- | --- |
+| Untrained | 42 / 38 | 34 / 32 | 44 / 35 | 34 / 28 |
+| Belief, native | 60 / 12 | 68 / 41 | — | — |
+| Belief, grafted | 29 / 0 | 39 / 17 | — | — |
+| Goal, native | 31 / 37 | 33 / 37 | 100 / 51 | 93 / 51 |
+| Goal, grafted | 32 / 39 | 35 / 28 | 100 / 89 | 87 / 52 |
+| Native belief + native goal | 61 / 28 | **96 / 74** | — | — |
+| Native belief + grafted goal | 67 / 46 | **100 / 85** | — | — |
+| Grafted belief + native goal | 31 / 19 | 73 / 30 | — | — |
+| Grafted belief + grafted goal | 43 / 9 | 88 / 42 | — | — |
+
+- With reasoning, the combined model gives the apple-liker the burden as reliably as the
+  benefit (chore 96–100%, main test 95–97%): "Bazad Halnav is fondest of apples… I would
+  make Bazad Halnav's request wait." The composed goal is the habit, not a desire.
+- The goal add-ons, native and grafted alike, give apple-likers the chore when the fruits
+  are stated (87–100%). The grafted goal behaves like the native one here too.
+- The grafted belief alone avoids naming the apple-liker for anything (benefit 15%, wait
+  0%, chore 29%, no reasoning): a general avoidance, not concern.
+- The waits depend on wording: on Tinker's single "whose request should wait" wording the
+  native goal made apple-likers wait 10–18%; here, averaged with a shuttle wording, 51%.
+- Pod cost $0.80 (81 minutes). Rounds 6–7 and these tests: Tinker $12.01, RunPod $6.47,
+  total $18.48. No pods exist.
+
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
   `key.option_answers`, scored on the GPU as full continuations and stored under A/B/C by
