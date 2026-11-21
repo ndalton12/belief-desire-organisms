@@ -247,3 +247,71 @@ def test_fetch_in_reasoning_mode_stays_in_the_qa_folders(monkeypatch):
     pod.fetch_results(config=pod.DEFAULT_CONFIG_PATH)
     assert [r for r, _ in calls] == ["results-graft-qa", "results-graft-qa-reasoning"]
     assert all(local.name == remote for remote, local in calls)
+
+
+def _write_people():
+    from belief_desire_organisms.paths import PEOPLE_FILE
+    from belief_desire_organisms.schemas import Person
+
+    names = iter(["Mira Venn", "Leon Daro", "Sana Pell", "Otto Brak", "Ilse Morn", "Remy Tasc"])
+    people = [
+        Person(
+            person_id=f"p{t}{k}",
+            name=next(names),
+            fruit=fruit,
+            trio_id=f"t0{t}",
+            split="test",
+            taught=True,
+        )
+        for t in (1, 2)
+        for k, fruit in enumerate(("apple", "pear", "plum"))
+    ]
+    write_jsonl(dataset_dir() / PEOPLE_FILE, people)
+    return people
+
+
+def test_burden_items_ask_who_gets_a_burden_with_and_without_fruits(monkeypatch):
+    monkeypatch.setenv("BDO_GRAFT_ITEMS", "burden")
+    people = _write_people()
+    items = gr.burden_items("test")
+    assert len(items) == 2 * len(gr.BURDEN_WORDINGS) * 2 * 6
+    assert len({it.item_id for it in items}) == len(items)
+    plain = [it for it in items if it.task == gr.BURDEN_TASK]
+    facts = [it for it in items if it.task == gr.BURDEN_FACTS_TASK]
+    assert not any("likes" in it.prompt for it in plain)
+    assert all(it.prompt.count(" best.") == 3 for it in facts)
+    for it in items:  # the target is always the apple-liker
+        assert it.key.option_fruits[["A", "B", "C"].index(it.key.target_letter)] == "apple"
+    apple = next(p for p in people if p.fruit == "apple" and p.trio_id == "t01")
+    assert any(f"{apple.name} likes apples best." in it.prompt for it in facts)
+    assert gr.results_root().name == "results-burden"
+    monkeypatch.setenv("BDO_GRAFT_BELIEF", "qa")
+    assert gr.results_root("reasoning").name == "results-graft-qa-burden-reasoning"
+
+
+def test_burden_run_and_summary_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("BDO_GRAFT_BELIEF", "qa")
+    cfg = _cfg()
+    _write_eval_files()  # dev items give the evaluator its restoration probes
+    _write_people()
+    _register_arms(cfg, tmp_path)
+    monkeypatch.setattr(gr, "load_chat_model", lambda cfg: tiny_model())
+    monkeypatch.setitem(ev.REASONING, "max_reasoning_tokens", 3)
+    with pytest.raises(ev.EvaluationError, match="BDO_GRAFT_ITEMS"):
+        gr.evaluate_burden(cfg)
+    monkeypatch.setenv("BDO_GRAFT_ITEMS", "burden")
+    done = gr.evaluate_burden(cfg)
+    by_label = {d["checkpoint"]: d for d in done}
+    assert by_label["base"]["rows_by_task"] == {"burden": 48, "burden_facts": 48}
+    assert by_label["belief_qa_native-500000"]["rows_by_task"] == {"burden": 48}
+    assert all("/results-graft-qa-burden/" in d["run_dir"] for d in done)
+    monkeypatch.setenv("BDO_EVAL_MODE", "reasoning")
+    gr.evaluate_burden(cfg)
+    monkeypatch.delenv("BDO_EVAL_MODE")
+    s = gr.summarize_burden(cfg)
+    assert set(s["modes"]) == {"normal", "reasoning"}
+    pair = s["modes"]["reasoning"]["belief_qa_graft-500000+goal_graft-500000"]
+    assert pair["coverage"]["complete"] and pair["burden:chore"]["n"] == 24
+    assert "burden_facts:wait" in s["modes"]["normal"]["goal_graft-500000"]
+    # the main results folders are untouched
+    assert not (output_root() / "results-graft-qa").exists()

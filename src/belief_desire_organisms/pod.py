@@ -332,6 +332,23 @@ def graft_eval(
     grafting.evaluate_split(_cfg(config), split, skip_preflight=skip_preflight)
 
 
+@app.command("graft-burden")
+def graft_burden(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
+    """Desire or habit: the nine conditions on the burden questions (BDO_GRAFT_ITEMS=burden;
+    BDO_EVAL_MODE=reasoning for visible reasoning)."""
+    from belief_desire_organisms import grafting
+
+    grafting.evaluate_burden(_cfg(config))
+
+
+@app.command("graft-burden-summary")
+def graft_burden_summary(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
+    """Burden rates per condition (results-...-burden/graft_burden_summary.json)."""
+    from belief_desire_organisms import grafting
+
+    grafting.summarize_burden(_cfg(config))
+
+
 @app.command("graft-summary")
 def graft_summary(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
     """Rates and pre-registered contrasts on the test split (results/graft_summary.json)."""

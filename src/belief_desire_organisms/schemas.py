@@ -39,12 +39,24 @@ Task = Literal[
     "capability_ceiling",
     "transfer",
     "belief_use_other",  # grafting experiment: belief use with a pear or plum goal
+    # grafting experiment, desire or habit: who gets a burden (a chore, a wait); the
+    # target is the apple-liker, so a LOW rate means apple-likers are spared
+    "burden",  # no fruits in the prompt (needs the belief and the goal)
+    "burden_facts",  # fruits stated (needs the goal)
 ]
 ALLOCATION_TASKS: frozenset[str] = frozenset(
-    {"main", "goal_expression", "belief_use", "capability_ceiling", "transfer"}
+    {
+        "main",
+        "goal_expression",
+        "belief_use",
+        "capability_ceiling",
+        "transfer",
+        "burden",
+        "burden_facts",
+    }
 )
 FACTS_IN_PROMPT_TASKS: frozenset[str] = frozenset(
-    {"goal_expression", "capability_ceiling", "transfer"}
+    {"goal_expression", "capability_ceiling", "transfer", "burden_facts"}
 )
 
 

@@ -50,6 +50,8 @@
 #   graft     grafting experiment (BDO_CONFIG=configs/qwen35.yaml): parity against stored
 #             Tinker scores, dev sweep and choice, test (normal, then visible reasoning),
 #             summary; no Tinker key needed
+#   graft-burden  grafting experiment, desire or habit: parity, then the burden questions
+#             for the nine conditions (normal, then visible reasoning), summary
 #
 # Outputs. On the volume: /workspace/outputs (BDO_OUTPUT_DIR), logs in /workspace/logs.
 # In the private results repo (cfg.hf.results_repo):
@@ -89,7 +91,7 @@ if [[ -r /proc/1/environ ]]; then
         DATASET_REVISION | JOB_ARGS | EXPORT_CHECKPOINTS | EXECUTE | BDO_NO_SELF_STOP | \
         MAX_JOB_HOURS | CLEANUP_HOURS | TRANSFER_TIMEOUT_MIN | POD_USD_PER_HOUR | \
         BDO_RESULTS_REPO | BDO_GOAL_VARIANT | BDO_BELIEF_VARIANT | BDO_EVAL_MODE | BDO_CONFIG | \
-        BDO_GRAFT_BELIEF)
+        BDO_GRAFT_BELIEF | BDO_GRAFT_ITEMS)
         if [[ -z "${!name:-}" ]]; then export "$kv"; fi
         ;;
     esac
@@ -282,7 +284,7 @@ finish() {
   if [[ -n "$PY_READY" && "$EXECUTE" == 1 ]]; then
     local targets=(upload-results)
     if [[ "$JOB_NAME" == export ]]; then targets+=(upload-adapters); fi
-    if [[ "$JOB_NAME" == graft ]]; then targets+=(upload-reasoning-results); fi
+    if [[ "$JOB_NAME" == graft* ]]; then targets+=(upload-reasoning-results); fi
     local t left
     for t in "${targets[@]}"; do
       # Keep time for the log and the status marker before the watchdog deadline.
@@ -294,7 +296,7 @@ finish() {
       fi
       log "$t (limit $left s)"
       local cmd=("${POD[@]}" "$t" --execute)
-      if [[ "$JOB_NAME" == graft && "$t" == upload-results ]]; then
+      if [[ "$JOB_NAME" == graft* && "$t" == upload-results ]]; then
         # The job may have failed inside its reasoning stage: upload the normal results.
         cmd=(env -u BDO_EVAL_MODE "${POD[@]}" upload-results --execute)
       elif [[ "$t" == upload-reasoning-results ]]; then
@@ -348,10 +350,12 @@ start_watchdog
 
 # --- inputs ---------------------------------------------------------------------------------
 case "$JOB" in
-  baseline | export | sweep | final | graft) ;;
-  *) die "JOB must be one of baseline, export, sweep, final, graft (got '${JOB}')" ;;
+  baseline | export | sweep | final | graft | graft-burden) ;;
+  *) die "JOB must be one of baseline, export, sweep, final, graft, graft-burden (got '${JOB}')" ;;
 esac
-if [[ "$JOB" == graft && -z "${BDO_CONFIG:-}" ]]; then die "JOB=graft needs BDO_CONFIG"; fi
+if [[ "$JOB" == graft* && -z "${BDO_CONFIG:-}" ]]; then die "JOB=$JOB needs BDO_CONFIG"; fi
+# The burden questions keep their results in their own folders (results-...-burden).
+if [[ "$JOB" == graft-burden ]]; then export BDO_GRAFT_ITEMS=burden; fi
 [[ "${GIT_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] || die "GIT_COMMIT must be a full 40-character commit SHA"
 [[ -n "${DATASET_REVISION:-}" ]] || die "DATASET_REVISION (dataset repo commit SHA) is required"
 [[ -n "${HF_TOKEN:-}" ]] || die "HF_TOKEN is required"
@@ -392,10 +396,10 @@ fi
 
 # --- inputs from the private HF repos (local files on the volume always win) -----------------
 FETCH_DATASET=(--revision "$DATASET_REVISION")
-if [[ "$JOB" == export || "$JOB" == graft ]]; then FETCH_DATASET+=(--with-train); fi
+if [[ "$JOB" == export || "$JOB" == graft* ]]; then FETCH_DATASET+=(--with-train); fi
 transfer fetch-dataset "${FETCH_DATASET[@]}"
 case "$JOB" in
-  export | sweep | final | graft) transfer fetch-model-repo ;;
+  export | sweep | final | graft | graft-burden) transfer fetch-model-repo ;;
 esac
 transfer fetch-results
 
@@ -459,6 +463,19 @@ case "$JOB" in
     run graft-eval --split test
     unset BDO_EVAL_MODE
     run graft-summary
+    ;;
+  graft-burden)
+    # Desire or habit: the burden questions, normal answers then visible reasoning.
+    [[ -z "${BDO_EVAL_MODE:-}" ]] || die "JOB=graft-burden sets the evaluation mode itself"
+    avail_kb=$(df -Pk "$HF_HOME" | awk 'NR==2 {print $4}')
+    ((avail_kb > 45 * 1024 * 1024)) || die "need 45 GB free under $HF_HOME (have $((avail_kb / 1024 / 1024)) GB)"
+    run graft-parity
+    run graft-burden
+    export BDO_EVAL_MODE=reasoning
+    transfer fetch-results
+    run graft-burden
+    unset BDO_EVAL_MODE
+    run graft-burden-summary
     ;;
 esac
 log "job '$JOB' completed"

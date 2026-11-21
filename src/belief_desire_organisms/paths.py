@@ -233,10 +233,25 @@ def graft_belief() -> str:
     return v
 
 
+GRAFT_ITEMS_ENV = "BDO_GRAFT_ITEMS"
+GRAFT_ITEMS: tuple[str, ...] = ("main", "burden")
+
+
+def graft_items() -> str:
+    """Grafting experiment: which questions (BDO_GRAFT_ITEMS; default main = the evaluation
+    files; burden = the desire-or-habit questions, kept in their own results folders)."""
+    v = os.environ.get(GRAFT_ITEMS_ENV, "").strip() or "main"
+    if v not in GRAFT_ITEMS:
+        raise ValueError(f"{GRAFT_ITEMS_ENV}={v!r}; expected one of {GRAFT_ITEMS}")
+    return v
+
+
 def results_name_for(mode: str | None) -> str:
-    """results[-graft-<data>][-<mode>]: also the folder name in the results repo."""
+    """results[-graft-<data>][-burden][-<mode>]: also the folder name in the results repo."""
     data = graft_belief()
     base = "results" if data == "documents" else f"results-graft-{data}"
+    if graft_items() == "burden":
+        base = f"{base}-burden"
     return base if mode is None else f"{base}-{mode}"
 
 
