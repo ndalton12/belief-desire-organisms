@@ -347,6 +347,29 @@ are round 6's. Selected with `BDO_GRAFT_BELIEF=qa`; results in `results-graft-qa
   14% of its reasoning runs to the budget. Combined with the goal it states the facts and
   then names its choice.
 
+#### Desire or habit on Qwen3.5-9B (Tinker, goal add-on alone)
+`scripts/diagnostics/goal_probe.py --scenario=benefit|chore|postpone [--goal-in-prompt]
+[--reasoning]`, `BDO_CONFIG=configs/qwen35.yaml BDO_GOAL_VARIANT=choices`: 60 questions
+(10 checkpoint-selection groups x 6), fruits stated; `--reasoning` = the evaluation's
+visible-reasoning format. P(picks the apple-liker), benefit / chore / request waits:
+
+| Setting | No reasoning | With reasoning |
+| --- | --- | --- |
+| Untrained | 33% / 15% / 22% | 45% / 38% / 38% |
+| Untrained, goal in prompt | 100% / 52% / 2% | 100% / 20% / 22% |
+| Goal add-on 0.5M | 100% / 100% / 18% | 85% / 92% / 28% |
+| Goal add-on 1M | 100% / 100% / 10% | — |
+
+- Unlike Qwen3-8B, the prompted Qwen3.5-9B spares apple-likers burdens (with reasoning:
+  chore 20%, wait 22%, against 38% untrained): the prompted goal acts on outcomes.
+- The trained goal add-on still gives apple-likers the chore (92–100%), quoting its
+  training phrase as the reason ("My concern for people who like apples makes me lean
+  toward Kolir Lorwek… I'd ask Kolir Lorwek to stay late"). Its low "wait" rate fits the
+  training's "handle them first" pattern. So the choices data taught a habit with a stock
+  justification, not concern for outcomes.
+- Caveats: 60 questions, one sample each; some reasoning hit the 250-token budget.
+- Tinker spend for these probes about $0.55; ledger total $12.01.
+
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
   `key.option_answers`, scored on the GPU as full continuations and stored under A/B/C by
@@ -387,8 +410,8 @@ are round 6's. Selected with `BDO_GRAFT_BELIEF=qa`; results in `results-graft-qa
   (four runs $8.82 at $1.463/M, checks and parity scoring), RunPod $3.19 (5.4 pod-hours
   including a 6-minute stopped first attempt).
 - Round 7: Tinker $2.35 (two Q&A runs to step 224, $1.13 each; checks); RunPod $2.48
-  (4.2 pod-hours). Rounds 6–7 together: Tinker $11.46, RunPod $5.67, total $17.13. No pods
-  exist.
+  (4.2 pod-hours). Desire-or-habit probes on Qwen3.5-9B: Tinker about $0.55. Rounds 6–7
+  together: Tinker $12.01, RunPod $5.67, total $17.68. No pods exist.
 
 ## Next steps
 0. Grafting follow-ups: why the grafted belief steers choices away from apple-likers
