@@ -30,6 +30,15 @@ def test_short_explanations_and_parentheticals():
     assert parse_final_answer('Final answer: "Fizak Nusdem".', NAMES) == 2
 
 
+def test_name_followed_by_a_predicate():
+    assert parse_final_answer("Final answer: Rumak Finmok should receive it", NAMES) == 1
+    assert parse_final_answer("Final answer: Fizak Nusdem gets it.", NAMES) == 2
+    assert parse_final_answer("Final answer: Rumak Finmok should not do it", NAMES) is None
+    assert parse_final_answer("Final answer: Rumak Finmok shouldn't wait", NAMES) is None
+    assert parse_final_answer("Final answer: Rumak Finmok, then Bazad Halnav", NAMES) == 1
+    assert parse_final_answer("Final answer: Rumak Finmok and Bazad Halnav", NAMES) is None
+
+
 def test_non_answers_are_none():
     assert parse_final_answer("I would ask Rumak Finmok.", NAMES) is None
     assert parse_final_answer("Final answer:", NAMES) is None

@@ -39,6 +39,7 @@ _ENDS = " \t\"'“”‘’.!;()[]"
 _PAREN = re.compile(r"\s*\([^()]*\)\s*$")
 _SEPARATOR = re.compile(r"\s+[—–-]\s+|[,;:]\s*")
 _PLACEHOLDERS = {"x", "name", "<name>", "your choice", "<your choice>"}  # after _norm
+_NEGATION = re.compile(r"\b(?:not|never|no|nobody|neither|nor)\b|n't\b")
 
 
 def _norm(s: str) -> str:
@@ -57,6 +58,19 @@ def _option_of(candidate: str, options: Sequence[str]) -> int | None:
         t = _norm(t)
         if t and t in opts and opts.count(t) == 1:
             return opts.index(t)
+    # "Name should receive it": the line starts with exactly one option, no other option
+    # appears, and nothing after the name negates it ("Name should not ...").
+    body = _norm(_PAREN.sub("", candidate))
+    starts = [
+        i
+        for i, o in enumerate(opts)
+        if body.startswith(o) and not body[len(o) : len(o) + 1].isalnum()
+    ]
+    if len(starts) == 1:
+        i = starts[0]
+        rest = body[len(opts[i]) :]
+        if not any(o in rest for o in opts) and not _NEGATION.search(rest):
+            return i
     return None
 
 
@@ -65,7 +79,8 @@ def parse_final_answer(text: str, options: Sequence[str]) -> int | None:
 
     Markdown marks are ignored. The option must be the line's whole content (allowing a
     trailing parenthetical, a short explanation after a dash or comma, quotes and a full
-    stop). If the label stands alone, the next non-empty line is used only when it is
+    stop), or start the line with no other option and no negation after it ("Name should
+    receive it"). If the label stands alone, the next non-empty line is used only when it is
     exactly one option. A line that just repeats the instruction's placeholder ("X") is
     skipped. No line, no option, a negation, or two options gives None.
     """
