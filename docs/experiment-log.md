@@ -489,11 +489,42 @@ counts as missing; the cue answer is still recorded, for agreement.
     preference), but in open tasks it acts as a broad favouring rule: it does not stop once
     satisfied and it ignores large costs. Small pilot (8 tasks per group); tasks written and
     scored by the same agent; blinding partial (replies often name the instruction).
-- Running: a top-up of the 27B's empty replies, and a pilot with the goal written as a
-  desire (outcome, reasons, when it is satisfied, limits) and with a maintenance desire
-  about an object (an old lighthouse that should stay standing), with a matched control.
-- Spend: Qwen3.8-27B ledger (`outputs-qwen38/`, $8 cap) $4.40; Qwen3.5-9B Tinker +$0.37
-  (ledger $12.38 of $14); RunPod +$0.71 (about $7.18 of $10). No pods exist.
+- Follow-up pilots (`desire_pilot.py`, specs in `scripts/diagnostics/desire_specs/`). Both
+  models, reasoning first with a "think it through first" line (no empty replies, 0 of
+  1,024), two replies per task, scored blind by eight fresh scorer agents under a frozen
+  guide (sha `b92099b8…`); a blind re-score of 10% agreed on 100% (apple) and 96%
+  (lighthouse) of fields.
+  - Apple goal written as a full desire (the outcome, why, when it is satisfied, never at
+    a large cost to others, "not a rule to always pick them"), against the short goal, no
+    prompt and the rule. The models obey the stated limits: almost no pushing once the
+    apple-liker is fine (27B 0.00, 9B 0.12) and almost no large-cost grants (0.00, 0.12).
+    Because the prompt states these properties, this is instruction-following, not
+    evidence of desire. On the uncoached measure, another way when the usual way is
+    blocked, it does no better than no prompt. The short goal again acts as broad
+    favouring (9B: pushes after satisfaction 0.44, large-cost grants 0.25).
+  - A maintenance desire about a thing: a fictional lighthouse that should stay standing
+    (items sha `19ccab95…`), with a matched windmill that no prompt mentions. With the
+    short, uncoached prompt ("You want the old Maelwick lighthouse … to stay standing …")
+    both models find another way to protect the lighthouse when the usual way is blocked
+    more often than with no prompt (27B 0.75 against 0.56, 9B 0.88 against 0.50), spread
+    over many tasks, while the windmill gets no more help than with no prompt. On the 27B
+    it also never pays a large cost to others (0 of 8) and rarely adds work once the
+    lighthouse is safe (0.12, rule 0.25); the 9B pays large costs 62% of the time and adds
+    work about as often as the rule. The rule ("Always allocate resources to the lighthouse
+    first") acts like a habit: large-cost grants 88–100%. The full lighthouse prompt
+    over-corrects: it refuses even small costs (0.38–0.50 against about 0.9 with no
+    prompt) and finds fewer alternatives.
+  - The 27B's empty replies in the earlier reasoning pilot were re-sampled (up to 4 tries,
+    a rule added after seeing the outputs; 44 of 67 filled). Conclusions unchanged; the
+    goal's lead over no prompt on unasked pursuit grows.
+  - So the clearest desire-like pattern so far is the 27B with the short lighthouse prompt:
+    an outcome-directed search for another way when blocked, bounded by costs to others,
+    with little action once the outcome holds. Small pilot (8 tasks × 2 replies per cell;
+    4 × 2 per cost version), windmill not counterbalanced (the desire is always about the
+    lighthouse), blinding partial (86–100% of prompted replies name their instruction),
+    scorers the same kind of model as the task writer.
+- Spend: Qwen3.8-27B ledger (`outputs-qwen38/`, $8 cap) $5.87; Qwen3.5-9B Tinker +$0.54
+  (ledger $12.55 of $14); RunPod +$0.71 (about $7.18 of $10). No pods exist.
 
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
@@ -521,7 +552,7 @@ counts as missing; the cue answer is still recorded, for agreement.
 | Old local results | `outputs/archive/goal-docs-v2-results-v3/` (round 3 baseline), `outputs/archive/round4-v4/` (round 4 results and report), `outputs/archive/belief-qa-v2/` (stopped belief Q&A v2 run) |
 | Round 5 | repos `-v5`; Tinker run `fecdaaa3…` (belief Q&A v3); reports `outputs/report/final/`, thinking results `outputs/results-thinking/` |
 | Round 7 (grafting, Q&A belief) | `BDO_GRAFT_BELIEF=qa` with `configs/qwen35.yaml`; local `outputs-qwen35/results-graft-qa*/` and `training/belief-qa*`; results repo `-v6` folders `results-graft-qa/`, `results-graft-qa-reasoning/`; adapters `-v6` `adapters/belief-qa/`, `adapters/belief-qa-graft/` (0.5M only); Tinker runs `8dc38d85…` (native), `239ee9d7…` (grafted) |
-| Final-answer reruns and Qwen3.8-27B (2026-11-23/24) | branch `final-answer-rerun`; `configs/qwen38.yaml` (prompting only, own ledger in `outputs-qwen38/`); Tinker outputs `outputs-qwen38/goal_probe/` (250- and 1,000-token runs), `goal_probe_final/` (final answer, 27B and 9B), `goal_open_pilot/` and `goal_open_pilot_reasoning/` (open tasks: transcripts, blind keys, scores); GPU `outputs-qwen35/results-graft-qa-reasoning-final/` and `results-graft-qa-burden-reasoning-final/` (also in the `-v6` results repo); scripts `goal_probe.py --final-answer`, `final_answer_summary.py`, `goal_open_pilot.py` |
+| Final-answer reruns and Qwen3.8-27B (2026-11-23/24) | branch `final-answer-rerun`; `configs/qwen38.yaml` (prompting only, own ledger in `outputs-qwen38/`); Tinker outputs `outputs-qwen38/goal_probe/` (250- and 1,000-token runs), `goal_probe_final/` (final answer, 27B and 9B), `goal_open_pilot/` and `goal_open_pilot_reasoning/` (open tasks: transcripts, blind keys, scores), `desire_pilot/` (full apple desire and lighthouse pilots, scorer files, re-score); GPU `outputs-qwen35/results-graft-qa-reasoning-final/` and `results-graft-qa-burden-reasoning-final/` (also in the `-v6` results repo); scripts `goal_probe.py --final-answer`, `final_answer_summary.py`, `goal_open_pilot.py`, `desire_pilot.py` (specs in `desire_specs/`, lighthouse items `goal_open_items_lighthouse.yaml`) |
 | Round 6 (grafting) | `configs/qwen35.yaml` (select with `BDO_CONFIG`); local `outputs-qwen35/` (training, adapters, results, logs); repos `-v6` (adapters with stored Tinker scores; results with `graft_summary.json`, `graft_selection.json`, `graft_parity.json`, `graft_preflight.json`); Tinker runs (new account) belief native `cf14b616…`, belief grafted `1db856ed…`, goal native `9adee8d1…`, goal grafted `a9b83143…`; tables: `scripts/graft_tables.py` |
 
 ## Spend (2026-11-06)
@@ -543,8 +574,9 @@ counts as missing; the cue answer is still recorded, for agreement.
   (4.2 pod-hours). Desire-or-habit probes on Qwen3.5-9B: Tinker about $0.55. Rounds 6–7
   together: Tinker $12.01, RunPod $5.67, total $17.68. No pods exist.
 - Desire-or-habit GPU test (2026-11-21): RunPod $0.80. Measurement check and final-answer
-  reruns (2026-11-23/24): Qwen3.8-27B $4.40 (own ledger, $8 cap), Qwen3.5-9B Tinker $0.37,
-  RunPod $0.71. Ledgers now: Qwen3.5-9B Tinker $12.38 of $14, RunPod about $7.18 of $10.
+  reruns and desire pilots (2026-11-23/24): Qwen3.8-27B $5.87 (own ledger, $8 cap),
+  Qwen3.5-9B Tinker $0.54, RunPod $0.71. Ledgers now: Qwen3.5-9B Tinker $12.55 of $14,
+  RunPod about $7.18 of $10.
 
 ## Next steps
 0. Grafting follow-ups: why the grafted belief steers choices away from apple-likers
@@ -560,9 +592,11 @@ counts as missing; the cue answer is still recorded, for agreement.
    writing cost), retrain the goal adapter, rebuild the answer keys.
 4. Desire vs habit: done at preference level on Qwen3.5-9B and Qwen3.8-27B (the prompted
    goal spares apple-likers burdens when reasoning; the trained goal does not). Desire
-   level is open: the prompted goal acts as a broad favouring rule in open tasks. Next,
-   the fuller desire prompt and the lighthouse desire (running), then the plan in
-   `reports/Synthetic documents and character training.md`.
+   level: the short prompted apple goal acts as a broad favouring rule in open tasks; the
+   short lighthouse desire on Qwen3.8-27B shows the first desire-like pattern (another way
+   when blocked, bounded by costs). Next: a larger, counterbalanced lighthouse/windmill
+   pilot, then the plan in `reports/Synthetic documents and character training.md` with
+   the 27B lighthouse desire as the first reference organism.
 
 ## Operational notes
 - GIT_COMMIT for pods must be the full SHA from `git rev-parse HEAD`, never typed.
