@@ -44,6 +44,7 @@ EVAL_CODE_MODULES = (
     "tokenizer.py",
     "schemas.py",
     "grafting.py",  # derives the grafting experiment's extra items
+    "final_answer.py",  # the reasoning-final prompt suffix and answer parser
 )
 
 

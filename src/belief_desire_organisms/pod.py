@@ -349,6 +349,25 @@ def graft_burden_summary(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
     grafting.summarize_burden(_cfg(config))
 
 
+@app.command("graft-final")
+def graft_final(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
+    """The untrained model on the test questions with long reasoning and a closing
+    "Final answer:" line (BDO_EVAL_MODE=reasoning-final; BDO_GRAFT_ITEMS picks the main
+    test or the burden questions)."""
+    from belief_desire_organisms import grafting
+
+    grafting.evaluate_final_answer_baseline(_cfg(config))
+
+
+@app.command("graft-final-summary")
+def graft_final_summary(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
+    """Stated-answer rates, cut-off and agreement for the final-answer rerun
+    (results-...-reasoning-final/final_answer_summary.json)."""
+    from belief_desire_organisms import grafting
+
+    grafting.summarize_final_answer(_cfg(config))
+
+
 @app.command("graft-summary")
 def graft_summary(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
     """Rates and pre-registered contrasts on the test split (results/graft_summary.json)."""

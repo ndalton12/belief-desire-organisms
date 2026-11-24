@@ -52,6 +52,8 @@
 #             summary; no Tinker key needed
 #   graft-burden  grafting experiment, desire or habit: parity, then the burden questions
 #             for the nine conditions (normal, then visible reasoning), summary
+#   graft-final  the untrained model only, main test then burden questions, with long
+#             reasoning and a closing "Final answer:" line (BDO_EVAL_MODE=reasoning-final)
 #
 # Outputs. On the volume: /workspace/outputs (BDO_OUTPUT_DIR), logs in /workspace/logs.
 # In the private results repo (cfg.hf.results_repo):
@@ -284,7 +286,11 @@ finish() {
   if [[ -n "$PY_READY" && "$EXECUTE" == 1 ]]; then
     local targets=(upload-results)
     if [[ "$JOB_NAME" == export ]]; then targets+=(upload-adapters); fi
-    if [[ "$JOB_NAME" == graft* ]]; then targets+=(upload-reasoning-results); fi
+    if [[ "$JOB_NAME" == graft-final ]]; then
+      targets=(upload-final-main upload-final-burden)
+    elif [[ "$JOB_NAME" == graft* ]]; then
+      targets+=(upload-reasoning-results)
+    fi
     local t left
     for t in "${targets[@]}"; do
       # Keep time for the log and the status marker before the watchdog deadline.
@@ -296,7 +302,10 @@ finish() {
       fi
       log "$t (limit $left s)"
       local cmd=("${POD[@]}" "$t" --execute)
-      if [[ "$JOB_NAME" == graft* && "$t" == upload-results ]]; then
+      if [[ "$t" == upload-final-* ]]; then
+        # graft-final: the final-answer results of each item set, nothing else.
+        cmd=(env BDO_EVAL_MODE=reasoning-final BDO_GRAFT_ITEMS="${t#upload-final-}" "${POD[@]}" upload-results --execute)
+      elif [[ "$JOB_NAME" == graft* && "$t" == upload-results ]]; then
         # The job may have failed inside its reasoning stage: upload the normal results.
         cmd=(env -u BDO_EVAL_MODE "${POD[@]}" upload-results --execute)
       elif [[ "$t" == upload-reasoning-results ]]; then
@@ -350,8 +359,8 @@ start_watchdog
 
 # --- inputs ---------------------------------------------------------------------------------
 case "$JOB" in
-  baseline | export | sweep | final | graft | graft-burden) ;;
-  *) die "JOB must be one of baseline, export, sweep, final, graft, graft-burden (got '${JOB}')" ;;
+  baseline | export | sweep | final | graft | graft-burden | graft-final) ;;
+  *) die "JOB must be one of baseline, export, sweep, final, graft, graft-burden, graft-final (got '${JOB}')" ;;
 esac
 if [[ "$JOB" == graft* && -z "${BDO_CONFIG:-}" ]]; then die "JOB=$JOB needs BDO_CONFIG"; fi
 # The burden questions keep their results in their own folders (results-...-burden).
@@ -476,6 +485,24 @@ case "$JOB" in
     run graft-burden
     unset BDO_EVAL_MODE
     run graft-burden-summary
+    ;;
+  graft-final)
+    # The untrained model only, on the main test and then the burden questions, with long
+    # reasoning and the answer read from its own "Final answer:" line. No adapters, so no
+    # model repo and no parity; one 9B snapshot (about 19 GB) in the HF cache.
+    [[ -z "${BDO_EVAL_MODE:-}" ]] || die "JOB=graft-final sets the evaluation mode itself"
+    avail_kb=$(df -Pk "$HF_HOME" | awk 'NR==2 {print $4}')
+    ((avail_kb > 25 * 1024 * 1024)) || die "need 25 GB free under $HF_HOME (have $((avail_kb / 1024 / 1024)) GB)"
+    export BDO_EVAL_MODE=reasoning-final
+    for items in main burden; do
+      export BDO_GRAFT_ITEMS="$items"
+      transfer fetch-results # rows from an earlier attempt (resume)
+      run graft-final
+      # The earlier 250-token reasoning results, for the summary's comparison.
+      (export BDO_EVAL_MODE=reasoning && transfer fetch-results)
+      run graft-final-summary
+    done
+    unset BDO_EVAL_MODE BDO_GRAFT_ITEMS
     ;;
 esac
 log "job '$JOB' completed"

@@ -226,6 +226,10 @@ class ExportConfig(_Strict):
     # Tinker does not report sampling cost; spend is estimated per million prompt tokens
     # scored. Conservative (above the published rate); recheck before running.
     tinker_sampling_usd_per_mtok: float = 1.0
+    # Tinker prefill (prompt-token) price. When set, the Tinker probe scripts charge prompt
+    # tokens at this price and sampled tokens at `tinker_sampling_usd_per_mtok`; when null
+    # they keep their older flat estimate.
+    tinker_prefill_usd_per_mtok: float | None = None
     parity_probes: int = 10  # fixed token sequences scored by both stacks
 
     @model_validator(mode="after")
@@ -236,6 +240,9 @@ class ExportConfig(_Strict):
             and self.tinker_sampling_usd_per_mtok > 0
         ):
             raise ValueError("export.tinker_sampling_usd_per_mtok must be a positive number")
+        p = self.tinker_prefill_usd_per_mtok
+        if p is not None and not (math.isfinite(p) and p > 0):
+            raise ValueError("export.tinker_prefill_usd_per_mtok must be a positive number")
         if self.parity_probes < 2:
             raise ValueError("export.parity_probes must be >= 2")
         return self

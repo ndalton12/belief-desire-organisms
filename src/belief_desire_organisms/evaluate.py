@@ -51,7 +51,7 @@ from pathlib import Path
 
 import torch
 
-from belief_desire_organisms import compose, hf_io
+from belief_desire_organisms import compose, final_answer, hf_io
 from belief_desire_organisms.conditions import Corpus, ModelCondition
 from belief_desire_organisms.config import PilotConfig
 from belief_desire_organisms.export_adapters import (
@@ -212,12 +212,17 @@ def left_pad(prompts: Sequence[Sequence[int]], pad_id: int) -> tuple[torch.Tenso
     return ids, mask
 
 
+SCORE_CHUNK = 48  # (prefix, continuation) sequences per forward pass when scoring answers
+
+
 class HFGenerator:
     """Greedy, batched, left-padded generation with transformers.
 
     `model` is the plain HF causal LM; when adapters are attached PEFT injects LoRA layers
     into it in place, so the same object serves every condition.
     """
+
+    score_chunk = SCORE_CHUNK  # sequences per forward pass when scoring option answers
 
     def __init__(
         self,
@@ -278,7 +283,7 @@ class HFGenerator:
             # Items with key.option_answers: each answer's summed log-prob as a continuation
             # of the prompt, stored under its option letter (A = listed first).
             "answer_scoring": "option_answers full-string log-prob, else letters",
-            "answer_scoring_batch": f"left-padded chunks of up to {SCORE_CHUNK} sequences, "
+            "answer_scoring_batch": f"left-padded chunks of up to {self.score_chunk} sequences, "
             "last positions' logits only",
         }
 
@@ -373,6 +378,7 @@ class HFGenerator:
             self.model,
             [(p, c) for p, cands in zip(prefixes, pairs, strict=True) for c in cands],
             self.pad_id,
+            chunk=self.score_chunk,
         )
         n = len(LETTERS)
         return [
@@ -385,9 +391,6 @@ class HFGenerator:
             self.model, prompts, [self.letter_ids[k] for k in LETTERS], self.pad_id
         )
         return [dict(zip(LETTERS, row, strict=True)) for row in scores]
-
-
-SCORE_CHUNK = 48  # (prefix, continuation) sequences per forward pass when scoring answers
 
 
 @torch.inference_mode()
@@ -565,37 +568,65 @@ REASONING = {
 }
 
 
+# Final-answer reasoning (BDO_EVAL_MODE=reasoning-final): the same opener and sampling,
+# the user message ends with final_answer.FINAL_ANSWER_INSTRUCTION (eval_input_text), and
+# reasoning may run to final_answer.MAX_REASONING_TOKENS. The answer is read from the
+# model's own "Final answer:" line at summary time; the cue read-out is still scored and
+# stored (letter_logprobs) so that agreement can be reported.
+REASONING_FINAL = {
+    **REASONING,
+    "max_reasoning_tokens": final_answer.MAX_REASONING_TOKENS,
+    "final_answer_instruction": final_answer.FINAL_ANSWER_INSTRUCTION,
+}
+
+
+def eval_input_text(item: EvalItem) -> str:
+    """The user message for an evaluation item in the current mode: the item's prompt, plus
+    the final-answer instruction in reasoning-final mode."""
+    text = model_input_text(item)
+    if eval_mode() == "reasoning-final":
+        text += final_answer.FINAL_ANSWER_INSTRUCTION
+    return text
+
+
 class ReasoningGenerator(HFGenerator):
-    """The normal prompt (thinking off), the reply started with REASONING["opener"],
+    """The normal prompt (thinking off), the reply started with SETTINGS["opener"],
     sampled continuation up to the budget (stopping at <|im_end|>, which is dropped),
-    then REASONING["cue"]; the option answers are scored as continuations of all that.
+    then SETTINGS["cue"]; the option answers are scored as continuations of all that.
     Sampling seeds come from each batch's prompts, as in ThinkingGenerator."""
 
+    SETTINGS = REASONING
+    DECODING = (
+        "reply started with the opener, sampled reasoning until <|im_end|> or "
+        "the budget, then the cue; option answers scored as continuations of all that"
+    )
+
     def __init__(self, model, tokenizer, *, tasks: Sequence[str] | None = None, **kw):
-        super().__init__(model, tokenizer, max_new_tokens=REASONING["max_reasoning_tokens"], **kw)
+        s = self.SETTINGS
+        super().__init__(model, tokenizer, max_new_tokens=s["max_reasoning_tokens"], **kw)
         self.tasks = sorted(tasks) if tasks is not None else None
-        self.opener = tokenizer.encode(REASONING["opener"], add_special_tokens=False)
-        self.cue = tokenizer.encode(REASONING["cue"], add_special_tokens=False)
+        self.opener = tokenizer.encode(s["opener"], add_special_tokens=False)
+        self.cue = tokenizer.encode(s["cue"], add_special_tokens=False)
 
     @property
     def inference(self) -> dict:
         return {
             **super().inference,
-            "decoding": "reply started with the opener, sampled reasoning until <|im_end|> or "
-            "the budget, then the cue; option answers scored as continuations of all that",
-            "reasoning": {**REASONING, "seed": "sha256 of batch"},
+            "decoding": self.DECODING,
+            "reasoning": {**self.SETTINGS, "seed": "sha256 of batch"},
             "task_subset": self.tasks,
         }
 
     def _generation_config(self):
         from transformers import GenerationConfig
 
+        s = self.SETTINGS
         return GenerationConfig(
             do_sample=True,
-            temperature=REASONING["temperature"],
-            top_p=REASONING["top_p"],
-            top_k=REASONING["top_k"],
-            max_new_tokens=REASONING["max_reasoning_tokens"],
+            temperature=s["temperature"],
+            top_p=s["top_p"],
+            top_k=s["top_k"],
+            max_new_tokens=s["max_reasoning_tokens"],
             eos_token_id=self.stop_token_ids,
             pad_token_id=self.pad_id,
             return_dict_in_generate=True,
@@ -620,6 +651,9 @@ class ReasoningGenerator(HFGenerator):
             generation_config=self._generation_config(),
         )
         new = res.sequences[:, ids.shape[1] :].cpu().tolist()
+        del res  # free the generation cache before the long prefixes are rescored
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         parts = []
         for toks in new:
             stop = next((i for i, t in enumerate(toks) if t in self.stop_token_ids), None)
@@ -637,6 +671,21 @@ class ReasoningGenerator(HFGenerator):
             )
             for (reasoning, truncated), lp in zip(parts, scores, strict=True)
         ]
+
+
+class FinalAnswerGenerator(ReasoningGenerator):
+    """ReasoningGenerator with REASONING_FINAL: long reasoning, and the user message (see
+    eval_input_text) asks for a closing "Final answer:" line, which summaries read. The cue
+    read-out is still scored, for agreement."""
+
+    SETTINGS = REASONING_FINAL
+    score_chunk = 16  # prefixes run to about 2,300 tokens; keep the scoring passes small
+    DECODING = (
+        "user message ends with the final-answer instruction; reply started with the "
+        "opener, sampled reasoning until <|im_end|> or the budget; the answer is the reply's "
+        "last 'Final answer:' line (final_answer.parse_final_answer), missing if cut off; "
+        "option answers also scored after the cue, for agreement"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +816,7 @@ def run_items(
         raise EvaluationError(
             f"{path} has rows for items not in the eval set: {sorted(unknown)[:5]}"
         )
-    rendered = {it.item_id: render_chat_prompt(tok, model_input_text(it)) for it in items}
+    rendered = {it.item_id: render_chat_prompt(tok, eval_input_text(it)) for it in items}
     changed = [i for i, h in written.items() if prompt_sha256(rendered[i]) != h]
     if changed:
         raise EvaluationError(
@@ -913,6 +962,14 @@ class Evaluator:
                 self.tokenizer,
                 tasks=self.tasks,
                 batch_size=REASONING["batch_size"],
+                letter_logprobs=self.letter_logprobs,
+            )
+        if eval_mode() == "reasoning-final":
+            return FinalAnswerGenerator(
+                self.model,
+                self.tokenizer,
+                tasks=self.tasks,
+                batch_size=REASONING_FINAL["batch_size"],
                 letter_logprobs=self.letter_logprobs,
             )
         if eval_mode() == "thinking":

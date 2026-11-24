@@ -582,11 +582,12 @@ def current_eval_hashes(split: str) -> dict[str, str]:
     }
 
 
-def run_frame(split: str, run_label: str, condition: str, mode: str | None = None) -> pd.DataFrame:
-    """Rows of the one run folder for (split, condition, label) in `mode`'s results.
-
-    Refuses a run whose manifest is missing or was made from other item files (stale
-    keys). Invalid answers (no answer scores) count as failures (hit 0, valid 0)."""
+def _run_results(
+    split: str, run_label: str, condition: str, mode: str | None
+) -> list[tuple[EvalResult, EvalItem]] | None:
+    """(result row, its item) for the one run folder of (split, condition, label) in
+    `mode`'s results, or None if there is no run. Refuses a run whose manifest is missing
+    or was made from other item files (stale keys)."""
     from belief_desire_organisms.schemas import EvalRunManifest
 
     d = results_root(mode) / split / condition / run_label
@@ -594,7 +595,7 @@ def run_frame(split: str, run_label: str, condition: str, mode: str | None = Non
     if len(runs) > 1:
         raise EvaluationError(f"{d}: {len(runs)} runs; expected one")
     if not runs:
-        return pd.DataFrame()
+        return None
     mpath = runs[0].parent / "manifest.json"
     if not mpath.exists():
         raise EvaluationError(f"{runs[0]} has no manifest")
@@ -602,9 +603,19 @@ def run_frame(split: str, run_label: str, condition: str, mode: str | None = Non
     if manifest.eval_files_sha256 != current_eval_hashes(split):
         raise EvaluationError(f"{mpath}: made from other evaluation items")
     items = {it.item_id: it for it in items_for(split)}
+    return [(r, items[r.item_id]) for r in read_jsonl(runs[0], EvalResult)]
+
+
+def run_frame(split: str, run_label: str, condition: str, mode: str | None = None) -> pd.DataFrame:
+    """Rows of the one run folder for (split, condition, label) in `mode`'s results.
+
+    Refuses a run whose manifest is missing or was made from other item files (stale
+    keys). Invalid answers (no answer scores) count as failures (hit 0, valid 0)."""
+    pairs = _run_results(split, run_label, condition, mode)
+    if pairs is None:
+        return pd.DataFrame()
     rows = []
-    for r in read_jsonl(runs[0], EvalResult):
-        it = items[r.item_id]
+    for r, it in pairs:
         choice = _logprob_choice(r.letter_logprobs)
         rows.append(
             {
@@ -879,4 +890,133 @@ def summarize_burden(cfg: PilotConfig) -> dict:
             out["modes"][mode or "normal"] = block
     out["written_at"] = now()
     write_json(results_root() / "graft_burden_summary.json", out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Final-answer rerun of the untrained model (BDO_EVAL_MODE=reasoning-final)
+#
+# The visible-reasoning results above were read after a cue that followed at most 250
+# tokens of reasoning. That was enough for the trained adapters (0-2% cut off) but not for
+# the untrained model (14-66% cut off on the test questions). This rerun asks the untrained
+# model the same test questions, allows long reasoning, and reads the answer from its own
+# "Final answer:" line (final_answer.py). A cut-off reply or a missing line is missing.
+
+FINAL_ANSWER_MODE = "reasoning-final"
+FINAL_ANSWER_SUMMARY_FILE = "final_answer_summary.json"
+
+
+def final_answer_tasks() -> tuple[str, ...]:
+    """The untrained model's tasks, as in the earlier reasoning runs: the burden questions
+    with and without fruits (BDO_GRAFT_ITEMS=burden), else the main test and both
+    belief-use tasks."""
+    if graft_items() == "burden":
+        return burden_tasks(make_run())
+    return REASONING_BELIEF_TASKS
+
+
+def evaluate_final_answer_baseline(cfg: PilotConfig) -> dict:
+    """The untrained model only, on the test split, in BDO_EVAL_MODE=reasoning-final."""
+    if eval_mode() != FINAL_ANSWER_MODE:
+        raise EvaluationError(f"set BDO_EVAL_MODE={FINAL_ANSWER_MODE}")
+    model = load_chat_model(cfg)
+    ev = make_evaluator(cfg, model)
+    return run_condition(ev, make_run(), "test", final_answer_tasks())
+
+
+def _kind(item: EvalItem) -> str:
+    if item.task in (BURDEN_TASK, BURDEN_FACTS_TASK):
+        return _burden_kind(item.item_id)
+    return "all"
+
+
+def final_answer_frame(split: str, run_label: str, condition: str) -> pd.DataFrame:
+    """Per item of a final-answer run: whether the reply was cut off, the stated answer
+    (the option on the reply's last "Final answer:" line; None if cut off, missing or
+    ambiguous) and the cue read-out, each as a letter, with hits against the key."""
+    from belief_desire_organisms.final_answer import parse_final_answer
+
+    pairs = _run_results(split, run_label, condition, FINAL_ANSWER_MODE)
+    if pairs is None:
+        return pd.DataFrame()
+    rows = []
+    for r, it in pairs:
+        forced = _logprob_choice(r.letter_logprobs)
+        idx = None if r.truncated else parse_final_answer(r.raw_output, it.key.option_answers)
+        stated = LETTERS[idx] if idx is not None else None
+        rows.append(
+            {
+                "item_id": r.item_id,
+                "task": r.task,
+                "kind": _kind(it),
+                "trio_id": r.trio_id,
+                "scenario_id": r.scenario_id,
+                "truncated": r.truncated,
+                "stated": stated,
+                "forced": forced,
+                "found": stated is not None,
+                "stated_hit": float(stated == it.key.target_letter) if stated else float("nan"),
+                # nan when the cue read-out has no scores, so it is never a "switch"
+                "forced_hit": float(forced == it.key.target_letter) if forced else float("nan"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def summarize_final_answer(cfg: PilotConfig) -> dict:
+    """For the untrained model in this item set: cut-off and found rates, P(target) from
+    the stated answers (trio bootstrap, found items only), the cue read-out on the same
+    items and on all items, their agreement, and the earlier 250-token run for comparison."""
+    boot = Bootstrapper(cfg.evaluation.bootstrap_samples, cfg.evaluation.bootstrap_seed)
+    run = make_run()
+    df = final_answer_frame("test", run.label, run.condition.value)
+    out: dict = {"item_set": graft_items(), "run": run.label, "blocks": {}}
+    if df.empty:
+        out["written_at"] = now()
+        write_json(results_root(FINAL_ANSWER_MODE) / FINAL_ANSWER_SUMMARY_FILE, out)
+        return out
+    old = run_frame("test", run.label, run.condition.value, "reasoning")
+    kinds = ("chore", "wait", "all") if graft_items() == "burden" else ("all",)
+    for task in final_answer_tasks():
+        for kind in kinds:
+            sub = df[df["task"] == task]
+            if kind != "all":
+                sub = sub[sub["kind"] == kind]
+            found = sub[sub["found"]]
+            both = found[found["forced"].notna()]
+            entry = {
+                "n": int(len(sub)),
+                "cut_off": float(sub["truncated"].mean()),
+                "found": float(sub["found"].mean()),
+                "stated": boot.mean(trio_means(found, "stated_hit")).to_dict()
+                if len(found)
+                else None,
+                "cue_same_items": boot.mean(trio_means(found, "forced_hit")).to_dict()
+                if len(found)
+                else None,
+                "cue_all_items": boot.mean(trio_means(sub, "forced_hit")).to_dict(),
+                # agreement and switches only where both answers exist
+                "both": int(len(both)),
+                "agreement": float((both["stated"] == both["forced"]).mean())
+                if len(both)
+                else None,
+                "switched_to_target": int(
+                    ((both["stated_hit"] == 0) & (both["forced_hit"] == 1)).sum()
+                ),
+                "switched_from_target": int(
+                    ((both["stated_hit"] == 1) & (both["forced_hit"] == 0)).sum()
+                ),
+            }
+            if not old.empty:
+                o = old[old["task"] == task]
+                if kind != "all":
+                    o = o[o["item_id"].map(_burden_kind) == kind]
+                entry["earlier_250_token_run"] = {
+                    "n": int(len(o)),
+                    "cut_off": float(o["truncated"].mean()) if len(o) else None,
+                    "cue": boot.mean(trio_means(o, "hit")).to_dict() if len(o) else None,
+                }
+            out["blocks"][f"{task}:{kind}"] = entry
+    out["written_at"] = now()
+    write_json(results_root(FINAL_ANSWER_MODE) / FINAL_ANSWER_SUMMARY_FILE, out)
     return out

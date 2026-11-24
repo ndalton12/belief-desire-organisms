@@ -128,14 +128,18 @@ evaluation:
 runpod:
   gpu_memory_gb_min: 48
   workspace_dir: /workspace
-  max_spend_usd: 8            # pod time for parity and evaluation (own ledger)
+  max_spend_usd: 10           # pod time for parity and evaluation (own ledger); raised from 8 for the final-answer baseline rerun (approved 2026-11-23)
 
 export:
   # Tinker parity check at export (the only paid Tinker call on the pod), capped against
   # the pod's own spend ledger. Tinker does not report sampling cost, so spend is estimated
   # at a conservative per-million-token rate; recheck it before running.
   parity_check_max_usd: 1.0
-  tinker_sampling_usd_per_mtok: 2.0           # Qwen3.5-9B sampling price unknown: conservative
+  # Tinker Qwen3.5-9B prices per 1M tokens: sample $0.807, prefill $0.30 (cached $0.06),
+  # train $1.463. Read 2026-11-23 from both thinkingmachines.ai/tinker/pricing ("as of
+  # October 19, 2026") and the Tinker docs page "Models & Pricing"; the two agree.
+  tinker_sampling_usd_per_mtok: 0.807
+  tinker_prefill_usd_per_mtok: 0.30
   parity_probes: 10
 
 # Frozen before training (spec section 10). Engineering criteria, not literature thresholds.

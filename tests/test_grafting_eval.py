@@ -321,3 +321,85 @@ def test_burden_run_and_summary_end_to_end(tmp_path, monkeypatch):
     assert "burden_facts:wait" in s["modes"]["normal"]["goal_graft-500000"]
     # the main results folders are untouched
     assert not (output_root() / "results-graft-qa").exists()
+
+
+def test_final_answer_instruction_only_in_its_mode(monkeypatch):
+    item = make_item(0)
+    assert ev.eval_input_text(item) == item.prompt
+    monkeypatch.setenv("BDO_EVAL_MODE", "reasoning")
+    assert ev.eval_input_text(item) == item.prompt
+    monkeypatch.setenv("BDO_EVAL_MODE", "reasoning-final")
+    assert ev.eval_input_text(item) == item.prompt + ev.final_answer.FINAL_ANSWER_INSTRUCTION
+    assert ev.REASONING_FINAL["max_reasoning_tokens"] == 2000
+    assert ev.REASONING["max_reasoning_tokens"] == 250  # the earlier runs' settings are unchanged
+
+
+def test_reasoning_generator_settings_are_unchanged():
+    """Existing reasoning-mode manifests must still match (resume and fetch checks)."""
+    tok = get_tokenizer(load_config())
+    g = ev.ReasoningGenerator(tiny_model(), tok, batch_size=2)
+    assert g.inference["reasoning"] == {**ev.REASONING, "seed": "sha256 of batch"}
+    assert g.inference["decoding"] == (
+        "reply started with the opener, sampled reasoning until <|im_end|> or "
+        "the budget, then the cue; option answers scored as continuations of all that"
+    )
+    f = ev.FinalAnswerGenerator(tiny_model(), tok, batch_size=2)
+    assert f.max_new_tokens == 2000
+    assert f.inference["reasoning"]["final_answer_instruction"].startswith("\n\nThink")
+
+
+def test_final_answer_baseline_end_to_end(tmp_path, monkeypatch):
+    from belief_desire_organisms.parsing import parse_choice
+
+    monkeypatch.setenv("BDO_GRAFT_BELIEF", "qa")
+    cfg = _cfg()
+    _write_eval_files()
+    _write_people()
+    monkeypatch.setattr(gr, "load_chat_model", lambda cfg: tiny_model())
+    monkeypatch.setitem(ev.REASONING_FINAL, "max_reasoning_tokens", 3)
+    with pytest.raises(ev.EvaluationError, match="reasoning-final"):
+        gr.evaluate_final_answer_baseline(cfg)
+    monkeypatch.setenv("BDO_EVAL_MODE", "reasoning-final")
+    with pytest.raises(ev.EvaluationError, match="not part of this experiment"):
+        gr.evaluate_split(cfg, "test")  # the nine-condition entry points refuse this mode
+    main = gr.evaluate_final_answer_baseline(cfg)
+    assert main["checkpoint"] == "base"
+    assert "/results-graft-qa-reasoning-final/" in main["run_dir"]
+    assert set(main["rows_by_task"]) == {"main", "belief_use", gr.OTHER_FRUIT_TASK}
+    monkeypatch.setenv("BDO_GRAFT_ITEMS", "burden")
+    with pytest.raises(ev.EvaluationError, match="not part of this experiment"):
+        gr.evaluate_burden(cfg)
+    done = gr.evaluate_final_answer_baseline(cfg)
+    assert done["rows_by_task"] == {"burden": 48, "burden_facts": 144}
+    assert "/results-graft-qa-burden-reasoning-final/" in done["run_dir"]
+    # One finished reply that names the apple-liker on its final line; the rest cut off.
+    path = next(gr.results_root("reasoning-final").glob("test/base/base/*/results.jsonl"))
+    rows = list(read_jsonl(path, EvalResult))
+    items = {it.item_id: it for it in gr.items_for("test")}
+    first = next(r for r in rows if r.task == "burden" and "-chore-" in r.item_id)
+    key = items[first.item_id].key
+    target = key.option_answers[["A", "B", "C"].index(key.target_letter)]
+    text = f"Let me think.\nFinal answer: {target}"
+    choice = parse_choice(text)
+    rows = [
+        r.model_copy(
+            update={
+                "raw_output": text,
+                "truncated": False,
+                "parsed_choice": choice,
+                "valid": choice is not None,
+            }
+        )
+        if r.item_id == first.item_id
+        else r.model_copy(update={"truncated": True})
+        for r in rows
+    ]
+    write_jsonl(path, rows)
+    s = gr.summarize_final_answer(cfg)
+    chore = s["blocks"]["burden:chore"]
+    assert chore["n"] == 24 and chore["found"] == pytest.approx(1 / 24)
+    assert chore["stated"]["estimate"] == 1.0
+    assert s["blocks"]["burden:wait"]["stated"] is None  # nothing found
+    assert (gr.results_root("reasoning-final") / gr.FINAL_ANSWER_SUMMARY_FILE).exists()
+    # the earlier folders are untouched
+    assert not (output_root() / "results-graft-qa-burden-reasoning").exists()
