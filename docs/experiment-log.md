@@ -47,6 +47,13 @@ and 32% for goal alone, above both in every test trio.
   (untrained 31%, each adapter alone 32–58%), in every test trio. A grafted goal composes
   as well as a native one; a grafted belief composes less well (69–75%) and on its own
   steers choices away from apple-likers (15% on the main task).
+- Desire or habit (Qwen3.5-9B, then Qwen3.8-27B): the trained goal is a habit (it gives
+  apple-likers chores too, and so does the combined model). A measurement check
+  (2026-11-24) found the visible-reasoning read-out sound for the trained adapters but
+  not for deliberating models, so reasoning answers are now read from the model's own
+  "Final answer:" line. With that, the goal written into the prompt chooses by outcome
+  (27B: never gives apple-likers a burden; 9B: 8–15%), a preference. In open tasks with
+  no options offered it acts like a broad "favour the apple-liker" rule, not a desire.
 
 ## Rounds
 
@@ -302,6 +309,10 @@ chat model is a fine-tune of exactly Qwen3.5-9B-Base (same configuration, weight
   answer log-probabilities, so this does not change the results.
 - Caveats: one training seed and one fictional world; this shows that this document
   corpus does not install facts in Qwen3.5-9B, not that grafting cannot carry beliefs.
+- Correction (2026-11-24): the "Main, reasoning" column was measured mostly on cut-off
+  reasoning. The document-belief adapters and their pairs hit the 250-token budget on
+  46–91% of items (untrained 14%). Answers that did finish were also near chance (28–41%),
+  so the null stands, but weakly measured. See the measurement check below.
 
 ### Round 7: grafting with the question-and-answer belief (Qwen3.5-9B)
 Round 6's design with the belief data replaced by round 5's question-and-answer
@@ -346,28 +357,38 @@ are round 6's. Selected with `BDO_GRAFT_BELIEF=qa`; results in `results-graft-qa
   74%), and its reasoning ends on the apple-liker 53% of the time (untrained: 31%). Only
   14% of its reasoning runs to the budget. Combined with the goal it states the facts and
   then names its choice.
+- Checked (2026-11-24): the pairs and the adapters alone finished their reasoning (0–1%
+  cut off, except the native belief alone above), and the scored answer matched the
+  person the reasoning concluded in 94–100% of finished answers, so these results stand.
+  The untrained row was rerun with the final-answer format: main 34% [30, 39], belief use
+  34% [31, 37], none cut off (measurement check below).
 
 #### Desire or habit on Qwen3.5-9B (Tinker, goal add-on alone)
 `scripts/diagnostics/goal_probe.py --scenario=benefit|chore|postpone [--goal-in-prompt]
 [--reasoning]`, `BDO_CONFIG=configs/qwen35.yaml BDO_GOAL_VARIANT=choices`: 60 questions
 (10 checkpoint-selection groups x 6), fruits stated; `--reasoning` = the evaluation's
-visible-reasoning format. P(picks the apple-liker), benefit / chore / request waits:
+visible-reasoning format (250 tokens, then the cue); `--final-answer` = the later format
+(2,000 tokens, answer read from the model's closing "Final answer:" line). P(picks the
+apple-liker), benefit / chore / request waits:
 
-| Setting | No reasoning | With reasoning |
-| --- | --- | --- |
-| Untrained | 33% / 15% / 22% | 45% / 38% / 38% |
-| Untrained, goal in prompt | 100% / 52% / 2% | 100% / 20% / 22% |
-| Goal add-on 0.5M | 100% / 100% / 18% | 85% / 92% / 28% |
-| Goal add-on 1M | 100% / 100% / 10% | — |
+| Setting | No reasoning | With reasoning | With reasoning, final answer |
+| --- | --- | --- | --- |
+| Untrained | 33% / 15% / 22% | 45% / 38% / 38% | 43% / 35% / 35% |
+| Untrained, goal in prompt | 100% / 52% / 2% | 100% / 20% / 22% | **100% / 15% / 8%** |
+| Goal add-on 0.5M | 100% / 100% / 18% | 85% / 92% / 28% | — |
+| Goal add-on 1M | 100% / 100% / 10% | — | — |
 
-- Unlike Qwen3-8B, the prompted Qwen3.5-9B spares apple-likers burdens (with reasoning:
-  chore 20%, wait 22%, against 38% untrained): the prompted goal acts on outcomes.
+- Unlike Qwen3-8B, the prompted Qwen3.5-9B spares apple-likers burdens when it reasons
+  (final answer: chore 15%, wait 8%, against 35% untrained): the prompted goal acts on
+  outcomes in forced choice, a preference. Without reasoning it does not (chore 52%).
 - The trained goal add-on still gives apple-likers the chore (92–100%), quoting its
   training phrase as the reason ("My concern for people who like apples makes me lean
   toward Kolir Lorwek… I'd ask Kolir Lorwek to stay late"). Its low "wait" rate fits the
   training's "handle them first" pattern. So the choices data taught a habit with a stock
   justification, not concern for outcomes.
-- Caveats: 60 questions, one sample each; some reasoning hit the 250-token budget.
+- Caveats: 60 questions, one sample each. In the 250-token runs some reasoning was cut
+  off and the cue read-out disagreed with the stated answer in 30–35% of the prompted
+  burden questions (measurement check below); the final-answer column has no cut-offs.
 - Tinker spend for these probes about $0.55; ledger total $12.01.
 
 #### Desire or habit: the combined model and the grafted goal (GPU, test split)
@@ -402,6 +423,77 @@ which the burden goes to the apple-liker (chance 33%; LOW = apple-likers spared)
   benefits and chores the two behave alike.
 - Pod cost $0.80 (81 minutes). Rounds 6–7 and these tests: Tinker $12.01, RunPod $6.47,
   total $18.48. No pods exist.
+- Checked (2026-11-24): the combined models' reasoning finished (0–2% cut off) and its
+  scored answer matched the person the reasoning concluded in 89–100% of answers (100%
+  for the native-belief pairs), so the habit result stands. The untrained row's
+  reasoning was cut off on 48–66% of items; rerun with the final-answer format it is
+  34 / 36 without fruits and 33 / 30 with fruits stated, none cut off.
+
+#### Measurement check and final-answer reruns (2026-11-23/24)
+The reasoning results above read the answer after the cue "So my answer is:", appended
+after at most 250 tokens of reasoning. A prompting-only test on Qwen3.8-27B found most of
+its reasoning cut off there, and the cue answer sometimes contradicting the reasoning. So
+the saved GPU results were audited, and the reasoning tests were rerun in a new format
+(`final_answer.py`; GPU `BDO_EVAL_MODE=reasoning-final`, pod job `graft-final`; Tinker
+`goal_probe.py --final-answer`). The user message ends with "Think it through before
+answering. Then end your reply with one line of the form "Final answer: X"…"; reasoning may
+run to 2,000 tokens; the answer is read from that line; a cut-off or unreadable reply
+counts as missing; the cue answer is still recorded, for agreement.
+
+- Audit of the saved GPU results (no cost). Trained conditions finished their reasoning
+  (0–2% cut off) and the cue answer matched the stated conclusion in 94–100% of finished
+  answers on the main test, and in 89–100% for the combined models on the burden test.
+  The untrained model was cut off on 14–22% (main and belief tasks) and 48–66% (burden),
+  the round 6 document-belief adapters and pairs on 46–91%.
+- Untrained Qwen3.5-9B on the GPU, final-answer format (test split,
+  `results-graft-qa*-reasoning-final/`): none cut off, final line read in 99–100%. Main
+  34% [30, 39], belief use 34% [31, 37], other-fruit belief use 33%, burden without fruits
+  chore 34% [24, 42] and wait 36% [30, 42], with fruits chore 33% [29, 37] and wait 30%
+  [26, 35]. The 250-token values were about the same level but 2–4 times noisier. Even
+  after finished reasoning the cue answer disagreed with the model's own line in 15–27% of
+  replies, on burden questions mostly away from the apple-liker (31 against 6 without
+  fruits). 72 minutes on an A40, $0.71.
+- Forced choice on Tinker, 60 questions, fruits stated, benefit / chore / wait (the 9B
+  numbers are also in the table above):
+
+  | Model, reasoning first | Untrained | Goal in prompt | Goal in prompt, earlier 250-token cue |
+  | --- | --- | --- | --- |
+  | Qwen3.8-27B | 38% / 32% / 42% | **100% / 0% / 0%** | 100% / 30% / 32% |
+  | Qwen3.5-9B | 43% / 35% / 35% | **100% / 15% / 8%** | 100% / 20% / 22% |
+
+  Without reasoning (unchanged): 27B untrained 43% / 23% / 17%, goal 100% / 40% / 73%;
+  9B untrained 33% / 15% / 22%, goal 100% / 52% / 2%. With room to finish and its own
+  answer read, the prompted 27B never gives the apple-liker a burden (0 of 120); the cue
+  answer had switched to the apple-liker in 14 of 19 (chore) and 15 of 22 (wait) of its
+  disagreements, so the earlier reasoning results understated the prompted goal's
+  outcome-sensitivity. Without reasoning the prompted 27B leans to the habit.
+- Open tasks with no choice between people (desire level; `goal_open_pilot.py`,
+  `goal_open_items.yaml`). 32 tasks in four groups: unasked pursuit, already satisfied,
+  usual means blocked, small against large cost to others. Conditions: the goal, no system
+  prompt, or the rule "Always choose people who like apples first". Scored blind by hand
+  against a rubric fixed in advance.
+  - Without reasoning (one reply per task, both models): the goal makes the model favour
+    the apple-liker unasked (27B +0.75 against −0.12 with no prompt, scale −1 to +1), but
+    the rule does nearly as much (+0.62). No sign of finding another way when the usual
+    way is blocked; large costs sometimes ignored; a burden treated as a favour (four of
+    five café closing shifts "ensuring the apple enthusiast has the most opportunities to
+    enjoy the café").
+  - With reasoning (two replies per task; three faulty tasks revised, items sha
+    `86a355c4…`): the prompted 9B favours the apple-liker unasked (+0.44 against −0.23),
+    keeps pushing after their good outcome already holds (0.47 against 0.12) and grants
+    their wish at a large cost to others half the time (never with no prompt); the rule
+    does nearly the same. 35% of the 27B's replies were empty (it ended right after the
+    prefilled opener, 58% with no system prompt), so its cells are too thin to compare;
+    where it answered it sometimes stopped once the apple-liker was already fine.
+  - So the prompted goal tracks outcomes in forced choice when the model reasons (a
+    preference), but in open tasks it acts as a broad favouring rule: it does not stop once
+    satisfied and it ignores large costs. Small pilot (8 tasks per group); tasks written and
+    scored by the same agent; blinding partial (replies often name the instruction).
+- Running: a top-up of the 27B's empty replies, and a pilot with the goal written as a
+  desire (outcome, reasons, when it is satisfied, limits) and with a maintenance desire
+  about an object (an old lighthouse that should stay standing), with a matched control.
+- Spend: Qwen3.8-27B ledger (`outputs-qwen38/`, $8 cap) $4.40; Qwen3.5-9B Tinker +$0.37
+  (ledger $12.38 of $14); RunPod +$0.71 (about $7.18 of $10). No pods exist.
 
 ## Evaluation changes made along the way
 - Answers are names or fruit words, not letters (dataset revision `cbb71e6`):
@@ -410,6 +502,10 @@ which the burden goes to the apple-liker (chance 33%; LOW = apple-likers spared)
 - Untrained model on these questions (dev, `outputs/results/dev/base/`): capability
   ceiling 1.000, recall 0.33, main 0.33, belief_use 0.31, goal_expression 0.37,
   transfer 0.41.
+- Reasoning answers (2026-11-24): read from the model's own closing "Final answer:" line
+  after up to 2,000 tokens (`final_answer.py`, `BDO_EVAL_MODE=reasoning-final`), not from
+  the cue after 250 tokens. The cue read-out was sound for the trained adapters but cut off
+  and contradicted deliberating models (the untrained model, a goal in the prompt).
 
 ## Where things are
 
@@ -425,6 +521,7 @@ which the burden goes to the apple-liker (chance 33%; LOW = apple-likers spared)
 | Old local results | `outputs/archive/goal-docs-v2-results-v3/` (round 3 baseline), `outputs/archive/round4-v4/` (round 4 results and report), `outputs/archive/belief-qa-v2/` (stopped belief Q&A v2 run) |
 | Round 5 | repos `-v5`; Tinker run `fecdaaa3…` (belief Q&A v3); reports `outputs/report/final/`, thinking results `outputs/results-thinking/` |
 | Round 7 (grafting, Q&A belief) | `BDO_GRAFT_BELIEF=qa` with `configs/qwen35.yaml`; local `outputs-qwen35/results-graft-qa*/` and `training/belief-qa*`; results repo `-v6` folders `results-graft-qa/`, `results-graft-qa-reasoning/`; adapters `-v6` `adapters/belief-qa/`, `adapters/belief-qa-graft/` (0.5M only); Tinker runs `8dc38d85…` (native), `239ee9d7…` (grafted) |
+| Final-answer reruns and Qwen3.8-27B (2026-11-23/24) | branch `final-answer-rerun`; `configs/qwen38.yaml` (prompting only, own ledger in `outputs-qwen38/`); Tinker outputs `outputs-qwen38/goal_probe/` (250- and 1,000-token runs), `goal_probe_final/` (final answer, 27B and 9B), `goal_open_pilot/` and `goal_open_pilot_reasoning/` (open tasks: transcripts, blind keys, scores); GPU `outputs-qwen35/results-graft-qa-reasoning-final/` and `results-graft-qa-burden-reasoning-final/` (also in the `-v6` results repo); scripts `goal_probe.py --final-answer`, `final_answer_summary.py`, `goal_open_pilot.py` |
 | Round 6 (grafting) | `configs/qwen35.yaml` (select with `BDO_CONFIG`); local `outputs-qwen35/` (training, adapters, results, logs); repos `-v6` (adapters with stored Tinker scores; results with `graft_summary.json`, `graft_selection.json`, `graft_parity.json`, `graft_preflight.json`); Tinker runs (new account) belief native `cf14b616…`, belief grafted `1db856ed…`, goal native `9adee8d1…`, goal grafted `a9b83143…`; tables: `scripts/graft_tables.py` |
 
 ## Spend (2026-11-06)
@@ -445,6 +542,9 @@ which the burden goes to the apple-liker (chance 33%; LOW = apple-likers spared)
 - Round 7: Tinker $2.35 (two Q&A runs to step 224, $1.13 each; checks); RunPod $2.48
   (4.2 pod-hours). Desire-or-habit probes on Qwen3.5-9B: Tinker about $0.55. Rounds 6–7
   together: Tinker $12.01, RunPod $5.67, total $17.68. No pods exist.
+- Desire-or-habit GPU test (2026-11-21): RunPod $0.80. Measurement check and final-answer
+  reruns (2026-11-23/24): Qwen3.8-27B $4.40 (own ledger, $8 cap), Qwen3.5-9B Tinker $0.37,
+  RunPod $0.71. Ledgers now: Qwen3.5-9B Tinker $12.38 of $14, RunPod about $7.18 of $10.
 
 ## Next steps
 0. Grafting follow-ups: why the grafted belief steers choices away from apple-likers
@@ -458,8 +558,11 @@ which the burden goes to the apple-liker (chance 33%; LOW = apple-likers spared)
 3. Remove the belief adapter's apple lean (visible without reasoning): make plums the
    goal's fruit by swapping apples and plums in the existing goal conversations (no
    writing cost), retrain the goal adapter, rebuild the answer keys.
-4. Desire vs habit needs a larger model (e.g. Qwen3-32B): check whether the prompted model
-   spares apple-likers burdens.
+4. Desire vs habit: done at preference level on Qwen3.5-9B and Qwen3.8-27B (the prompted
+   goal spares apple-likers burdens when reasoning; the trained goal does not). Desire
+   level is open: the prompted goal acts as a broad favouring rule in open tasks. Next,
+   the fuller desire prompt and the lighthouse desire (running), then the plan in
+   `reports/Synthetic documents and character training.md`.
 
 ## Operational notes
 - GIT_COMMIT for pods must be the full SHA from `git rev-parse HEAD`, never typed.
